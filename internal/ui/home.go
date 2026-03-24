@@ -6295,8 +6295,12 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 				if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create parent directory: %w", err)}
 				}
-				if err := git.CreateWorktree(worktreeRepoRoot, worktreePath, worktreeBranch); err != nil {
+				setupOutput, setupErr, err := git.CreateWorktreeWithSetup(worktreeRepoRoot, worktreePath, worktreeBranch)
+				if err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create worktree: %w", err)}
+				}
+				if setupErr != nil {
+					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupOutput))
 				}
 			}
 			path = worktreePath
@@ -6667,8 +6671,12 @@ func (h *Home) forkSessionCmdWithOptions(
 				if err := os.MkdirAll(filepath.Dir(opts.WorktreePath), 0o755); err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("failed to create directory: %w", err), sourceID: sourceID}
 				}
-				if err := git.CreateWorktree(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch); err != nil {
+				setupOutput, setupErr, err := git.CreateWorktreeWithSetup(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
+				if err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("worktree creation failed: %w", err), sourceID: sourceID}
+				}
+				if setupErr != nil {
+					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupOutput))
 				}
 			}
 		}

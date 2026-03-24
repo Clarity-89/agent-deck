@@ -194,9 +194,16 @@ func handleLaunch(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			if err := git.CreateWorktree(repoRoot, worktreePath, wtBranch); err != nil {
+			setupOutput, setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch)
+			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
+			}
+			if setupOutput != "" {
+				fmt.Println(setupOutput)
+			}
+			if setupErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
 			}
 		}
 
