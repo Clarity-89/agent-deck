@@ -516,13 +516,10 @@ func handleSessionFork(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			setupOutput, setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch)
+			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr)
 			if err != nil {
 				out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
-			}
-			if setupOutput != "" {
-				fmt.Println(setupOutput)
 			}
 			if setupErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)

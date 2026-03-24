@@ -1075,7 +1075,7 @@ func handleAdd(profile string, args []string) {
 
 			// Create worktree atomically (git handles existence checks).
 			// This avoids a TOCTOU race from separate check-then-create steps.
-			setupOutput, setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch)
+			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr)
 			if err != nil {
 				if isWorktreeAlreadyExistsError(err) {
 					fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)
@@ -1084,9 +1084,6 @@ func handleAdd(profile string, args []string) {
 				}
 				fmt.Fprintf(os.Stderr, "Error: failed to create worktree: %v\n", err)
 				os.Exit(1)
-			}
-			if setupOutput != "" {
-				fmt.Println(setupOutput)
 			}
 			if setupErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)

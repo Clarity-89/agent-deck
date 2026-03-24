@@ -3,10 +3,10 @@ package git
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -25,8 +25,8 @@ var worktreeSetupTimeout = 60 * time.Second
 
 // RunWorktreeSetupScript executes the setup script with AGENT_DECK_REPO_ROOT
 // and AGENT_DECK_WORKTREE_PATH environment variables set. Working directory
-// is set to worktreePath. Returns combined output and any error.
-func RunWorktreeSetupScript(scriptPath, repoDir, worktreePath string) (string, error) {
+// is set to worktreePath. Output is streamed to the provided writers.
+func RunWorktreeSetupScript(scriptPath, repoDir, worktreePath string, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), worktreeSetupTimeout)
 	defer cancel()
 
@@ -36,33 +36,35 @@ func RunWorktreeSetupScript(scriptPath, repoDir, worktreePath string) (string, e
 		"AGENT_DECK_REPO_ROOT="+repoDir,
 		"AGENT_DECK_WORKTREE_PATH="+worktreePath,
 	)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	cmd.WaitDelay = 5 * time.Second
 
-	output, err := cmd.CombinedOutput()
-	out := strings.TrimSpace(string(output))
+	err := cmd.Run()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return out, fmt.Errorf("worktree setup script timed out after %s", worktreeSetupTimeout)
+		return fmt.Errorf("worktree setup script timed out after %s", worktreeSetupTimeout)
 	}
 	if err != nil {
-		return out, fmt.Errorf("worktree setup script failed: %w", err)
+		return fmt.Errorf("worktree setup script failed: %w", err)
 	}
-	return out, nil
+	return nil
 }
 
 // CreateWorktreeWithSetup creates a worktree and runs the setup script if present.
 // Setup script failure is non-fatal: the worktree is still valid.
-// Returns setup output, setup error (if any), and worktree creation error.
-func CreateWorktreeWithSetup(repoDir, worktreePath, branchName string) (setupOutput string, setupErr error, err error) {
+// Output is streamed to the provided writers.
+func CreateWorktreeWithSetup(repoDir, worktreePath, branchName string, stdout, stderr io.Writer) (setupErr error, err error) {
 	if err = CreateWorktree(repoDir, worktreePath, branchName); err != nil {
-		return "", nil, err
+		return nil, err
 	}
 
 	scriptPath := FindWorktreeSetupScript(repoDir)
 	if scriptPath == "" {
-		return "", nil, nil
+		return nil, nil
 	}
 
-	setupOutput, setupErr = RunWorktreeSetupScript(scriptPath, repoDir, worktreePath)
-	return setupOutput, setupErr, nil
+	fmt.Fprintln(stderr, "Running worktree setup script...")
+	setupErr = RunWorktreeSetupScript(scriptPath, repoDir, worktreePath, stdout, stderr)
+	return setupErr, nil
 }

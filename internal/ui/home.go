@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -6295,12 +6296,13 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 				if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create parent directory: %w", err)}
 				}
-				setupOutput, setupErr, err := git.CreateWorktreeWithSetup(worktreeRepoRoot, worktreePath, worktreeBranch)
+				var setupBuf bytes.Buffer
+				setupErr, err := git.CreateWorktreeWithSetup(worktreeRepoRoot, worktreePath, worktreeBranch, &setupBuf, &setupBuf)
 				if err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create worktree: %w", err)}
 				}
 				if setupErr != nil {
-					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupOutput))
+					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupBuf.String()))
 				}
 			}
 			path = worktreePath
@@ -6671,12 +6673,13 @@ func (h *Home) forkSessionCmdWithOptions(
 				if err := os.MkdirAll(filepath.Dir(opts.WorktreePath), 0o755); err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("failed to create directory: %w", err), sourceID: sourceID}
 				}
-				setupOutput, setupErr, err := git.CreateWorktreeWithSetup(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
+				var setupBuf bytes.Buffer
+				setupErr, err := git.CreateWorktreeWithSetup(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch, &setupBuf, &setupBuf)
 				if err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("worktree creation failed: %w", err), sourceID: sourceID}
 				}
 				if setupErr != nil {
-					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupOutput))
+					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupBuf.String()))
 				}
 			}
 		}

@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,15 +51,17 @@ func TestRunWorktreeSetupScript_Success(t *testing.T) {
 	// Script copies .mcp.json using env vars
 	script := `#!/bin/sh
 cp "$AGENT_DECK_REPO_ROOT/.mcp.json" "$AGENT_DECK_WORKTREE_PATH/.mcp.json"
+echo "copying done"
 `
 	scriptPath := filepath.Join(t.TempDir(), "setup.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	output, err := RunWorktreeSetupScript(scriptPath, repoDir, worktreeDir)
+	var stdout, stderr bytes.Buffer
+	err := RunWorktreeSetupScript(scriptPath, repoDir, worktreeDir, &stdout, &stderr)
 	if err != nil {
-		t.Fatalf("unexpected error: %v (output: %s)", err, output)
+		t.Fatalf("unexpected error: %v (stderr: %s)", err, stderr.String())
 	}
 
 	// Verify file was copied
@@ -68,6 +71,11 @@ cp "$AGENT_DECK_REPO_ROOT/.mcp.json" "$AGENT_DECK_WORKTREE_PATH/.mcp.json"
 	}
 	if string(copied) != `{"test": true}` {
 		t.Errorf("unexpected content: %s", copied)
+	}
+
+	// Verify output was streamed to stdout
+	if !strings.Contains(stdout.String(), "copying done") {
+		t.Errorf("expected stdout to contain 'copying done', got %q", stdout.String())
 	}
 }
 
@@ -83,12 +91,13 @@ exit 1
 		t.Fatal(err)
 	}
 
-	output, err := RunWorktreeSetupScript(scriptPath, t.TempDir(), worktreeDir)
+	var stdout, stderr bytes.Buffer
+	err := RunWorktreeSetupScript(scriptPath, t.TempDir(), worktreeDir, &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error from failing script")
 	}
-	if !strings.Contains(output, "something went wrong") {
-		t.Errorf("expected output to contain error message, got: %q", output)
+	if !strings.Contains(stderr.String(), "something went wrong") {
+		t.Errorf("expected stderr to contain error message, got: %q", stderr.String())
 	}
 }
 
@@ -108,7 +117,8 @@ sleep 300
 		t.Fatal(err)
 	}
 
-	_, err := RunWorktreeSetupScript(scriptPath, t.TempDir(), worktreeDir)
+	var stdout, stderr bytes.Buffer
+	err := RunWorktreeSetupScript(scriptPath, t.TempDir(), worktreeDir, &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -153,15 +163,16 @@ func TestCreateWorktreeWithSetup_NoScript(t *testing.T) {
 	createTestRepoForSetup(t, dir)
 	worktreePath := filepath.Join(dir, ".worktrees", "test-branch")
 
-	output, setupErr, err := CreateWorktreeWithSetup(dir, worktreePath, "test-branch")
+	var stdout, stderr bytes.Buffer
+	setupErr, err := CreateWorktreeWithSetup(dir, worktreePath, "test-branch", &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("worktree creation failed: %v", err)
 	}
 	if setupErr != nil {
 		t.Errorf("unexpected setup error: %v", setupErr)
 	}
-	if output != "" {
-		t.Errorf("expected empty output, got %q", output)
+	if stdout.Len() != 0 {
+		t.Errorf("expected no output, got %q", stdout.String())
 	}
 
 	// Verify worktree was created
@@ -193,15 +204,16 @@ echo "setup done"
 	}
 
 	worktreePath := filepath.Join(dir, ".worktrees", "setup-branch")
-	output, setupErr, err := CreateWorktreeWithSetup(dir, worktreePath, "setup-branch")
+	var stdout, stderr bytes.Buffer
+	setupErr, err := CreateWorktreeWithSetup(dir, worktreePath, "setup-branch", &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("worktree creation failed: %v", err)
 	}
 	if setupErr != nil {
 		t.Errorf("unexpected setup error: %v", setupErr)
 	}
-	if !strings.Contains(output, "setup done") {
-		t.Errorf("expected output to contain 'setup done', got %q", output)
+	if !strings.Contains(stdout.String(), "setup done") {
+		t.Errorf("expected stdout to contain 'setup done', got %q", stdout.String())
 	}
 
 	// Verify file was copied
@@ -232,7 +244,8 @@ exit 1
 	}
 
 	worktreePath := filepath.Join(dir, ".worktrees", "fail-branch")
-	output, setupErr, err := CreateWorktreeWithSetup(dir, worktreePath, "fail-branch")
+	var stdout, stderr bytes.Buffer
+	setupErr, err := CreateWorktreeWithSetup(dir, worktreePath, "fail-branch", &stdout, &stderr)
 
 	// Worktree creation should succeed
 	if err != nil {
@@ -243,8 +256,8 @@ exit 1
 	if setupErr == nil {
 		t.Error("expected setup error from failing script")
 	}
-	if !strings.Contains(output, "fail") {
-		t.Errorf("expected output to contain 'fail', got %q", output)
+	if !strings.Contains(stderr.String(), "fail") {
+		t.Errorf("expected stderr to contain 'fail', got %q", stderr.String())
 	}
 
 	// Worktree should still be valid
