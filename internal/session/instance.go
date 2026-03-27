@@ -79,6 +79,9 @@ type Instance struct {
 	WorktreeRepoRoot string `json:"worktree_repo_root,omitempty"` // Original repo root
 	WorktreeBranch   string `json:"worktree_branch,omitempty"`    // Branch name in worktree
 
+	// Companion shell pane
+	CompanionPane bool `json:"companion_pane,omitempty"`
+
 	// Multi-repo support
 	MultiRepoEnabled   bool                `json:"multi_repo_enabled,omitempty"`
 	AdditionalPaths    []string            `json:"additional_paths,omitempty"`    // Paths beyond ProjectPath
@@ -1886,6 +1889,7 @@ func (i *Instance) Start() error {
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
 	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed()
+	i.tmuxSession.CompanionPane = i.CompanionPane
 
 	// Start the tmux session
 	if err := i.tmuxSession.Start(command); err != nil {
@@ -2002,6 +2006,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
 	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed()
+	i.tmuxSession.CompanionPane = i.CompanionPane
 
 	// Start the tmux session
 	if err := i.tmuxSession.Start(command); err != nil {

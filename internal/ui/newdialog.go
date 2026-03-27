@@ -25,6 +25,7 @@ const (
 	focusCommand               // tool/command picker.
 	focusWorktree              // worktree checkbox.
 	focusSandbox               // sandbox checkbox.
+	focusCompanionPane         // companion shell pane checkbox.
 	focusMultiRepo             // multi-repo toggle (transforms path into list when enabled).
 	focusInherited             // inherited Docker settings toggle (conditional).
 	focusBranch                // branch input (conditional — only when worktree enabled).
@@ -65,6 +66,8 @@ type NewDialog struct {
 	branchInput     textinput.Model
 	branchAutoSet   bool   // true if branch was auto-derived from session name.
 	branchPrefix    string // configured prefix for auto-generated branch names.
+	// Companion shell pane.
+	companionPaneEnabled bool
 	// Docker sandbox support.
 	sandboxEnabled    bool
 	inheritedExpanded bool             // whether the inherited settings section is expanded.
@@ -90,8 +93,9 @@ type dialogSnapshot struct {
 	path             string
 	commandCursor    int
 	commandInput     string
-	sandboxEnabled   bool
-	worktreeEnabled  bool
+	sandboxEnabled       bool
+	companionPaneEnabled bool
+	worktreeEnabled      bool
 	branch           string
 	branchAutoSet    bool
 	claudeOptions    *session.ClaudeOptions
@@ -225,7 +229,8 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 	d.branchInput.SetValue("")
 	d.branchAutoSet = false
 	d.branchPrefix = "feature/" // default; overridden below if config provides one.
-	// Reset sandbox from global config default.
+	// Reset companion pane and sandbox from global config defaults.
+	d.companionPaneEnabled = true // default; overridden below if config provides one.
 	d.sandboxEnabled = false
 	d.inheritedExpanded = false
 	d.inheritedSettings = nil
@@ -247,6 +252,7 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 		d.codexOptions.SetDefaults(userConfig.Codex.YoloMode)
 		d.claudeOptions.SetDefaults(userConfig)
 		d.sandboxEnabled = userConfig.Docker.DefaultEnabled
+		d.companionPaneEnabled = userConfig.Shell.GetCompanionPane()
 		d.inheritedSettings = buildInheritedSettings(userConfig.Docker)
 		d.branchPrefix = userConfig.Worktree.Prefix()
 	}
@@ -319,8 +325,9 @@ func (d *NewDialog) saveSnapshot() *dialogSnapshot {
 		path:             d.pathInput.Value(),
 		commandCursor:    d.commandCursor,
 		commandInput:     d.commandInput.Value(),
-		sandboxEnabled:   d.sandboxEnabled,
-		worktreeEnabled:  d.worktreeEnabled,
+		sandboxEnabled:       d.sandboxEnabled,
+		companionPaneEnabled: d.companionPaneEnabled,
+		worktreeEnabled:      d.worktreeEnabled,
 		branch:           d.branchInput.Value(),
 		branchAutoSet:    d.branchAutoSet,
 		claudeOptions:    claudeOpts,
@@ -338,6 +345,7 @@ func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
 	d.commandCursor = s.commandCursor
 	d.commandInput.SetValue(s.commandInput)
 	d.sandboxEnabled = s.sandboxEnabled
+	d.companionPaneEnabled = s.companionPaneEnabled
 	d.worktreeEnabled = s.worktreeEnabled
 	d.branchInput.SetValue(s.branch)
 	d.branchAutoSet = s.branchAutoSet
@@ -541,6 +549,16 @@ func (d *NewDialog) ToggleSandbox() {
 	d.rebuildFocusTargets()
 }
 
+// IsCompanionPaneEnabled returns whether the companion shell pane is enabled.
+func (d *NewDialog) IsCompanionPaneEnabled() bool {
+	return d.companionPaneEnabled
+}
+
+// ToggleCompanionPane toggles the companion shell pane.
+func (d *NewDialog) ToggleCompanionPane() {
+	d.companionPaneEnabled = !d.companionPaneEnabled
+}
+
 // ToggleMultiRepo toggles multi-repo mode.
 // When enabling, initializes multiRepoPaths with the current pathInput value.
 // When disabling, collapses back to the first path.
@@ -708,9 +726,9 @@ func (d *NewDialog) rebuildFocusTargets() {
 	var targets []focusTarget
 	if d.multiRepoEnabled {
 		// Multi-repo replaces the single path field with a path list under focusMultiRepo
-		targets = []focusTarget{focusName, focusMultiRepo, focusCommand, focusWorktree, focusSandbox}
+		targets = []focusTarget{focusName, focusMultiRepo, focusCommand, focusWorktree, focusSandbox, focusCompanionPane}
 	} else {
-		targets = []focusTarget{focusName, focusMultiRepo, focusPath, focusCommand, focusWorktree, focusSandbox}
+		targets = []focusTarget{focusName, focusMultiRepo, focusPath, focusCommand, focusWorktree, focusSandbox, focusCompanionPane}
 	}
 	if d.sandboxEnabled && len(d.inheritedSettings) > 0 {
 		targets = append(targets, focusInherited)
@@ -1147,6 +1165,10 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 					d.inheritedExpanded = false
 				}
 				d.rebuildFocusTargets()
+				return d, nil
+			}
+			if cur == focusCompanionPane {
+				d.ToggleCompanionPane()
 				return d, nil
 			}
 			if cur == focusMultiRepo {
@@ -1627,6 +1649,9 @@ func (d *NewDialog) View() string {
 		content.WriteString("  " + dimStyle.Render("Docker Settings (all defaults)"))
 		content.WriteString("\n")
 	}
+
+	// Companion shell pane checkbox.
+	content.WriteString(renderCheckboxLine("Split terminal (companion shell)", d.companionPaneEnabled, cur == focusCompanionPane))
 
 	// Branch input (only visible when worktree is enabled).
 	if d.worktreeEnabled {

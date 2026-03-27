@@ -4398,6 +4398,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		geminiYoloMode := h.newDialog.IsGeminiYoloMode()
 		sandboxMode := h.newDialog.IsSandboxEnabled()
+		companionPane := h.newDialog.IsCompanionPaneEnabled()
 		multiRepoPaths, multiRepoEnabled := h.newDialog.GetMultiRepoPaths()
 		var additionalPaths []string
 		if multiRepoEnabled && len(multiRepoPaths) > 1 {
@@ -4438,6 +4439,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			branchName,
 			geminiYoloMode,
 			sandboxMode,
+			companionPane,
 			toolOptionsJSON,
 			multiRepoEnabled,
 			additionalPaths,
@@ -5672,6 +5674,7 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				"",
 				false,
 				false,
+				false, // no companion pane for confirm-dialog created sessions
 				pendingToolOpts,
 				false,
 				nil,
@@ -6370,6 +6373,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	name, path, command, groupPath, worktreePath, worktreeRepoRoot, worktreeBranch string,
 	geminiYoloMode bool,
 	sandboxEnabled bool,
+	companionPane bool,
 	toolOptionsJSON json.RawMessage,
 	multiRepoEnabled bool,
 	additionalPaths []string,
@@ -6432,6 +6436,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			inst = session.NewInstanceWithTool(name, path, tool)
 		}
 		inst.Command = command
+		inst.CompanionPane = companionPane
 
 		// Set worktree fields if provided
 		if worktreePath != "" {
@@ -6693,7 +6698,7 @@ func (h *Home) quickCreateSession() tea.Cmd {
 	return h.createSessionInGroupWithWorktreeAndOptions(
 		name, projectPath, command, groupPath,
 		"", "", "", // no worktree
-		geminiYoloMode, false, toolOptionsJSON,
+		geminiYoloMode, false, false, toolOptionsJSON,
 		false, nil, // no multi-repo
 		"", // no placeholder
 	)

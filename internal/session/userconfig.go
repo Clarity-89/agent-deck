@@ -413,6 +413,18 @@ type ShellSettings struct {
 	// IgnoreMissingEnvFiles silently ignores missing .env files (default: true)
 	// When false, sessions will error if an env_file doesn't exist
 	IgnoreMissingEnvFiles *bool `toml:"ignore_missing_env_files"`
+
+	// CompanionPane creates a small shell pane above the agent when true (default: true).
+	// The shell runs in the same working directory for running scripts, dev servers, etc.
+	CompanionPane *bool `toml:"companion_pane"`
+}
+
+// GetCompanionPane returns whether to create a companion shell pane, defaulting to true.
+func (s *ShellSettings) GetCompanionPane() bool {
+	if s.CompanionPane == nil {
+		return true
+	}
+	return *s.CompanionPane
 }
 
 // GetIgnoreMissingEnvFiles returns whether to ignore missing env files, defaulting to true

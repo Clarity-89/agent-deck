@@ -655,6 +655,11 @@ type Session struct {
 	// Sandbox sessions enable this so pane-dead detection can restart exited tools.
 	RunCommandAsInitialProcess bool
 
+	// CompanionPane creates a small shell pane above the agent pane when true.
+	// The shell runs in the same working directory, giving users a terminal
+	// for scripts, dev servers, etc. without interrupting the agent.
+	CompanionPane bool
+
 	// Custom patterns for generic tool support
 	customToolName       string
 	customBusyPatterns   []string
@@ -1297,6 +1302,17 @@ func (s *Session) Start(command string) error {
 		if err := s.SendKeysAndEnter(cmdToSend); err != nil {
 			return fmt.Errorf("failed to send command: %w", err)
 		}
+	}
+
+	// Create companion shell pane if enabled.
+	// Splits the window: small shell pane on top (20%), agent pane on bottom (80%).
+	// Placed after the agent command is running so it works for both
+	// send-keys and RunCommandAsInitialProcess modes.
+	if s.CompanionPane {
+		_ = exec.Command("tmux", "split-window", "-vb", "-l", "20%",
+			"-t", s.Name, "-c", workDir).Run()
+		// Re-select the agent pane (now pane 1) so CapturePane reads agent output
+		_ = exec.Command("tmux", "select-pane", "-t", s.Name+".1").Run()
 	}
 
 	// Connect control mode pipe for event-driven status detection
