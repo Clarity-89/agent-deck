@@ -732,16 +732,18 @@ type loadSessionsMsg struct {
 }
 
 type sessionCreatedMsg struct {
-	instance *session.Instance
-	err      error
-	tempID   string // matches creatingSessions key for placeholder removal
+	instance     *session.Instance
+	err          error
+	tempID       string // matches creatingSessions key for placeholder removal
+	setupWarning string // non-fatal worktree setup script warning
 }
 
 type sessionForkedMsg struct {
-	instance *session.Instance
-	sourceID string // ID of the source session that was forked (for cleanup)
-	notice   string // non-fatal degradation notice shown after a successful fork
-	err      error
+	instance     *session.Instance
+	sourceID     string // ID of the source session that was forked (for cleanup)
+	notice       string // non-fatal degradation notice shown after a successful fork
+	err          error
+	setupWarning string // non-fatal worktree setup script warning
 }
 
 type refreshMsg struct{}
@@ -4275,6 +4277,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Use forceSave to bypass mtime check - new session creation MUST persist
 			h.forceSaveInstances()
 
+			// Surface worktree setup warning if any
+			if msg.setupWarning != "" {
+				h.setError(fmt.Errorf("%s", msg.setupWarning))
+			}
+
 			// Start fetching preview for the new session
 			return h, h.fetchPreview(msg.instance, msg.instance.ID, -1)
 		}
@@ -4347,6 +4354,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// fork that wasn't actually saved doesn't look successful (#1299 review).
 			if msg.notice != "" {
 				h.setError(noticeError(h.err, msg.notice))
+			}
+
+			// Surface worktree setup warning if any
+			if msg.setupWarning != "" {
+				h.setError(noticeError(h.err, msg.setupWarning))
 			}
 
 			// Start fetching preview for the forked session
@@ -6890,6 +6902,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.setError(fmt.Errorf("session '%s' is not a worktree", inst.Title))
 			return h, nil
 		}
+		if _, running := h.setupRunningSessions[inst.ID]; running {
+			h.setError(fmt.Errorf("setup script already running for '%s'", inst.Title))
+			return h, nil
+		}
 		h.setupRunningSessions[inst.ID] = time.Now()
 		return h, h.runWorktreeSetup(inst)
 
@@ -8965,6 +8981,8 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	tempID string,
 ) tea.Cmd {
 	return func() tea.Msg {
+		var setupWarning string
+
 		// Check tmux availability before creating session
 		if err := tmux.IsTmuxAvailable(); err != nil {
 			return sessionCreatedMsg{err: fmt.Errorf("cannot create session: %w", err), tempID: tempID}
@@ -8989,8 +9007,12 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 				if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create parent directory: %w", err), tempID: tempID}
 				}
-				if err := createWorktreeWithSetupAndLog(backend, worktreePath, worktreeBranch); err != nil {
+				setupErr, err := createWorktreeWithSetupAndLog(backend, worktreePath, worktreeBranch)
+				if err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create worktree: %w", err), tempID: tempID}
+				}
+				if setupErr != nil {
+					setupWarning = fmt.Sprintf("worktree setup script failed: %v", setupErr)
 				}
 			}
 			path = worktreePath
@@ -9146,25 +9168,27 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			return sessionCreatedMsg{err: err, tempID: tempID}
 		}
 		uiLog.Info("session_create_succeeded", slog.String("id", inst.ID))
-		return sessionCreatedMsg{instance: inst, tempID: tempID}
+		return sessionCreatedMsg{instance: inst, tempID: tempID, setupWarning: setupWarning}
 	}
 }
 
 // createWorktreeWithSetupAndLog creates a worktree via the supplied backend.
 // For git backends it also runs .worktreeinclude and worktree-setup.sh; for
 // jujutsu backends only the workspace is created (setup-script behavior is
-// git-only per the vcsbackend convention). Returns only the creation error;
-// setup failures are non-fatal and logged to uiLog.
-func createWorktreeWithSetupAndLog(backend vcs.Backend, wtPath, branch string) error {
+// git-only per the vcsbackend convention). Returns (setupErr, err) — the setup
+// error is non-fatal and logged to uiLog, but is also surfaced to the caller so
+// it can be shown in the UI; err is the worktree-creation error.
+func createWorktreeWithSetupAndLog(backend vcs.Backend, wtPath, branch string) (error, error) {
 	var buf bytes.Buffer
 	setupErr, err := vcsbackend.CreateWorktreeWithSetup(backend, wtPath, branch, &buf, &buf, session.GetWorktreeSettings().SetupTimeout())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if setupErr != nil {
 		uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", buf.String()))
+		setupErr = fmt.Errorf("%w: %s", setupErr, buf.String())
 	}
-	return nil
+	return setupErr, nil
 }
 
 // createSessionTool maps a free-form command to (tool, command). Built-in
@@ -9875,6 +9899,8 @@ func (h *Home) forkSessionCmdWithOptions(
 	sourceID := source.ID // Capture for closure
 
 	return func() tea.Msg {
+		var setupWarning string
+
 		// Check tmux availability before forking
 		if err := tmux.IsTmuxAvailable(); err != nil {
 			return sessionForkedMsg{err: fmt.Errorf("cannot fork session: %w", err), sourceID: sourceID}
@@ -9948,8 +9974,12 @@ func (h *Home) forkSessionCmdWithOptions(
 				if err := os.MkdirAll(filepath.Dir(opts.WorktreePath), 0o755); err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("failed to create directory: %w", err), sourceID: sourceID}
 				}
-				if err := createWorktreeWithSetupAndLog(backend, opts.WorktreePath, opts.WorktreeBranch); err != nil {
+				setupErr, err := createWorktreeWithSetupAndLog(backend, opts.WorktreePath, opts.WorktreeBranch)
+				if err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("worktree creation failed: %w", err), sourceID: sourceID}
+				}
+				if setupErr != nil {
+					setupWarning = fmt.Sprintf("worktree setup script failed: %v", setupErr)
 				}
 			}
 		}
@@ -9959,7 +9989,12 @@ func (h *Home) forkSessionCmdWithOptions(
 			return sessionForkedMsg{err: err, sourceID: sourceID}
 		}
 
-		return sessionForkedMsg{instance: inst, sourceID: sourceID, notice: forkNotice}
+		switch inst.Tool {
+		case "opencode":
+			go inst.DetectOpenCodeSession()
+		}
+
+		return sessionForkedMsg{instance: inst, sourceID: sourceID, notice: forkNotice, setupWarning: setupWarning}
 	}
 }
 
