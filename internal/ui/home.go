@@ -853,6 +853,12 @@ type worktreeDirtyCheckMsg struct {
 	err       error
 }
 
+// worktreeSetupResultMsg is sent when re-running the worktree setup script completes
+type worktreeSetupResultMsg struct {
+	sessionTitle string
+	err          error
+}
+
 // worktreeFinishResultMsg is sent when the worktree finish operation completes
 type worktreeFinishResultMsg struct {
 	sessionID    string
@@ -5058,6 +5064,14 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case worktreeSetupResultMsg:
+		if msg.err != nil {
+			h.setError(msg.err)
+		} else {
+			h.setError(fmt.Errorf("worktree setup completed for '%s'", msg.sessionTitle))
+		}
+		return h, nil
+
 	case worktreeFinishResultMsg:
 		if msg.err != nil {
 			// Show error in dialog (user can go back or cancel)
@@ -6853,6 +6867,22 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession {
 				h.groupDialog.ShowMove(h.scopedGroupPaths())
+			}
+		}
+		return h, nil
+
+	case "w":
+		// Re-run worktree setup script
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				inst := item.Session
+				if !inst.IsWorktree() {
+					h.setError(fmt.Errorf("session '%s' is not a worktree", inst.Title))
+					return h, nil
+				}
+				h.setError(fmt.Errorf("running worktree setup for '%s'...", inst.Title))
+				return h, h.runWorktreeSetup(inst)
 			}
 		}
 		return h, nil
@@ -14327,6 +14357,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(dirtyStyle.Render(dirtyLabel))
 		b.WriteString("\n")
 
+		// Setup hint
+		if setupKey := h.actionKey(hotkeyWorktreeSetup); setupKey != "" {
+			b.WriteString(wtHintStyle.Render("Setup:   "))
+			b.WriteString(wtKeyStyle.Render(setupKey))
+			b.WriteString(wtHintStyle.Render(" re-run setup script"))
+			b.WriteString("\n")
+		}
+
 		// Finish hint
 		if finishKey := h.actionKey(hotkeyWorktreeFinish); finishKey != "" {
 			b.WriteString(wtHintStyle.Render("Finish:  "))
@@ -15910,6 +15948,27 @@ func (h *Home) handleWorktreeFinishDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd
 
 // finishWorktree performs the worktree finish operation asynchronously:
 // merge branch, remove worktree, delete branch, kill session, remove from storage
+func (h *Home) runWorktreeSetup(inst *session.Instance) tea.Cmd {
+	repoRoot := inst.WorktreeRepoRoot
+	wtPath := inst.WorktreePath
+	title := inst.Title
+	return func() tea.Msg {
+		scriptPath, scriptMode := git.FindWorktreeSetupScript(repoRoot)
+		if scriptPath == "" {
+			return worktreeSetupResultMsg{
+				sessionTitle: title,
+				err:          fmt.Errorf("no setup script found at .agent-deck/worktree-setup.sh"),
+			}
+		}
+		var buf bytes.Buffer
+		err := git.RunWorktreeSetupScript(scriptPath, scriptMode, repoRoot, wtPath, &buf, &buf, session.GetWorktreeSettings().SetupTimeout())
+		if err != nil {
+			return worktreeSetupResultMsg{sessionTitle: title, err: fmt.Errorf("%w: %s", err, buf.String())}
+		}
+		return worktreeSetupResultMsg{sessionTitle: title}
+	}
+}
+
 func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, branchName, repoRoot, worktreePath string, mergeEnabled bool, targetBranch string, keepBranch bool) tea.Cmd {
 	return func() tea.Msg {
 		merged := false
