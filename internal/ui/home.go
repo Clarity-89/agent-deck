@@ -13278,28 +13278,30 @@ func (h *Home) renderCreatingSessionItem(
 	spinnerFrames := []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"}
 	spinner := spinnerFrames[h.animationFrame]
 
-	// Selection styling
-	if selected {
-		b.WriteString(lipgloss.NewStyle().
-			Foreground(ColorAccent).
-			Bold(true).
-			Render("▸ "))
-	} else {
-		b.WriteString("  ")
-	}
-
-	// Tree connector
-	if item.Level > 0 {
-		b.WriteString(TreeConnectorStyle.Render("├── "))
-	}
-
-	// Spinner + title
+	treeStyle := TreeConnectorStyle
+	selectionPrefix := " "
 	spinnerStyle := lipgloss.NewStyle().Foreground(ColorPurple)
 	titleStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
+	subtitleStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true)
+
+	if selected {
+		selectionPrefix = SessionSelectionPrefix.Render("▶")
+		treeStyle = TreeConnectorSelStyle
+		titleStyle = SessionTitleSelStyle.Italic(true)
+		subtitleStyle = SessionTitleSelStyle.Italic(true).Faint(true)
+		spinnerStyle = SessionStatusSelStyle
+	}
+
+	b.WriteString(selectionPrefix)
+
+	if item.Level > 0 {
+		b.WriteString(treeStyle.Render("├── "))
+	}
+
 	b.WriteString(spinnerStyle.Render(spinner))
 	b.WriteString(" ")
 	b.WriteString(titleStyle.Render(item.CreatingTitle))
-	b.WriteString(lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render(" (creating worktree...)"))
+	b.WriteString(subtitleStyle.Render(" (creating worktree...)"))
 	b.WriteString("\n")
 }
 
