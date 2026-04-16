@@ -109,7 +109,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyEditNotes:       "e",
 	hotkeyEditPaths:       "p",
 	hotkeyEditSession:     "P",
-	hotkeyWorktreeSetup:   "w",
+	hotkeyWorktreeSetup:   "b",
 	hotkeyWorktreeFinish:  "W",
 	hotkeyCreateGroup:     "g",
 	hotkeySearch:          "/",

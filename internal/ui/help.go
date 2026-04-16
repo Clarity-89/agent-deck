@@ -196,7 +196,7 @@ func (h *HelpOverlay) View() string {
 	}
 	editPathsKey := h.key(hotkeyEditPaths, "p")
 	editSessionKey := h.key(hotkeyEditSession, "P")
-	worktreeSetupKey := h.key(hotkeyWorktreeSetup, "w")
+	worktreeSetupKey := h.key(hotkeyWorktreeSetup, "b")
 	worktreeKey := h.key(hotkeyWorktreeFinish, "W")
 	watcherPanelKey := h.key(hotkeyWatcherPanel, "w")
 	groupKey := h.key(hotkeyCreateGroup, "g")

@@ -6888,8 +6888,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "w":
-		// Re-run worktree setup script
+	case "b":
+		// Re-run worktree setup script (bootstrap)
 		if h.cursor >= len(h.flatItems) {
 			return h, nil
 		}
