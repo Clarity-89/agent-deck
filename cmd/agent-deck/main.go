@@ -37,7 +37,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.51" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.55" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -2239,8 +2239,13 @@ func handleRename(profile string, args []string) {
 		}
 	}
 
-	inst.Title = newTitle
-	inst.SyncTmuxDisplayName()
+	// Route through SetField so the rename also sets TitleLocked — a direct
+	// Title assignment would be reverted by the #572 Claude-name sync on the
+	// next hook event.
+	if _, _, err := session.SetField(inst, session.FieldTitle, newTitle, nil); err != nil {
+		out.Error(fmt.Sprintf("failed to rename: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
