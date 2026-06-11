@@ -2564,6 +2564,9 @@ func (h *Home) setError(err error) {
 	h.err = err
 	if err != nil {
 		h.errTime = time.Now()
+		// Footer errors are otherwise invisible in debug.log, making
+		// post-hoc diagnosis of failed UI actions impossible.
+		uiLog.Error("ui_error", slog.String("err", err.Error()))
 	}
 }
 
@@ -4235,6 +4238,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case sessionCreatedMsg:
+		uiLog.Info("session_created_msg",
+			slog.Bool("has_err", msg.err != nil),
+			slog.String("temp_id", msg.tempID),
+			slog.Bool("has_instance", msg.instance != nil))
 		// Remove the creating placeholder (if any) — always, on success or error
 		if msg.tempID != "" {
 			delete(h.creatingSessions, msg.tempID)
@@ -9047,6 +9054,12 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 ) tea.Cmd {
 	return func() tea.Msg {
 		var setupWarning string
+
+		uiLog.Info("create_session_start",
+			slog.String("name", name),
+			slog.String("path", path),
+			slog.String("worktree_branch", worktreeBranch),
+			slog.String("temp_id", tempID))
 
 		// Check tmux availability before creating session
 		if err := tmux.IsTmuxAvailable(); err != nil {
