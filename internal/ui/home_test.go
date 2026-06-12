@@ -1315,10 +1315,81 @@ func TestRemoteRestartReturnsRemoteCommand(t *testing.T) {
 	_ = h
 }
 
-// TestRemoteSelectionNOpensNewDialog was removed with the #743 fix: it
-// codified d9a5de8's broken contract (n on a remote session opens the local
-// dialog). The regression guard now lives in
-// TestRegression743_NOnRemoteSession_QuickCreatesNoDialog.
+func TestRemoteSelectionNOpensRemoteAwareNewDialog(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:         "remote-123",
+		Title:      "remote-session",
+		RemoteName: "myserver",
+		Path:       "/srv/project",
+		Group:      "work",
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if cmd != nil {
+		t.Fatal("pressing n on a remote session should open the dialog, not quick-create")
+	}
+	if !h.newDialog.IsVisible() {
+		t.Fatal("pressing n on a remote session should open the new-session dialog")
+	}
+	if h.pendingRemoteName != "myserver" {
+		t.Fatalf("pendingRemoteName = %q, want myserver", h.pendingRemoteName)
+	}
+	if got := h.newDialog.GetSelectedGroup(); got != "work" {
+		t.Fatalf("selected group = %q, want work", got)
+	}
+	_, gotPath, _ := h.newDialog.GetRemoteValues()
+	if gotPath != "/srv/project" {
+		t.Fatalf("dialog path = %q, want /srv/project", gotPath)
+	}
+}
+
+func TestRemoteNewDialogCustomizationPreservesRemoteValues(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:         "remote-123",
+		Title:      "remote-session",
+		RemoteName: "myserver",
+		Path:       "/srv/project",
+		Group:      "work",
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	h := model.(*Home)
+	h.newDialog.nameInput.SetValue("custom remote")
+	h.newDialog.pathInput.SetValue("~/custom-project")
+	h.newDialog.SetDefaultTool("codex")
+
+	name, path, command := h.newDialog.GetRemoteValues()
+	if name != "custom remote" {
+		t.Fatalf("name = %q, want custom remote", name)
+	}
+	if path != "~/custom-project" {
+		t.Fatalf("path = %q, want ~/custom-project", path)
+	}
+	if command != "codex" {
+		t.Fatalf("command = %q, want codex", command)
+	}
+	group := h.newDialog.GetSelectedGroup()
+	if group != "work" {
+		t.Fatalf("group = %q, want work", group)
+	}
+
+}
 
 func TestSelectedRemotePreviewTarget(t *testing.T) {
 	home := NewHome()
@@ -1392,9 +1463,8 @@ func TestRenderRemotePreviewIncludesCachedResponse(t *testing.T) {
 	}
 }
 
-// TestRemoteGroupSelectionNOpensNewDialog was removed with the #743 fix —
-// see the note on TestRemoteSelectionNOpensNewDialog above. Guard lives in
-// TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog.
+// Remote group `n` behavior is covered by
+// TestRegression743_NOnRemoteGroup_OpensRemoteDialog.
 
 func TestRenderRemotePreviewShowsEmptyStateAfterFetch(t *testing.T) {
 	home := NewHome()
@@ -3018,6 +3088,92 @@ func TestRebuildFlatItemsGroupScope(t *testing.T) {
 	}
 }
 
+// RemoteSession N/A for collapsed-group headers: archive partitioning applies to
+// local ItemTypeSession rows; remote rows are excluded (see
+// TestRebuildFlatItemsArchivedViewOmitsRemoteSessions).
+func TestRebuildFlatItemsCollapsedGroupKeepsHeaderWithArchivedSessions(t *testing.T) {
+	h := &Home{}
+	instances := []*session.Instance{
+		session.NewInstanceWithGroup("active", "/tmp/a", "work"),
+		session.NewInstanceWithGroup("archived", "/tmp/b", "work"),
+	}
+	instances[1].ArchivedAt = time.Now().UTC()
+
+	h.groupTree = session.NewGroupTree(instances)
+	h.groupTree.CollapseGroup("work")
+	h.windowsCollapsed = make(map[string]bool)
+
+	h.rebuildFlatItems()
+
+	if len(h.flatItems) != 1 {
+		t.Fatalf("collapsed group with active sessions: got %d flat items, want 1 group header", len(h.flatItems))
+	}
+	if h.flatItems[0].Type != session.ItemTypeGroup || h.flatItems[0].Path != "work" {
+		t.Fatalf("expected collapsed work group header, got %+v", h.flatItems[0])
+	}
+}
+
+func TestRebuildFlatItemsCollapsedGroupKeepsHeaderInArchivedView(t *testing.T) {
+	h := NewHome()
+	h.statusFilter = FilterModeArchived
+
+	instances := []*session.Instance{
+		session.NewInstanceWithGroup("active", "/tmp/a", "work"),
+		session.NewInstanceWithGroup("archived", "/tmp/b", "work"),
+	}
+	instances[1].ArchivedAt = time.Now().UTC()
+	h.instancesMu.Lock()
+	h.instances = instances
+	h.instanceByID[instances[0].ID] = instances[0]
+	h.instanceByID[instances[1].ID] = instances[1]
+	h.instancesMu.Unlock()
+
+	h.groupTree = session.NewGroupTree(instances)
+	h.groupTree.CollapseGroup("work")
+	h.windowsCollapsed = make(map[string]bool)
+
+	h.rebuildFlatItems()
+	if h.statusFilter != FilterModeArchived {
+		t.Fatalf("statusFilter = %q, want %q", h.statusFilter, FilterModeArchived)
+	}
+
+	if len(h.flatItems) != 1 {
+		t.Fatalf("archived view + collapsed group: got %d flat items, want 1 group header", len(h.flatItems))
+	}
+	if h.flatItems[0].Type != session.ItemTypeGroup || h.flatItems[0].Path != "work" {
+		t.Fatalf("expected group header in archived view, got %+v", h.flatItems[0])
+	}
+}
+
+func TestRebuildFlatItemsArchivedViewOmitsRemoteSessions(t *testing.T) {
+	h := NewHome()
+	h.statusFilter = FilterModeArchived
+
+	inst := session.NewInstanceWithGroup("archived", "/tmp/b", "work")
+	inst.ArchivedAt = time.Now().UTC()
+	h.instancesMu.Lock()
+	h.instances = []*session.Instance{inst}
+	h.instanceByID[inst.ID] = inst
+	h.instancesMu.Unlock()
+
+	h.groupTree = session.NewGroupTree(h.instances)
+	h.windowsCollapsed = make(map[string]bool)
+
+	h.remoteSessionsMu.Lock()
+	h.remoteSessions = map[string][]session.RemoteSessionInfo{
+		"dev": {{ID: "remote-1", Title: "remote-session", RemoteName: "dev"}},
+	}
+	h.remoteSessionsMu.Unlock()
+
+	h.rebuildFlatItems()
+
+	for _, item := range h.flatItems {
+		if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
+			t.Fatalf("archived view should omit remote rows, got %+v", item)
+		}
+	}
+}
+
 func TestRebuildFlatItemsGroupScopeComposesWithStatusFilter(t *testing.T) {
 	h := &Home{}
 	h.groupScope = "work"
@@ -3329,13 +3485,16 @@ func TestHandleMainKeyQuickApproveSkipsNonClaudeTool(t *testing.T) {
 	}
 }
 
-// TestRegression743_NOnRemoteSession_QuickCreatesNoDialog guards #743.
+// TestRegression743_NOnRemoteSession_NeverCreatesLocally guards #743.
 // v1.7.68 shipped d9a5de8 which removed the remote early-return from the `n`
 // key handler, so pressing `n` on a remote session opened the local
-// newDialog and created a LOCAL session instead of a remote one. Restoring
-// the pre-d9a5de8 behavior: `n` on a remote-session cursor issues the remote
-// quick-create command and does NOT open the local new-session dialog.
-func TestRegression743_NOnRemoteSession_QuickCreatesNoDialog(t *testing.T) {
+// newDialog and created a LOCAL session instead of a remote one. Since #1353
+// the dialog DOES open for remote targets (so the user can pick a tool), but
+// the remote target must be recorded so submit routes the create to the
+// remote over SSH — the #743 invariant ("never create on localhost") is now
+// enforced at submit time. See issue1353_remote_new_dialog_test.go for the
+// submit-routing coverage.
+func TestRegression743_NOnRemoteSession_NeverCreatesLocally(t *testing.T) {
 	home := NewHome()
 	home.width = 100
 	home.height = 30
@@ -3344,22 +3503,22 @@ func TestRegression743_NOnRemoteSession_QuickCreatesNoDialog(t *testing.T) {
 	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
 	home.cursor = 0
 
-	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	h, ok := model.(*Home)
 	if !ok {
 		t.Fatal("handleMainKey should return *Home")
 	}
-	if cmd == nil {
-		t.Fatal("pressing n on a remote session must issue the remote quick-create command (was local dialog)")
+	if !h.newDialog.IsVisible() {
+		t.Fatal("pressing n on a remote session must open the new-session dialog (#1353)")
 	}
-	if h.newDialog.IsVisible() {
-		t.Fatal("pressing n on a remote session must NOT open the local new-session dialog")
+	if h.pendingRemoteName != "myserver" {
+		t.Fatalf("remote target must be recorded so submit creates on the remote, not localhost (#743); got %q", h.pendingRemoteName)
 	}
 }
 
-// TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog — same contract for
+// TestRegression743_NOnRemoteGroup_NeverCreatesLocally — same contract for
 // cursor on a remote group header row.
-func TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog(t *testing.T) {
+func TestRegression743_NOnRemoteGroup_NeverCreatesLocally(t *testing.T) {
 	home := NewHome()
 	home.width = 100
 	home.height = 30
@@ -3367,16 +3526,16 @@ func TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog(t *testing.T) {
 	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteGroup, RemoteName: "myserver", Path: "remotes/myserver"}}
 	home.cursor = 0
 
-	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	h, ok := model.(*Home)
 	if !ok {
 		t.Fatal("handleMainKey should return *Home")
 	}
-	if cmd == nil {
-		t.Fatal("pressing n on a remote group must issue the remote quick-create command")
+	if !h.newDialog.IsVisible() {
+		t.Fatal("pressing n on a remote group must open the new-session dialog (#1353)")
 	}
-	if h.newDialog.IsVisible() {
-		t.Fatal("pressing n on a remote group must NOT open the local new-session dialog")
+	if h.pendingRemoteName != "myserver" {
+		t.Fatalf("remote target must be recorded so submit creates on the remote, not localhost (#743); got %q", h.pendingRemoteName)
 	}
 }
 
