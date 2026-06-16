@@ -3277,6 +3277,11 @@ func (i *Instance) Start() error {
 	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell"
 	i.applyLaunchSettingsFromConfig()
 
+	// Re-assert the declarative per-group/per-conductor skill+mcp loadout
+	// BEFORE the tool process starts so project-scope discovery sees it.
+	// Idempotent: a healthy floor is a no-op; failures warn, never block.
+	ApplyConfiguredLoadout(i)
+
 	i.preAcceptCursorWorkspaceTrust()
 
 	// Start the tmux session
@@ -3519,6 +3524,10 @@ func (i *Instance) StartWithMessage(message string) error {
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
 	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell"
 	i.applyLaunchSettingsFromConfig()
+
+	// Re-assert the declarative skill+mcp loadout before spawn — sister
+	// call to Start(); see ApplyConfiguredLoadout.
+	ApplyConfiguredLoadout(i)
 
 	i.preAcceptCursorWorkspaceTrust()
 
@@ -6447,6 +6456,10 @@ func (i *Instance) Restart() error {
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
 	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell"
 	i.applyLaunchSettingsFromConfig()
+
+	// Re-assert the declarative skill+mcp loadout before respawn — sister
+	// call to Start(); config edits land on the next restart this way.
+	ApplyConfiguredLoadout(i)
 
 	mcpLog.Debug("restart_starting_new_session", slog.String("command", command))
 
