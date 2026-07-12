@@ -27,6 +27,7 @@ type GroupClaudeResolution struct {
 	ModelSource string `json:"model_source,omitempty"`
 
 	Env     map[string]string `json:"env,omitempty"`
+	Skills  []string          `json:"skills,omitempty"`
 	Plugins []string          `json:"plugins,omitempty"`
 	MCPs    []string          `json:"mcps,omitempty"`
 
@@ -107,6 +108,7 @@ func ResolveGroupClaude(groupPath string) GroupClaudeResolution {
 	}
 
 	res.Env = config.GetGroupClaudeEnv(groupPath)
+	res.Skills = config.GetGroupClaudeSkills(groupPath)
 	res.Plugins = config.GetGroupClaudePlugins(groupPath)
 	res.MCPs = config.GetGroupClaudeMCPs(groupPath)
 

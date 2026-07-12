@@ -746,7 +746,10 @@ type GroupClaudeSettings struct {
 	// Skills lists declarative skill-loadout entries ("<source>/<name>")
 	// attached to sessions in this group at create and re-asserted on
 	// every start (ApplyConfiguredLoadout — attach-only floor semantics).
-	// Surfaced by `group show --resolved`.
+	Skills []string `toml:"skills,omitempty"`
+
+	// Plugins lists [plugins.X] catalog keys unioned into Instance.Plugins.
+	// Catalog resolution remains the single plugin enablement path.
 	Plugins []string `toml:"plugins,omitempty"`
 
 	// MCPs lists [mcps.X] catalog names appended to the local .mcp.json
@@ -805,8 +808,10 @@ type ConductorClaudeSettings struct {
 	Env map[string]string `toml:"env,omitempty"`
 
 	// Skills lists declarative skill-loadout entries ("<source>/<name>")
-	// unioned on top of the group floor for this conductor's sessions
-	// (ApplyConfiguredLoadout — attach-only floor semantics).
+	// unioned on top of the group floor for this conductor's sessions.
+	Skills []string `toml:"skills,omitempty"`
+
+	// Plugins lists [plugins.X] catalog keys unioned on top of the group floor.
 	Plugins []string `toml:"plugins,omitempty"`
 
 	// MCPs lists [mcps.X] catalog names unioned on top of the group
@@ -1475,10 +1480,16 @@ func (c *UserConfig) GetGroupClaudeEnv(groupPath string) map[string]string {
 	return merged
 }
 
-// GetGroupClaudePlugins returns the union of skill-loadout entries along the
+// GetGroupClaudeSkills returns the union of skill-loadout entries along the
 // group ancestor chain, deduplicated, root-first. Union (not nearest-wins)
 // because the loadout is an attach-only floor: a child group declaring its
 // own skills adds to the parent's floor rather than replacing it.
+func (c *UserConfig) GetGroupClaudeSkills(groupPath string) []string {
+	return c.unionGroupClaudeList(groupPath, func(s GroupClaudeSettings) []string { return s.Skills })
+}
+
+// GetGroupClaudePlugins returns the union of catalog plugin keys along the
+// group ancestor chain, deduplicated and root-first.
 func (c *UserConfig) GetGroupClaudePlugins(groupPath string) []string {
 	return c.unionGroupClaudeList(groupPath, func(s GroupClaudeSettings) []string { return s.Plugins })
 }
@@ -1605,19 +1616,28 @@ func (c *UserConfig) GetConductorClaudeEnv(name string) map[string]string {
 	return cp
 }
 
-// GetConductorClaudePlugins returns the conductor-specific skill-loadout
+// GetConductorClaudeSkills returns the conductor-specific skill-loadout
 // entries, if configured. The effective loadout for a conductor session is
 // the union of its group chain's skills and this list (floor semantics).
+func (c *UserConfig) GetConductorClaudeSkills(name string) []string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return nil
+	}
+	src := c.Conductors[name].Claude.Skills
+	if len(src) == 0 {
+		return nil
+	}
+	// Defensive copy — see GetConductorClaudeEnv. Callers must not mutate the
+	// cached slice; the group skill getter likewise returns a fresh union slice.
+	return append([]string(nil), src...)
+}
+
+// GetConductorClaudePlugins returns conductor-specific catalog plugin keys.
 func (c *UserConfig) GetConductorClaudePlugins(name string) []string {
 	if c == nil || name == "" || c.Conductors == nil {
 		return nil
 	}
 	src := c.Conductors[name].Claude.Plugins
-	if len(src) == 0 {
-		return nil
-	}
-	// Defensive copy — see GetConductorClaudeEnv. Callers must not mutate the
-	// cached slice; the group plugin getter likewise returns a fresh union slice.
 	return append([]string(nil), src...)
 }
 

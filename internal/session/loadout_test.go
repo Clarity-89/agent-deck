@@ -62,11 +62,14 @@ func TestLoadout_MaterializesSkillsAndMCPs(t *testing.T) {
 command = "echo"
 
 [groups."work".claude]
-plugins = ["store/alpha"]
+skills = ["store/alpha"]
 mcps = ["memory"]
 `)
 	store := setupLoadoutStore(t, tmpHome)
 	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, ".mcp.json"), []byte(`{"mcpServers":{"manual":{"command":"manual"}}}`), 0o600); err != nil {
+		t.Fatalf("seed .mcp.json: %v", err)
+	}
 	inst := NewInstanceWithGroupAndTool("s1", project, "work/sub", "claude")
 
 	warnings := ApplyConfiguredLoadout(inst)
@@ -101,6 +104,9 @@ mcps = ["memory"]
 	if !strings.Contains(string(mcpData), "memory") {
 		t.Errorf(".mcp.json does not carry memory:\n%s", mcpData)
 	}
+	if !strings.Contains(string(mcpData), "manual") {
+		t.Errorf(".mcp.json did not preserve manual settings:\n%s", mcpData)
+	}
 }
 
 func TestLoadout_ReassertIsIdempotent(t *testing.T) {
@@ -109,7 +115,7 @@ func TestLoadout_ReassertIsIdempotent(t *testing.T) {
 command = "echo"
 
 [groups."work".claude]
-plugins = ["store/alpha"]
+skills = ["store/alpha"]
 mcps = ["memory"]
 `)
 	setupLoadoutStore(t, tmpHome)
@@ -128,7 +134,7 @@ mcps = ["memory"]
 func TestLoadout_HealsDeletedTarget(t *testing.T) {
 	tmpHome := withIsolatedHomeAndConfig(t, `
 [groups."work".claude]
-plugins = ["store/alpha"]
+skills = ["store/alpha"]
 `)
 	setupLoadoutStore(t, tmpHome)
 	project := t.TempDir()
@@ -151,7 +157,7 @@ plugins = ["store/alpha"]
 func TestLoadout_NeverClobbersForeignDir(t *testing.T) {
 	tmpHome := withIsolatedHomeAndConfig(t, `
 [groups."work".claude]
-plugins = ["store/alpha"]
+skills = ["store/alpha"]
 `)
 	setupLoadoutStore(t, tmpHome)
 	project := t.TempDir()
@@ -185,7 +191,7 @@ plugins = ["store/alpha"]
 func TestLoadout_MissingEntriesWarnDontFail(t *testing.T) {
 	tmpHome := withIsolatedHomeAndConfig(t, `
 [groups."work".claude]
-plugins = ["store/ghost"]
+skills = ["store/ghost"]
 mcps = ["ghostmcp"]
 `)
 	setupLoadoutStore(t, tmpHome)
@@ -211,7 +217,7 @@ func TestLoadout_ConfigRemovalDoesNotDetach(t *testing.T) {
 command = "echo"
 
 [groups."work".claude]
-plugins = ["store/alpha"]
+skills = ["store/alpha"]
 mcps = ["memory"]
 `)
 	setupLoadoutStore(t, tmpHome)
@@ -243,10 +249,10 @@ mcps = ["memory"]
 func TestLoadout_ConductorUnionsWithGroupFloor(t *testing.T) {
 	tmpHome := withIsolatedHomeAndConfig(t, `
 [groups."work".claude]
-plugins = ["store/alpha"]
+skills = ["store/alpha"]
 
 [conductors.lilu.claude]
-plugins = ["store/beta"]
+skills = ["store/beta"]
 `)
 	setupLoadoutStore(t, tmpHome)
 	project := t.TempDir()
@@ -259,10 +265,90 @@ plugins = ["store/beta"]
 	mustLstatSymlink(t, filepath.Join(project, ".claude", "skills", "beta"))
 }
 
+func TestLoadout_CatalogPluginsUnionAndPreserveManual(t *testing.T) {
+	withIsolatedHomeAndConfig(t, `
+[plugins.manual]
+name = "manual"
+source = "acme/manual"
+
+[plugins.parent]
+name = "parent"
+source = "acme/parent"
+
+[plugins.extra]
+name = "extra"
+source = "acme/extra"
+
+[plugins.refused]
+name = "telegram"
+source = "claude-plugins-official"
+
+[groups."work".claude]
+plugins = ["parent", "refused"]
+
+[conductors.lilu.claude]
+plugins = ["extra"]
+`)
+	inst := NewInstanceWithGroupAndTool("conductor-lilu", t.TempDir(), "work/sub", "claude")
+	inst.Plugins = []string{"manual"}
+
+	warnings := ApplyConfiguredLoadout(inst)
+	if got, want := strings.Join(inst.Plugins, ","), "manual,parent,extra"; got != want {
+		t.Fatalf("plugins=%q want %q", got, want)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "refused") {
+		t.Fatalf("expected one refused-plugin warning, got %v", warnings)
+	}
+}
+
+func TestLoadout_DoesNotSeedClaudeTrustWithoutSuccessfulSkillAttach(t *testing.T) {
+	withIsolatedHomeAndConfig(t, `
+[groups."work".claude]
+skills = ["missing/ghost"]
+`)
+	inst := NewInstanceWithGroupAndTool("s1", t.TempDir(), "work", "claude")
+	if warnings := ApplyConfiguredLoadout(inst); len(warnings) != 1 {
+		t.Fatalf("expected missing-skill warning, got %v", warnings)
+	}
+	if _, err := os.Stat(GetUserMCPRootPath()); !os.IsNotExist(err) {
+		t.Fatalf("trust state must not be created without a successful attach: %v", err)
+	}
+}
+
+func TestLoadout_RefusesForeignReplacementOfManagedSymlink(t *testing.T) {
+	tmpHome := withIsolatedHomeAndConfig(t, `
+[groups."work".claude]
+skills = ["store/alpha"]
+`)
+	setupLoadoutStore(t, tmpHome)
+	project := t.TempDir()
+	inst := NewInstanceWithGroupAndTool("s1", project, "work", "claude")
+	if warnings := ApplyConfiguredLoadout(inst); len(warnings) != 0 {
+		t.Fatalf("first apply: %v", warnings)
+	}
+	target := filepath.Join(project, ".claude", "skills", "alpha")
+	foreign := t.TempDir()
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("remove managed target: %v", err)
+	}
+	if err := os.Symlink(foreign, target); err != nil {
+		t.Fatalf("install foreign symlink: %v", err)
+	}
+	warnings := ApplyConfiguredLoadout(inst)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "not a healthy manifest-managed attachment") {
+		t.Fatalf("expected foreign-target refusal, got %v", warnings)
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	foreignResolved, foreignErr := filepath.EvalSymlinks(foreign)
+	if err != nil || foreignErr != nil || resolved != foreignResolved {
+		t.Fatalf("foreign symlink was changed: resolved=%q err=%v", resolved, err)
+	}
+}
+
 func TestLoadout_SkipsNonClaudeAndSSH(t *testing.T) {
 	tmpHome := withIsolatedHomeAndConfig(t, `
 [groups."work".claude]
-plugins = ["store/alpha"]
+skills = ["store/alpha"]
 `)
 	setupLoadoutStore(t, tmpHome)
 
@@ -307,6 +393,16 @@ plugins = [broken
 	warnings := ApplyConfiguredLoadout(inst)
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "config.toml error") {
 		t.Fatalf("broken config must yield exactly the inactive-loadout warning, got: %v", warnings)
+	}
+}
+
+func TestSanitizeLoadoutWarning_FlattensLineAndControlCharacters(t *testing.T) {
+	got := sanitizeLoadoutWarning("first\nsecond\r\u0085\u2028\u2029\u0090done")
+	if strings.ContainsAny(got, "\n\r\u0085\u2028\u2029\u0090") {
+		t.Fatalf("warning still contains line or control characters: %q", got)
+	}
+	if !strings.Contains(got, "first second") || !strings.Contains(got, "done") {
+		t.Fatalf("warning content was not preserved: %q", got)
 	}
 }
 

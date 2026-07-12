@@ -29,7 +29,7 @@ func TestAdd_MaterializesDeclarativeLoadout(t *testing.T) {
 command = "echo"
 
 [groups."work".claude]
-plugins = ["store/alpha"]
+skills = ["store/alpha"]
 mcps = ["memory", "ghostmcp"]
 `)
 

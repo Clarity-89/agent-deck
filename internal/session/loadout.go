@@ -4,13 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 )
 
 // ApplyConfiguredLoadout materializes the declarative per-group /
-// per-conductor skill and MCP loadout ([groups.X.claude].plugins/.mcps,
-// [conductors.X.claude].plugins/.mcps) for a claude-compatible session, by
+// per-conductor skill, plugin, and MCP loadout
+// ([groups.X.claude].skills/.plugins/.mcps and the conductor mirror) for a
+// claude-compatible session, by
 // driving the existing project-skills attach machinery and local .mcp.json
 // writer — exactly as if the user had run `skill attach` / `mcp attach` by
 // hand. Called at session create (add/launch) and re-asserted before every
@@ -59,6 +61,10 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 		return nil
 	}
 
+	skills := unionLoadoutEntries(
+		config.GetGroupClaudeSkills(inst.GroupPath),
+		config.GetConductorClaudeSkills(conductorNameFromInstance(inst)),
+	)
 	plugins := unionLoadoutEntries(
 		config.GetGroupClaudePlugins(inst.GroupPath),
 		config.GetConductorClaudePlugins(conductorNameFromInstance(inst)),
@@ -67,13 +73,13 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 		config.GetGroupClaudeMCPs(inst.GroupPath),
 		config.GetConductorClaudeMCPs(conductorNameFromInstance(inst)),
 	)
-	if len(plugins) == 0 && len(mcps) == 0 {
+	if len(skills) == 0 && len(plugins) == 0 && len(mcps) == 0 {
 		return nil
 	}
 
 	var warnings []string
 	warn := func(format string, args ...interface{}) {
-		w := fmt.Sprintf(format, args...)
+		w := sanitizeLoadoutWarning(fmt.Sprintf(format, args...))
 		warnings = append(warnings, w)
 		sessionLog.Warn("loadout_entry_skipped",
 			slog.String("session", inst.Title),
@@ -81,28 +87,52 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 			slog.String("detail", w))
 	}
 
-	for _, entry := range plugins {
+	attachedSkill := false
+	for _, entry := range skills {
 		attachment, err := AttachSkillToProject(inst.ProjectPath, inst.Tool, entry, "")
 		switch {
 		case err == nil:
+			attachedSkill = true
 			sessionLog.Info("loadout_skill_attached",
 				slog.String("session", inst.Title),
 				slog.String("skill", entry),
 				slog.String("target", attachment.TargetPath))
+		case errors.Is(err, ErrSkillAlreadyAttached) && healthyManagedSkillAttachment(inst.ProjectPath, entry):
+			// Healthy manifest-managed floor — nothing to do.
 		case errors.Is(err, ErrSkillAlreadyAttached):
-			// Healthy floor — nothing to do.
+			warn("skill %q: existing target is not a healthy manifest-managed attachment", entry)
 		case errors.Is(err, ErrSkillNotFound) || errors.Is(err, ErrSkillSourceNotFound):
-			warn("plugin %q: not found in the skill-source registry (register the store with `agent-deck skill source add`)", entry)
+			warn("skill %q: not found in the skill-source registry (register the store with `agent-deck skill source add`)", entry)
 		case errors.Is(err, ErrSkillAmbiguous):
-			warn("plugin %q: ambiguous — qualify as <source>/<name>: %v", entry, err)
+			warn("skill %q: ambiguous — qualify as <source>/<name>: %v", entry, err)
 		case errors.Is(err, ErrSkillUnsupportedKind):
-			warn("plugin %q: not an attachable directory skill: %v", entry, err)
+			warn("skill %q: not an attachable directory skill: %v", entry, err)
 		default:
 			// Covers the never-clobber conflicts ("target already exists and
 			// is not managed", "target already managed by …") and IO errors.
-			warn("plugin %q: %v", entry, err)
+			warn("skill %q: %v", entry, err)
 		}
 	}
+
+	// Catalog plugins are persisted on the instance and resolved by the
+	// existing scratch-config path. Manual plugins stay in place; configured
+	// entries only append. Unknown and refused catalog entries warn.
+	pluginSet := make(map[string]bool, len(inst.Plugins)+len(plugins))
+	for _, name := range inst.Plugins {
+		pluginSet[name] = true
+	}
+	for _, name := range plugins {
+		if pluginSet[name] {
+			continue
+		}
+		if GetPluginDef(name) == nil {
+			warn("plugin %q: not available in config.toml [plugins.%s] or refused by policy", name, name)
+			continue
+		}
+		inst.Plugins = append(inst.Plugins, name)
+		pluginSet[name] = true
+	}
+	syncPluginChannels(inst)
 
 	// Project-scope plugins only load when the cwd's realpath is trusted in
 	// ~/.claude.json (projects[<realpath>].hasTrustDialogAccepted). Seed it
@@ -114,7 +144,7 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 	// symlinks, and agent homes are commonly reached via synced/symlinked paths.
 	// Empirically one key is sufficient; hasCompletedProjectOnboarding is not
 	// required for plugin loading.
-	if len(plugins) > 0 {
+	if attachedSkill && inst.Tool == "claude" {
 		trustDir := inst.ProjectPath
 		if real, err := filepath.EvalSymlinks(trustDir); err == nil {
 			trustDir = real
@@ -166,6 +196,46 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 	}
 
 	return warnings
+}
+
+func sanitizeLoadoutWarning(value string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\u0085' || r == '\u2028' || r == '\u2029':
+			return ' '
+		case r < 0x20 || (r >= 0x7f && r <= 0x9f):
+			return -1
+		default:
+			return r
+		}
+	}, value)
+}
+
+// healthyManagedSkillAttachment verifies that ErrSkillAlreadyAttached came
+// from the manifest-managed target and, for symlink mode, that the link still
+// resolves to the recorded source. A foreign replacement must never be
+// accepted as a healthy declarative floor.
+func healthyManagedSkillAttachment(projectPath, skillID string) bool {
+	manifest, err := LoadProjectSkillsManifest(projectPath)
+	if err != nil {
+		return false
+	}
+	for _, attachment := range manifest.Skills {
+		if normalizeSkillToken(skillIDForAttachment(attachment)) != normalizeSkillToken(skillID) {
+			continue
+		}
+		target := resolveTargetPath(projectPath, attachment.TargetPath)
+		if _, err := os.Lstat(target); err != nil {
+			return false
+		}
+		if attachment.Mode != "symlink" {
+			return true
+		}
+		actual, actualErr := filepath.EvalSymlinks(target)
+		expected, expectedErr := filepath.EvalSymlinks(attachment.SourcePath)
+		return actualErr == nil && expectedErr == nil && actual == expected
+	}
+	return false
 }
 
 // unionLoadoutEntries merges loadout lists preserving order (group floor
