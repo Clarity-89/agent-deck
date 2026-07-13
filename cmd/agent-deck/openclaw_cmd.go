@@ -130,12 +130,15 @@ func handleOpenClawSync(profile string, args []string) {
 				existing.Title = agentDisplayName
 				updated++
 			}
+			existing.SetAutoName(false) // openclaw assigns a real agent name
 		}
 	}
 
 	// Save
 	groupTree := session.NewGroupTree(instances)
 	_ = groupsData // unused but loaded for completeness
+	userCfg, _ := session.LoadUserConfig()
+	groupTree.DefaultMaxConcurrent = userCfg.GroupDefaults.MaxConcurrent
 	groupTree.CreateGroup(groupName)
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to save sessions: %v\n", err)

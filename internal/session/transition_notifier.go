@@ -45,6 +45,14 @@ type TransitionNotificationEvent struct {
 	ToStatus       string    `json:"to_status"`
 	Timestamp      time.Time `json:"timestamp"`
 
+	// Substate is the additive Honest-Status-v2 refinement of ToStatus
+	// (model-unavailable, auth-401, idle-at-empty-prompt, running). It makes
+	// each status-transition event structured and substate-bearing so fleet
+	// telemetry (a future operational-KG sink) can distinguish a dead-model
+	// no-op loop from a genuinely-running session. Empty when no refinement
+	// applies. Observability hook only — does not affect delivery/dedup.
+	Substate string `json:"substate,omitempty"`
+
 	// LastOutputHash is a cheap stable signal (e.g. SHA-1 of the last N
 	// bytes of the child's tmux pane at transition time) used by the
 	// notifier's #1142 dedup to suppress repeated [EVENT] notifications
@@ -290,10 +298,15 @@ func (n *TransitionNotifier) NotifyTransition(event TransitionNotificationEvent)
 		event.DeliveryResult = transitionDeliveryDropped
 		return event
 	}
-	if isConductorSessionTitle(event.ChildTitle) {
-		event.DeliveryResult = transitionDeliveryDropped
-		return event
-	}
+	// Conductor self-suppression is applied DOWNSTREAM in resolveParentIDForInbox
+	// (inbox_outbox.go), which keys on the child's actual ParentSessionID: only a
+	// TOP-LEVEL/self-pointing conductor (empty/self parent) is dropped silently
+	// (deadLetterReasonSelfConductor). A conductor-TITLED child that has a real
+	// parent (e.g. a conductor-named worker) is a legitimate delivery and MUST NOT
+	// be dropped on its title alone. The previous isConductorSessionTitle
+	// pre-filter here did exactly that — it could only see the title, not the
+	// parent linkage, so it silently dropped completions for parented children
+	// whose title merely started with "conductor-".
 	if n.isDuplicate(event) {
 		event.DeliveryResult = transitionDeliveryDropped
 		return event
@@ -343,11 +356,13 @@ func (n *TransitionNotifier) NotifyFinished(event TransitionNotificationEvent) T
 		event.DeliveryResult = transitionDeliveryDropped
 		return event
 	}
-	if isConductorSessionTitle(event.ChildTitle) {
-		event.DeliveryResult = transitionDeliveryDropped
-		return event
-	}
 
+	// Conductor self-suppression is applied DOWNSTREAM in resolveParentIDForInbox
+	// (keyed on the child's real ParentSessionID): a TOP-LEVEL/self conductor is
+	// dropped silently; a conductor-TITLED child with a real parent is delivered.
+	// The title alone (the only data available here) cannot distinguish the two —
+	// the removed pre-filter dropped both, silently killing legitimate parented
+	// completions.
 	// Issue #1225: commit the finished event to the parent's durable outbox.
 	committed, transient, reason := n.commitEventToInbox(event)
 	if committed {

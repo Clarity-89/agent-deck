@@ -37,23 +37,25 @@ type StorageData struct {
 
 // InstanceData represents the serializable session data
 type InstanceData struct {
-	ID                 string    `json:"id"`
-	Title              string    `json:"title"`
-	ProjectPath        string    `json:"project_path"`
-	GroupPath          string    `json:"group_path"`
-	Order              int       `json:"order"`
-	ParentSessionID    string    `json:"parent_session_id,omitempty"`    // Links to parent session (sub-session support)
-	IsConductor        bool      `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
-	NoTransitionNotify bool      `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
-	TitleLocked        bool      `json:"title_locked,omitempty"`         // #697: block Claude session-name sync into Title
-	Command            string    `json:"command"`
-	Wrapper            string    `json:"wrapper,omitempty"`
-	Tool               string    `json:"tool"`
-	Status             Status    `json:"status"`
-	CreatedAt          time.Time `json:"created_at"`
-	LastAccessedAt     time.Time `json:"last_accessed_at,omitempty"`
-	ArchivedAt         time.Time `json:"archived_at,omitempty"`
-	TmuxSession        string    `json:"tmux_session"`
+	ID                  string    `json:"id"`
+	Title               string    `json:"title"`
+	ProjectPath         string    `json:"project_path"`
+	GroupPath           string    `json:"group_path"`
+	Order               int       `json:"order"`
+	ParentSessionID     string    `json:"parent_session_id,omitempty"`     // Links to parent session (sub-session support)
+	IsConductor         bool      `json:"is_conductor,omitempty"`          // True if this session is a conductor orchestrator
+	NoTransitionNotify  bool      `json:"no_transition_notify,omitempty"`  // Suppress transition event dispatch
+	TitleLocked         bool      `json:"title_locked,omitempty"`          // #697: block Claude session-name sync into Title
+	AutoName            bool      `json:"auto_name,omitempty"`             // marks Title as a machine-generated quick-session handle
+	AutoNameDescription string    `json:"auto_name_description,omitempty"` // last captured Claude task description for an AutoName session
+	Command             string    `json:"command"`
+	Wrapper             string    `json:"wrapper,omitempty"`
+	Tool                string    `json:"tool"`
+	Status              Status    `json:"status"`
+	CreatedAt           time.Time `json:"created_at"`
+	LastAccessedAt      time.Time `json:"last_accessed_at,omitempty"`
+	ArchivedAt          time.Time `json:"archived_at,omitempty"`
+	TmuxSession         string    `json:"tmux_session"`
 	// TmuxSocketName is the tmux -L selector captured at Instance creation
 	// (issue #687, v1.7.50). Empty for pre-v1.7.50 rows — those keep hitting
 	// the default server after upgrade.
@@ -67,6 +69,10 @@ type InstanceData struct {
 	// Account is the per-session named account (issue #924). See
 	// Instance.Account for full semantics.
 	Account string `json:"account,omitempty"`
+
+	// Pin anchors the session to the top/bottom of its group (pin-sessions).
+	// Round-trips through the pin column. Empty = not pinned.
+	Pin PinMode `json:"pin,omitempty"`
 
 	// Claude session (persisted for resume after app restart)
 	ClaudeSessionID  string    `json:"claude_session_id,omitempty"`
@@ -295,7 +301,15 @@ func (s *Storage) Save(instances []*Instance) error {
 }
 
 // SaveWithGroups persists instances and groups to SQLite.
-// Converts Instance objects to database rows, then batch-inserts in a transaction.
+// Converts Instance objects to database rows, then batch-upserts in a transaction.
+//
+// UPSERT-ONLY (#1550): this path never deletes rows. It used to route through
+// statedb.SaveInstances, whose `DELETE FROM instances WHERE id NOT IN (...)`
+// sweep let any process holding a stale snapshot silently delete sessions a
+// concurrent process created after that snapshot was loaded (the TUI-side twin
+// of #909/#1031). Deletions must be explicit and targeted instead:
+// DeleteInstance / RemoveSessionAndVerify at the moment the user deletes a
+// session, or statedb.ClearAllInstances for an intentional full wipe.
 func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -318,7 +332,7 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 		rows[i] = row
 	}
 
-	if err := s.db.SaveInstances(rows); err != nil {
+	if err := s.db.UpsertInstances(rows); err != nil {
 		return fmt.Errorf("failed to save instances: %w", err)
 	}
 
@@ -358,6 +372,46 @@ func (s *Storage) DeleteInstance(id string) error {
 
 	if err := s.db.DeleteInstance(id); err != nil {
 		return fmt.Errorf("failed to delete instance %s: %w", id, err)
+	}
+
+	_ = s.db.Touch()
+	return nil
+}
+
+// DeleteGroupSubtree removes a group and all of its descendants from the groups
+// table. SaveGroups is additive (upsert, never prune), so intentional group
+// removal — delete, rename, move — must call this explicitly; otherwise the old
+// path rows linger and the group resurrects on the next reload.
+func (s *Storage) DeleteGroupSubtree(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
+	}
+
+	if err := s.db.DeleteGroupSubtree(path); err != nil {
+		return fmt.Errorf("failed to delete group subtree %s: %w", path, err)
+	}
+
+	_ = s.db.Touch()
+	return nil
+}
+
+// WriteAutoNameDescription persists a single auto-named session's last captured
+// Claude task description via a targeted column update — no whole-row rewrite,
+// no full-table reconcile (see statedb.WriteAutoNameDescription). This lets the
+// archive path snapshot the display name without a full save.
+func (s *Storage) WriteAutoNameDescription(id, description string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
+	}
+
+	if err := s.db.WriteAutoNameDescription(id, description); err != nil {
+		return fmt.Errorf("failed to persist auto-name description for %s: %w", id, err)
 	}
 
 	_ = s.db.Touch()
@@ -561,6 +615,82 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 	return fmt.Errorf("%w: %s", ErrInsertNotPersistent, newInstance.ID)
 }
 
+// SyncInstanceCwd updates the persisted project_path for id to newCwd when they differ.
+// If newCwd matches an entry in the instance's additional_paths, positions are swapped
+// so the multi-repo primary reflects Claude's current working directory. Reports whether
+// the instance was found in this profile.
+func (s *Storage) SyncInstanceCwd(id, newCwd string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return false, fmt.Errorf("storage database not initialized")
+	}
+	row, err := s.db.LoadInstanceByID(id)
+	if err != nil {
+		return false, err
+	}
+	if row == nil {
+		return false, nil
+	}
+	if row.ProjectPath == newCwd {
+		return true, nil
+	}
+	newToolData, err := swapAdditionalPath(row.ToolData, row.ProjectPath, newCwd)
+	if err != nil {
+		return true, err
+	}
+	row.ToolData = newToolData
+	row.ProjectPath = newCwd
+	row.LastAccessed = time.Now()
+	if err := s.db.SaveInstance(row); err != nil {
+		return true, fmt.Errorf("failed to persist cwd for %s: %w", id, err)
+	}
+	_ = s.db.Touch()
+	return true, nil
+}
+
+// swapAdditionalPath rewrites the additional_paths list in a tool_data blob so
+// that if newCwd is present, its slot is replaced by oldCwd (multi-repo swap).
+// All other tool_data keys are preserved verbatim.
+func swapAdditionalPath(toolData json.RawMessage, oldCwd, newCwd string) (json.RawMessage, error) {
+	if len(toolData) == 0 {
+		return toolData, nil
+	}
+	var blob map[string]json.RawMessage
+	if err := json.Unmarshal(toolData, &blob); err != nil {
+		return toolData, nil
+	}
+	raw, ok := blob["additional_paths"]
+	if !ok || len(raw) == 0 {
+		return toolData, nil
+	}
+	var paths []string
+	if err := json.Unmarshal(raw, &paths); err != nil {
+		return toolData, nil
+	}
+	swapped := false
+	for i, p := range paths {
+		if p == newCwd {
+			paths[i] = oldCwd
+			swapped = true
+			break
+		}
+	}
+	if !swapped {
+		return toolData, nil
+	}
+	updated, err := json.Marshal(paths)
+	if err != nil {
+		return toolData, err
+	}
+	blob["additional_paths"] = updated
+	out, err := json.Marshal(blob)
+	if err != nil {
+		return toolData, err
+	}
+	return out, nil
+}
+
 // saveSingleInstance writes one row via the targeted SaveInstance path
 // (single-row INSERT OR REPLACE — no DELETE-NOT-IN sweep). Wraps the
 // statedb call in the storage mutex and the nil-db guard so callers
@@ -695,29 +825,32 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	toolData = WriteIdleTimeoutSecsToToolData(toolData, inst.IdleTimeoutSecs)
 
 	return &statedb.InstanceRow{
-		ID:                 inst.ID,
-		Title:              inst.Title,
-		ProjectPath:        inst.ProjectPath,
-		GroupPath:          inst.GroupPath,
-		Order:              inst.Order,
-		Command:            inst.Command,
-		Wrapper:            inst.Wrapper,
-		Tool:               inst.Tool,
-		Status:             string(inst.Status),
-		TmuxSession:        tmuxName,
-		TmuxSocketName:     inst.TmuxSocketName,
-		CreatedAt:          inst.CreatedAt,
-		LastAccessed:       inst.LastAccessedAt,
-		ParentSessionID:    inst.ParentSessionID,
-		IsConductor:        inst.IsConductor,
-		NoTransitionNotify: inst.NoTransitionNotify,
-		TitleLocked:        inst.TitleLocked,
-		WorktreePath:       inst.WorktreePath,
-		WorktreeRepo:       inst.WorktreeRepoRoot,
-		WorktreeBranch:     inst.WorktreeBranch,
-		Account:            inst.Account,
-		ArchivedAt:         inst.ArchivedAt,
-		ToolData:           toolData,
+		ID:                  inst.ID,
+		Title:               inst.Title,
+		ProjectPath:         inst.ProjectPath,
+		GroupPath:           inst.GroupPath,
+		Order:               inst.Order,
+		Command:             inst.Command,
+		Wrapper:             inst.Wrapper,
+		Tool:                inst.Tool,
+		Status:              string(inst.Status),
+		TmuxSession:         tmuxName,
+		TmuxSocketName:      inst.TmuxSocketName,
+		CreatedAt:           inst.CreatedAt,
+		LastAccessed:        inst.LastAccessedAt,
+		ParentSessionID:     inst.ParentSessionID,
+		IsConductor:         inst.IsConductor,
+		NoTransitionNotify:  inst.NoTransitionNotify,
+		TitleLocked:         inst.TitleLocked,
+		AutoName:            inst.GetAutoName(),
+		AutoNameDescription: inst.GetAutoNameDescription(),
+		WorktreePath:        inst.WorktreePath,
+		WorktreeRepo:        inst.WorktreeRepoRoot,
+		WorktreeBranch:      inst.WorktreeBranch,
+		Account:             inst.Account,
+		ArchivedAt:          inst.ArchivedAt,
+		Pin:                 string(inst.Pin),
+		ToolData:            toolData,
 	}, nil
 }
 
@@ -816,6 +949,8 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			IsConductor:               r.IsConductor,
 			NoTransitionNotify:        r.NoTransitionNotify,
 			TitleLocked:               r.TitleLocked,
+			AutoName:                  r.AutoName,
+			AutoNameDescription:       r.AutoNameDescription,
 			Command:                   r.Command,
 			Wrapper:                   r.Wrapper,
 			Tool:                      r.Tool,
@@ -829,6 +964,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			WorktreeRepoRoot:          r.WorktreeRepo,
 			WorktreeBranch:            r.WorktreeBranch,
 			Account:                   r.Account,
+			Pin:                       PinMode(r.Pin),
 			ClaudeSessionID:           claudeSID,
 			ClaudeDetectedAt:          claudeAt,
 			GeminiSessionID:           geminiSID,
@@ -932,6 +1068,8 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			IsConductor:               r.IsConductor,
 			NoTransitionNotify:        r.NoTransitionNotify,
 			TitleLocked:               r.TitleLocked,
+			AutoName:                  r.AutoName,
+			AutoNameDescription:       r.AutoNameDescription,
 			Command:                   r.Command,
 			Wrapper:                   r.Wrapper,
 			Tool:                      r.Tool,
@@ -945,6 +1083,7 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			WorktreeRepoRoot:          r.WorktreeRepo,
 			WorktreeBranch:            r.WorktreeBranch,
 			Account:                   r.Account,
+			Pin:                       PinMode(r.Pin),
 			ClaudeSessionID:           claudeSID,
 			ClaudeDetectedAt:          claudeAt,
 			GeminiSessionID:           geminiSID,
@@ -1184,6 +1323,8 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			IsConductor:               instData.IsConductor,
 			NoTransitionNotify:        instData.NoTransitionNotify,
 			TitleLocked:               instData.TitleLocked,
+			AutoName:                  instData.AutoName,
+			autoNameDescription:       instData.AutoNameDescription,
 			Command:                   instData.Command,
 			Wrapper:                   instData.Wrapper,
 			Tool:                      instData.Tool,
@@ -1195,6 +1336,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			WorktreeRepoRoot:          instData.WorktreeRepoRoot,
 			WorktreeBranch:            instData.WorktreeBranch,
 			Account:                   instData.Account,
+			Pin:                       instData.Pin,
 			TmuxSocketName:            instData.TmuxSocketName,
 			ClaudeSessionID:           instData.ClaudeSessionID,
 			ClaudeDetectedAt:          instData.ClaudeDetectedAt,

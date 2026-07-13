@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -103,6 +104,115 @@ func TestSaveLoadInstances(t *testing.T) {
 	// Verify tool_data round-trip
 	if string(loaded[0].ToolData) != `{"claude_session_id":"abc"}` {
 		t.Errorf("ToolData mismatch: %s", loaded[0].ToolData)
+	}
+}
+
+func TestSetArchivedPersistsTimestampIndependently(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now()
+	if err := db.SaveInstance(&InstanceRow{
+		ID:          "arch-1",
+		Title:       "indigo-jay",
+		ProjectPath: "/tmp/project",
+		GroupPath:   "grp",
+		Tool:        "claude",
+		Status:      "error",
+		CreatedAt:   now,
+		ToolData:    json.RawMessage("{}"),
+	}); err != nil {
+		t.Fatalf("seed SaveInstance: %v", err)
+	}
+
+	rowByID := func() *InstanceRow {
+		t.Helper()
+		rows, err := db.LoadInstances()
+		if err != nil {
+			t.Fatalf("LoadInstances: %v", err)
+		}
+		for _, r := range rows {
+			if r.ID == "arch-1" {
+				return r
+			}
+		}
+		t.Fatalf("instance arch-1 not found")
+		return nil
+	}
+
+	// Precondition: not archived.
+	if got := rowByID(); !got.ArchivedAt.IsZero() {
+		t.Fatalf("expected unarchived, got archived_at=%v", got.ArchivedAt)
+	}
+
+	// Archive via the targeted update.
+	archivedAt := time.Unix(1781626272, 0).UTC()
+	if err := db.SetArchived("arch-1", archivedAt); err != nil {
+		t.Fatalf("SetArchived(archive): %v", err)
+	}
+	if got := rowByID(); got.ArchivedAt.Unix() != archivedAt.Unix() {
+		t.Errorf("archive not persisted: got archived_at=%v, want %v", got.ArchivedAt, archivedAt)
+	}
+
+	// Unarchive by setting the zero time.
+	if err := db.SetArchived("arch-1", time.Time{}); err != nil {
+		t.Fatalf("SetArchived(unarchive): %v", err)
+	}
+	if got := rowByID(); !got.ArchivedAt.IsZero() {
+		t.Errorf("unarchive not persisted: got archived_at=%v, want zero", got.ArchivedAt)
+	}
+}
+
+func TestSaveInstancesPreservesFreshAutoNameFieldsFromStaleSnapshot(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now()
+	row := &InstanceRow{
+		ID:          "auto-1",
+		Title:       "lively-fjord",
+		ProjectPath: "/tmp/project",
+		GroupPath:   "grp",
+		Tool:        "claude",
+		Status:      "idle",
+		CreatedAt:   now,
+		ToolData:    json.RawMessage("{}"),
+		AutoName:    true,
+	}
+	if err := db.SaveInstances([]*InstanceRow{row}); err != nil {
+		t.Fatalf("seed SaveInstances: %v", err)
+	}
+
+	if err := db.WriteAutoNameDescription(row.ID, "Review SketchUp house models"); err != nil {
+		t.Fatalf("WriteAutoNameDescription: %v", err)
+	}
+
+	stale := *row
+	stale.AutoNameDescription = ""
+	if err := db.SaveInstances([]*InstanceRow{&stale}); err != nil {
+		t.Fatalf("stale SaveInstances: %v", err)
+	}
+
+	loaded, err := db.LoadInstances()
+	if err != nil {
+		t.Fatalf("LoadInstances: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("loaded %d rows, want 1", len(loaded))
+	}
+	if got := loaded[0].AutoNameDescription; got != "Review SketchUp house models" {
+		t.Errorf("AutoNameDescription after stale SaveInstances = %q, want fresh DB value", got)
+	}
+
+	if _, err := db.DB().Exec(`UPDATE instances SET auto_name = 0 WHERE id = ?`, row.ID); err != nil {
+		t.Fatalf("clear auto_name directly: %v", err)
+	}
+	stale.AutoName = true
+	if err := db.SaveInstances([]*InstanceRow{&stale}); err != nil {
+		t.Fatalf("stale AutoName SaveInstances: %v", err)
+	}
+	loaded, err = db.LoadInstances()
+	if err != nil {
+		t.Fatalf("LoadInstances after stale AutoName save: %v", err)
+	}
+	if loaded[0].AutoName {
+		t.Error("AutoName resurrected after stale SaveInstances, want cleared DB value preserved")
 	}
 }
 
@@ -486,28 +596,91 @@ func TestElectPrimary_FirstInstance(t *testing.T) {
 func TestElectPrimary_SecondInstance(t *testing.T) {
 	db := newTestDB(t)
 
-	// Simulate first instance (PID 10001) as primary with fresh heartbeat
+	// Simulate first instance as primary with a fresh heartbeat. Use the test
+	// process's own PID so it is a genuinely *live* owner: ElectPrimary now
+	// verifies process liveness, so a fabricated dead PID would no longer count
+	// as an active primary (see TestElectPrimary_DeadPrimaryFreshHeartbeat).
+	ownerPID := os.Getpid()
 	now := time.Now().Unix()
 	_, err := db.DB().Exec(
 		"INSERT INTO instance_heartbeats (pid, started, heartbeat, is_primary) VALUES (?, ?, ?, ?)",
-		10001, now, now, 1,
+		ownerPID, now, now, 1,
 	)
 	if err != nil {
 		t.Fatalf("Insert primary: %v", err)
 	}
 
-	// Register our process (not primary yet)
-	if err := db.RegisterInstance(false); err != nil {
-		t.Fatalf("RegisterInstance: %v", err)
+	// Electing instance is a *different* pid than the live owner.
+	db.pid = pickDeadPID(ownerPID)
+	if _, err := db.DB().Exec(
+		"INSERT INTO instance_heartbeats (pid, started, heartbeat, is_primary) VALUES (?, ?, ?, ?)",
+		db.pid, now, now, 0,
+	); err != nil {
+		t.Fatalf("Insert second instance: %v", err)
 	}
 
-	// Try to elect: should fail because PID 10001 is alive and primary
+	// Try to elect: should fail because the owner PID is alive and primary.
 	isPrimary, err := db.ElectPrimary(30 * time.Second)
 	if err != nil {
 		t.Fatalf("ElectPrimary: %v", err)
 	}
 	if isPrimary {
 		t.Error("Second instance should NOT become primary while first is alive")
+	}
+}
+
+// pickDeadPID returns a positive PID that is not alive and not equal to avoid.
+// Used to model a primary left behind by a crashed/killed process.
+func pickDeadPID(avoid int) int {
+	for pid := 2147480000; pid > 1; pid-- {
+		if pid == avoid {
+			continue
+		}
+		if !pidAlive(pid) {
+			return pid
+		}
+	}
+	return 99999
+}
+
+// TestElectPrimary_DeadPrimaryFreshHeartbeat is the regression test for the
+// "restart requires manual pkill" bug. A primary row whose PID is dead but
+// whose heartbeat is still within the staleness window must NOT block a new
+// instance from becoming primary — otherwise an unclean exit leaves agent-deck
+// unstartable until the window elapses or the user pkills.
+func TestElectPrimary_DeadPrimaryFreshHeartbeat(t *testing.T) {
+	db := newTestDB(t)
+
+	deadPID := pickDeadPID(os.Getpid())
+	now := time.Now().Unix() // fresh: NOT stale by time
+	if _, err := db.DB().Exec(
+		"INSERT INTO instance_heartbeats (pid, started, heartbeat, is_primary) VALUES (?, ?, ?, ?)",
+		deadPID, now, now, 1,
+	); err != nil {
+		t.Fatalf("Insert dead primary: %v", err)
+	}
+
+	if err := db.RegisterInstance(false); err != nil {
+		t.Fatalf("RegisterInstance: %v", err)
+	}
+
+	isPrimary, err := db.ElectPrimary(30 * time.Second)
+	if err != nil {
+		t.Fatalf("ElectPrimary: %v", err)
+	}
+	if !isPrimary {
+		t.Error("New instance should become primary when the prior primary's PID is dead, even with a fresh heartbeat")
+	}
+
+	// The dead PID must have been demoted.
+	var deadIsPrimary int
+	if err := db.DB().QueryRow(
+		"SELECT is_primary FROM instance_heartbeats WHERE pid = ?", deadPID,
+	).Scan(&deadIsPrimary); err != nil {
+		t.Fatalf("Query dead PID: %v", err)
+	}
+	if deadIsPrimary != 0 {
+		t.Error("Dead PID should have is_primary=0 after reclaim")
 	}
 }
 
@@ -810,6 +983,54 @@ func TestMigrate_OldSchema_AcknowledgedColumn(t *testing.T) {
 	statuses, _ = db.ReadAllStatuses()
 	if statuses["existing-1"].Acknowledged {
 		t.Error("running status should clear acknowledged flag on migrated DB")
+	}
+}
+
+// TestMigrate_OldSchema_LastSentAtColumn verifies the v13 self-heal migration:
+// upgrading a pre-last_sent_at DB adds the column, defaults legacy rows to 0
+// ("never sent" → deliberate-idle, never a self-heal candidate), preserves the
+// existing row, and the targeted Write/ReadLastSentAt helpers work without
+// touching any other column.
+func TestMigrate_OldSchema_LastSentAtColumn(t *testing.T) {
+	db := createV1SchemaDB(t)
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate() on v1 schema failed: %v", err)
+	}
+
+	// Legacy row survives, and last_sent_at defaults to 0.
+	insts, err := db.LoadInstances()
+	if err != nil {
+		t.Fatalf("LoadInstances after migrate: %v", err)
+	}
+	if len(insts) != 1 || insts[0].ID != "existing-1" {
+		t.Fatalf("legacy row not preserved: %+v", insts)
+	}
+	ts, err := db.ReadLastSentAt("existing-1")
+	if err != nil {
+		t.Fatalf("ReadLastSentAt: %v", err)
+	}
+	if ts != 0 {
+		t.Fatalf("legacy row last_sent_at must default to 0, got %d", ts)
+	}
+
+	// Targeted write round-trips and does not disturb the title/status.
+	const sent = int64(1780000123)
+	if err := db.WriteLastSentAt("existing-1", sent); err != nil {
+		t.Fatalf("WriteLastSentAt: %v", err)
+	}
+	ts, _ = db.ReadLastSentAt("existing-1")
+	if ts != sent {
+		t.Fatalf("ReadLastSentAt = %d, want %d", ts, sent)
+	}
+	insts2, _ := db.LoadInstances()
+	if insts2[0].Title != "My Session" {
+		t.Fatalf("WriteLastSentAt disturbed another column: title=%q", insts2[0].Title)
+	}
+
+	// Unknown id reads 0, not an error (no row).
+	if v, err := db.ReadLastSentAt("nope"); err != nil || v != 0 {
+		t.Fatalf("ReadLastSentAt(unknown) = %d, %v; want 0, nil", v, err)
 	}
 }
 
@@ -1798,4 +2019,29 @@ func createV9SchemaDB(t *testing.T) *StateDB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+func TestTakeMeta(t *testing.T) {
+	db := newTestDB(t)
+
+	// Absent key → "" and no error.
+	if got, err := db.TakeMeta("focus_request"); err != nil || got != "" {
+		t.Fatalf("absent TakeMeta = (%q, %v), want (\"\", nil)", got, err)
+	}
+
+	// Set then take → returns the value and clears it atomically.
+	if err := db.SetMeta("focus_request", "payload"); err != nil {
+		t.Fatalf("SetMeta: %v", err)
+	}
+	got, err := db.TakeMeta("focus_request")
+	if err != nil || got != "payload" {
+		t.Fatalf("TakeMeta = (%q, %v), want (\"payload\", nil)", got, err)
+	}
+	// Cleared: a second take yields "" (consume-once).
+	if got, err := db.TakeMeta("focus_request"); err != nil || got != "" {
+		t.Fatalf("second TakeMeta = (%q, %v), want (\"\", nil)", got, err)
+	}
+	if got, err := db.GetMeta("focus_request"); err != nil || got != "" {
+		t.Fatalf("GetMeta after take = (%q, %v), want (\"\", nil)", got, err)
+	}
 }

@@ -4,11 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,6 +33,113 @@ const sshAttachReplyQuarantine = 500 * time.Millisecond
 
 // sshControlDir is the directory for SSH ControlMaster sockets.
 const sshControlDir = "/tmp/agent-deck-ssh"
+
+// staleSocketProbeTimeout bounds the per-socket liveness dial in
+// CleanStaleSSHSockets. It is deliberately short: a healthy master answers a
+// Unix-socket connect essentially instantly (the listener is local), so a dial
+// that does not connect within this window is treated as unreachable.
+const staleSocketProbeTimeout = 250 * time.Millisecond
+
+// CleanStaleSSHSockets removes orphaned SSH ControlMaster sockets from
+// sshControlDir (#1421). When an SSH master process dies unexpectedly (remote
+// agent-deck update restarts sshd, network drop, remote reboot), its
+// ControlPath socket file is left behind on disk with no process listening on
+// it. Because agent-deck uses ControlMaster=auto, the NEXT ssh invocation tries
+// to reuse that stale socket and hangs indefinitely — ConnectTimeout only
+// bounds the initial TCP dial, NOT the Unix-domain-socket connect to the mux.
+// The result: fetchRemoteSessions (and `agent-deck remote sessions`) block
+// forever and every remote session disappears from the TUI until restart.
+//
+// The cleanup probes each socket with a short net.DialTimeout. A live master
+// answers the connect immediately; a stale socket cannot be connected to
+// (connection refused — the listener is gone), so it is removed. Removing a
+// stale socket is safe: the next ssh invocation simply opens a fresh master.
+//
+// Best-effort and fully defensive: an unreadable directory, a transient stat
+// error, or a failed remove is swallowed (logged at debug), never fatal —
+// leaving a socket in place is strictly better than blocking the caller.
+// Non-socket files in the directory are ignored.
+func CleanStaleSSHSockets() {
+	cleanStaleSSHSocketsIn(sshControlDir)
+}
+
+// cleanStaleSSHSocketsIn is the dir-parameterized core of CleanStaleSSHSockets,
+// split out so tests can exercise the probe/remove logic against a temp dir
+// instead of the process-global /tmp/agent-deck-ssh (which a live agent-deck
+// shares).
+func cleanStaleSSHSocketsIn(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// Directory missing (no remotes ever used) or unreadable: nothing to do.
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+
+		info, statErr := entry.Info()
+		if statErr != nil {
+			continue
+		}
+		// Only probe Unix sockets — skip regular files / anything unexpected.
+		if info.Mode()&os.ModeSocket == 0 {
+			continue
+		}
+
+		conn, dialErr := net.DialTimeout("unix", path, staleSocketProbeTimeout)
+		if dialErr == nil {
+			// A process is listening: the master is alive, keep the socket.
+			_ = conn.Close()
+			continue
+		}
+		// Only remove on a CONFIRMED-dead signal. A bare "dial failed" is not
+		// enough: a timeout (busy master with a full accept backlog), EMFILE /
+		// ENOMEM (local fd/memory exhaustion), or EACCES (transient permission)
+		// do NOT prove the master is gone, and unlinking on those would tear
+		// down a LIVE ControlMaster. ECONNREFUSED is the unambiguous "socket
+		// file exists but nothing is listening" signal a dead master leaves;
+		// ENOENT means it is already gone. Anything else: keep the socket and
+		// log (#1421, Codex review).
+		if !isStaleSocketDialErr(dialErr) {
+			slog.Debug("ssh: ControlMaster socket probe inconclusive, keeping socket",
+				slog.String("path", path), slog.String("err", dialErr.Error()))
+			continue
+		}
+		// The listening master is gone. Remove the orphan so the next ssh
+		// ControlMaster=auto opens a fresh master instead of hanging on it.
+		if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			slog.Debug("ssh: failed to remove stale ControlMaster socket",
+				slog.String("path", path), slog.String("err", rmErr.Error()))
+		} else {
+			slog.Debug("ssh: removed stale ControlMaster socket", slog.String("path", path))
+		}
+	}
+}
+
+// isStaleSocketDialErr reports whether a net.DialTimeout error against a Unix
+// socket unambiguously means "the socket file exists but nothing is listening"
+// — i.e. the SSH master is dead and the socket is safe to remove. Only
+// ECONNREFUSED (no listener) and ENOENT (already gone) qualify. Timeouts and
+// resource errors (EMFILE/ENOMEM/EACCES) are deliberately excluded: they can
+// occur against a LIVE master, and removing on them would tear down a healthy
+// ControlMaster (#1421).
+func isStaleSocketDialErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) {
+		return true
+	}
+	// A timeout is explicitly NOT stale: a busy master with a full accept
+	// backlog can time out. Be conservative — keep the socket.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	return false
+}
 
 // SSHRunner executes commands on a remote host via SSH.
 type SSHRunner struct {
@@ -472,12 +584,30 @@ func (r *SSHRunner) remoteExec(ctx context.Context, remoteCmd string, stdin []by
 	return stdout.Bytes(), nil
 }
 
-// parseRemoteVersion extracts the version from `agent-deck version` output,
-// e.g. "Agent Deck v0.20.2" -> "0.20.2".
+// remoteVersionRe matches the first semver-looking token (with optional
+// dotted/pre-release tail) in `agent-deck version` output. The leading "v" is
+// optional and not captured.
+var remoteVersionRe = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:[.\-+][0-9A-Za-z.\-]+)?)`)
+
+// parseRemoteVersion extracts the binary's ACTUAL current version from
+// `agent-deck version` output, e.g. "Agent Deck v0.20.2" -> "0.20.2".
+//
+// It returns the FIRST semver token, which is the real current version right
+// after "Agent Deck v". This matters because a binary one release behind prints
+// its version with an "(update available: vNEWER)" suffix, e.g.
+// "Agent Deck v1.9.49 (update available: v1.9.55)". A naive
+// strings.LastIndex(out, "v") landed on the advertised newer version and
+// returned "1.9.55)" (trailing paren and all), so callers mis-read the remote
+// as already up to date and skipped the update — a catch-22 where a remote
+// could never be updated while it advertised one. Anchoring on the first
+// semver token fixes that and is robust to trailing punctuation/whitespace.
+//
+// Falls back to the trimmed raw input when no semver token is found so callers
+// still behave.
 func parseRemoteVersion(raw string) string {
 	out := strings.TrimSpace(raw)
-	if idx := strings.LastIndex(out, "v"); idx >= 0 {
-		return strings.TrimSpace(out[idx+1:])
+	if m := remoteVersionRe.FindStringSubmatch(out); m != nil {
+		return m[1]
 	}
 	return out
 }
@@ -639,13 +769,7 @@ func (r *SSHRunner) InstallBinary(ctx context.Context, binaryData []byte, expect
 //
 // See the README "Remote Instances" section for the documented assumption.
 func (r *SSHRunner) sshConnOpts() []string {
-	return []string{
-		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + sshControlDir + "/%r@%h:%p",
-		"-o", "ControlPersist=600",
-		"-o", "ConnectTimeout=10",
-		"-o", "BatchMode=yes",
-	}
+	return sessionSSHConnOpts()
 }
 
 // ValidateSSHHost rejects host strings ssh would misinterpret as options rather

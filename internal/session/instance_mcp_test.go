@@ -17,6 +17,12 @@ func TestMCPLocalConfigPathForTool(t *testing.T) {
 	if p := MCPLocalConfigPathForTool("gemini", proj); p != "" {
 		t.Fatalf("gemini: want empty project-local path, got %q", p)
 	}
+	if p := MCPLocalConfigPathForTool("opencode", proj); p != filepath.Join(proj, "opencode.json") {
+		t.Fatalf("opencode: got %q", p)
+	}
+	if p := MCPLocalConfigPathForTool("codex", proj); p != "" {
+		t.Fatalf("codex: want empty project-local path, got %q", p)
+	}
 	if MCPLocalConfigPathForTool("claude", "") != "" {
 		t.Fatal("empty project path")
 	}
@@ -45,6 +51,9 @@ func TestMCPInfoForLocalAttach_GeminiUsesProjectMcpJsonWalker(t *testing.T) {
 func TestToolSupportsMCPManager(t *testing.T) {
 	if !ToolSupportsMCPManager("claude") || !ToolSupportsMCPManager("gemini") || !ToolSupportsMCPManager("cursor") {
 		t.Fatal("expected claude, gemini, cursor")
+	}
+	if !ToolSupportsMCPManager("opencode") || !ToolSupportsMCPManager("codex") {
+		t.Fatal("expected opencode and codex")
 	}
 	if ToolSupportsMCPManager("shell") || ToolSupportsMCPManager("") {
 		t.Fatal("unexpected tool")

@@ -7,7 +7,7 @@
 import { html } from 'htm/preact'
 import { Logo, Icon, ICONS } from './icons.js'
 import { menuModelSignal } from './dataModel.js'
-import { connectionSignal, profilesSignal } from './state.js'
+import { connectionSignal, profilesSignal, commandCenterSignal } from './state.js'
 import {
   activeTabSignal, paletteOpenSignal, tweaksOpenSignal,
   railSignal, profileSignal,
@@ -15,6 +15,7 @@ import {
 import { ToastHistoryDrawerToggle } from './ToastHistoryDrawer.js'
 
 const TABS = [
+  { id: 'command-center', label: 'Command Center' },
   { id: 'fleet',     label: 'Fleet'     },
   { id: 'terminal',  label: 'Terminal'  },
   { id: 'mcp',       label: 'MCPs'      },
@@ -33,6 +34,8 @@ export function Topbar() {
   const { sessions } = menuModelSignal.value
   const sessionsBadge = sessions.filter(s => s.status === 'waiting' || s.status === 'error').length
   const pendingNeeds = sessions.reduce((n, s) => n + (s.pendingNeeds || 0), 0)
+  const cc = commandCenterSignal.value
+  const decisionsBadge = cc && Array.isArray(cc.decisionsWaiting) ? cc.decisionsWaiting.length : 0
 
   const connClass = conn === 'connected' ? '' : 'off'
   const connDotStyle = conn === 'connected'
@@ -59,6 +62,7 @@ export function Topbar() {
               ${t.label}
               ${t.id === 'conductor' && pendingNeeds > 0 && html`<span class="badge">${pendingNeeds}</span>`}
               ${t.id === 'fleet' && sessionsBadge > 0 && html`<span class="badge">${sessionsBadge}</span>`}
+              ${t.id === 'command-center' && decisionsBadge > 0 && html`<span class="badge">${decisionsBadge}</span>`}
             </button>
           `)}
         </div>
@@ -70,16 +74,22 @@ export function Topbar() {
         ${(() => {
           const p = profilesSignal.value
           const list = p && Array.isArray(p.profiles) ? p.profiles : null
-          // Hold the dropdown until /api/profiles resolves so we never
-          // flash a hardcoded default on cold load.
+          // Hold until /api/profiles resolves so we never flash a hardcoded
+          // default on cold load.
           if (!list || list.length === 0) return null
+          // The profile is bound once at server startup (buildWebServer); the
+          // web UI has no server-side switch endpoint. Render the current
+          // profile as static, read-only text rather than an interactive
+          // <select> so users aren't misled into thinking a switch silently
+          // failed (issue #1365). The breadcrumb label still reads
+          // profileSignal, which AppShell seeds from /api/profiles' `current`.
+          const current = profileSignal.value || p.current || list[0]
           return html`
-            <select class="icon-btn"
-              style=${{ width: 'auto', padding: '0 8px', fontFamily: 'var(--mono)', fontSize: '11px' }}
-              value=${profileSignal.value || (p.current || list[0])}
-              onChange=${e => (profileSignal.value = e.target.value)}>
-              ${list.map(name => html`<option key=${name} value=${name}>${name}</option>`)}
-            </select>
+            <span class="icon-btn"
+              style=${{ width: 'auto', padding: '0 8px', fontFamily: 'var(--mono)', fontSize: '11px', cursor: 'default' }}
+              title="Active profile (bound at startup; not switchable from the web UI)">
+              ${current}
+            </span>
           `
         })()}
         <${ToastHistoryDrawerToggle}/>

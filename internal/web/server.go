@@ -242,6 +242,13 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/events/menu", s.handleMenuEvents)
 	mux.HandleFunc("/ws/session/", s.handleSessionWS)
 
+	// Command Center (the embedded live fleet god-view — see
+	// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and
+	// one write endpoint, all behind the existing authorize/CSRF/mutation gates.
+	mux.HandleFunc("/api/command-center/status", s.handleCommandCenterStatus)
+	mux.HandleFunc("/events/command-center", s.handleCommandCenterEvents)
+	mux.HandleFunc("POST /api/command-center/ask", s.handleCommandCenterAsk)
+
 	mux.HandleFunc("/api/costs/summary", s.handleCostsSummary)
 	mux.HandleFunc("/api/costs/daily", s.handleCostsDaily)
 	mux.HandleFunc("/api/costs/sessions", s.handleCostsSessions)
@@ -422,6 +429,15 @@ func (s *Server) notifyMenuChanged() {
 		}
 	}
 	s.menuSubscribersMu.Unlock()
+
+	// Invalidate the MemoryMenuData cache so the next LoadMenuSnapshot()
+	// reloads from the storage-backed fallback. In headless (--no-tui) mode
+	// there is no TUI loop to call publishWebMenuSnapshot(), so without this
+	// the menu snapshot would remain frozen at its first-load state and new
+	// sessions created via the API would never appear until server restart.
+	if mmd, ok := s.menuData.(*MemoryMenuData); ok {
+		mmd.InvalidateCache()
+	}
 }
 
 // checkMutationsAllowed writes a 403 response and returns false when web mutations are disabled.

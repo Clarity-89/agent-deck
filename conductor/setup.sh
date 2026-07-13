@@ -39,8 +39,11 @@ command -v tmux >/dev/null 2>&1 || fail "tmux not found in PATH"
 info "Creating conductor directory: ${CONDUCTOR_DIR}"
 mkdir -p "${CONDUCTOR_DIR}"
 
-# Copy bridge script to base conductor directory
-cp "${SCRIPT_DIR}/bridge.py" "${CONDUCTOR_DIR}/bridge.py"
+# Copy bridge script to base conductor directory. The canonical source is the
+# single embedded copy at internal/session/conductor_bridge.py (see
+# conductor/README.md); the Go installer (InstallBridgeScript) materializes the
+# same bytes. This shell installer copies that canonical file directly.
+cp "${SCRIPT_DIR}/../internal/session/conductor_bridge.py" "${CONDUCTOR_DIR}/bridge.py"
 chmod +x "${CONDUCTOR_DIR}/bridge.py"
 ok "bridge.py installed"
 
@@ -102,7 +105,8 @@ else
 # sessions per profile, auto-respond when possible, and escalate via Telegram.
 
 [conductor]
-enabled = true
+# The conductor system is active whenever a conductor exists on disk; there is
+# no longer an `enabled` flag (#1361).
 heartbeat_interval = 15
 profiles = ["default", "work"]
 

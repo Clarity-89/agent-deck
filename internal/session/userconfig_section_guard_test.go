@@ -3,6 +3,8 @@ package session
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
@@ -236,5 +238,138 @@ func TestSaveUserConfig_BackupHoldsPreSaveSections(t *testing.T) {
 	}
 	if len(fromBak.MCPs) != 2 || len(fromBak.Groups) != 2 {
 		t.Fatalf("expected .bak to preserve pre-save sections, got mcps=%d groups=%d", len(fromBak.MCPs), len(fromBak.Groups))
+	}
+}
+
+// (g) S3 edge case: a user hand-edits config.toml to add a bare [mcps.stub]
+// header (all-zero MCPDef). On the next save, stripEmptyTOMLSections removes it
+// (no key=value content), but the guard must NOT refuse — the lost entry was
+// non-functional (all fields zero).
+func TestSaveUserConfig_AllZeroMCPEntry_DoesNotBlockSaves(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	isolateConfigHomeXDG(t)
+
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Simulate hand-editing: write a config with a bare [mcps.stub] section.
+	handEdited := []byte("# Agent Deck Configuration\n\ntheme = \"dark\"\n\n[mcps.stub]\n")
+	if err := os.WriteFile(configPath, handEdited, 0o600); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	ReloadUserConfig()
+
+	// A normal save (changing theme) must succeed — the guard should not
+	// refuse because the "lost" entry was non-functional (all-zero).
+	loaded, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig: %v", err)
+	}
+	loaded.Theme = "light"
+	if err := SaveUserConfig(loaded); err != nil {
+		t.Fatalf("expected save to succeed when sole MCP entry is all-zero, got: %v", err)
+	}
+}
+
+// Same scenario for groups.
+func TestSaveUserConfig_AllZeroGroupEntry_DoesNotBlockSaves(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	isolateConfigHomeXDG(t)
+
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	handEdited := []byte("# Agent Deck Configuration\n\ntheme = \"dark\"\n\n[groups.placeholder]\n")
+	if err := os.WriteFile(configPath, handEdited, 0o600); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	ReloadUserConfig()
+
+	loaded, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig: %v", err)
+	}
+	loaded.Theme = "light"
+	if err := SaveUserConfig(loaded); err != nil {
+		t.Fatalf("expected save to succeed when sole group entry is all-zero, got: %v", err)
+	}
+}
+
+// A config carrying [mcps], [profiles], a tool-only [groups] block, and a
+// declarative [groups] block survives a normal save with every section intact;
+// omitempty keeps create/default_path out of the tool-only block.
+func TestSaveUserConfig_PreservesSectionsWithDeclarativeGroups(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	isolateConfigHomeXDG(t)
+
+	cfg := cloneDefaultUserConfig()
+	cfg.MCPs = map[string]MCPDef{
+		"context7": {Command: "npx", Args: []string{"-y", "context7"}},
+	}
+	cfg.Profiles = map[string]ProfileSettings{
+		"work": {Codex: ProfileCodexSettings{ConfigDir: "~/.codex-work"}},
+	}
+	cfg.Groups = map[string]GroupSettings{
+		"tools":   {Claude: GroupClaudeSettings{ConfigDir: "~/.claude-work"}},
+		"staging": {Create: true, DefaultPath: "~/repos/staging"},
+	}
+	if err := SaveUserConfigWithIntent(&cfg, true); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	ReloadUserConfig()
+
+	loaded, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig: %v", err)
+	}
+	loaded.Theme = "light"
+	if err := SaveUserConfig(loaded); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+
+	got, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if _, ok := got.MCPs["context7"]; !ok {
+		t.Error("[mcps] context7 not preserved")
+	}
+	if _, ok := got.Profiles["work"]; !ok {
+		t.Error("[profiles.work] not preserved")
+	}
+	if _, ok := got.Groups["tools"]; !ok {
+		t.Error("tool-only [groups.tools] not preserved")
+	}
+	g, ok := got.Groups["staging"]
+	if !ok {
+		t.Fatal("declarative [groups.staging] not preserved")
+	}
+	if !g.Create || g.DefaultPath == "" {
+		t.Errorf("declarative group fields lost: %+v", g)
+	}
+
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(raw), "create = false") {
+		t.Error("omitempty failed: 'create = false' written into a group block")
+	}
+	if strings.Contains(string(raw), `default_path = ""`) {
+		t.Error(`omitempty failed: 'default_path = "" written into a group block`)
 	}
 }

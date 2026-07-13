@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -456,7 +457,7 @@ index_rate_limit = 30
 		t.Fatalf("Failed to decode: %v", err)
 	}
 
-	if !config.GlobalSearch.Enabled {
+	if !config.GlobalSearch.GetEnabled() {
 		t.Error("Expected GlobalSearch.Enabled to be true")
 	}
 	if config.GlobalSearch.Tier != "auto" {
@@ -489,9 +490,9 @@ func TestGlobalSearchConfigDefaults(t *testing.T) {
 		t.Fatalf("Failed to decode: %v", err)
 	}
 
-	// When parsing directly without LoadUserConfig, values should be zero
-	if config.GlobalSearch.Enabled {
-		t.Error("GlobalSearch.Enabled should be false when not specified (zero value)")
+	// When parsing directly without LoadUserConfig, pointer should be nil
+	if config.GlobalSearch.Enabled != nil {
+		t.Error("GlobalSearch.Enabled should be nil when not specified")
 	}
 	if config.GlobalSearch.MemoryLimitMB != 0 {
 		t.Errorf("Expected default MemoryLimitMB 0 (zero value), got %d", config.GlobalSearch.MemoryLimitMB)
@@ -517,7 +518,7 @@ tier = "disabled"
 		t.Fatalf("Failed to decode: %v", err)
 	}
 
-	if config.GlobalSearch.Enabled {
+	if config.GlobalSearch.GetEnabled() {
 		t.Error("Expected GlobalSearch.Enabled to be false")
 	}
 	if config.GlobalSearch.Tier != "disabled" {
@@ -546,9 +547,8 @@ func TestSaveUserConfig(t *testing.T) {
 			ConfigDir:     "~/.claude-work",
 		},
 		Logs: LogSettings{
-			MaxSizeMB:     20,
-			MaxLines:      5000,
-			RemoveOrphans: true,
+			MaxSizeMB: 20,
+			MaxLines:  5000,
 		},
 	}
 
@@ -718,8 +718,8 @@ auto_cleanup = false
 	if !config.Worktree.DefaultEnabled {
 		t.Error("Expected DefaultEnabled to be true")
 	}
-	if config.Worktree.AutoCleanup {
-		t.Error("Expected AutoCleanup to be false")
+	if config.Worktree.AutoCleanup != nil && *config.Worktree.AutoCleanup {
+		t.Error("Expected AutoCleanup to be nil or false")
 	}
 }
 
@@ -743,8 +743,8 @@ func TestWorktreeConfigDefaults(t *testing.T) {
 	if config.Worktree.DefaultLocation != "" {
 		t.Errorf("Expected empty DefaultLocation (zero value), got %q", config.Worktree.DefaultLocation)
 	}
-	if config.Worktree.AutoCleanup {
-		t.Error("AutoCleanup should be false when not specified (zero value)")
+	if config.Worktree.AutoCleanup != nil {
+		t.Error("AutoCleanup should be nil when not specified")
 	}
 }
 
@@ -760,7 +760,7 @@ func TestGetWorktreeSettings(t *testing.T) {
 	if settings.DefaultLocation != "subdirectory" {
 		t.Errorf("GetWorktreeSettings DefaultLocation: got %q, want %q", settings.DefaultLocation, "subdirectory")
 	}
-	if !settings.AutoCleanup {
+	if !settings.GetAutoCleanup() {
 		t.Error("GetWorktreeSettings AutoCleanup: should default to true")
 	}
 }
@@ -775,11 +775,12 @@ func TestGetWorktreeSettings_FromConfig(t *testing.T) {
 	// Create config with custom worktree settings
 	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
 	_ = os.MkdirAll(agentDeckDir, 0700)
+	autoCleanupFalse := false
 	config := &UserConfig{
 		Worktree: WorktreeSettings{
 			DefaultLocation: "subdirectory",
 			DefaultEnabled:  true,
-			AutoCleanup:     false,
+			AutoCleanup:     &autoCleanupFalse,
 		},
 	}
 	_ = SaveUserConfig(config)
@@ -792,7 +793,7 @@ func TestGetWorktreeSettings_FromConfig(t *testing.T) {
 	if !settings.DefaultEnabled {
 		t.Error("GetWorktreeSettings DefaultEnabled: should be true from config")
 	}
-	if settings.AutoCleanup {
+	if settings.GetAutoCleanup() {
 		t.Error("GetWorktreeSettings AutoCleanup: should be false from config")
 	}
 }
@@ -1251,7 +1252,7 @@ func TestNotificationsConfig_Defaults(t *testing.T) {
 
 	// With no config file, GetNotificationsSettings should return defaults
 	settings := GetNotificationsSettings()
-	if !settings.Enabled {
+	if !settings.GetEnabled() {
 		t.Error("notifications should be enabled by default")
 	}
 	if settings.MaxShown != 6 {
@@ -1278,7 +1279,7 @@ max_shown = 4
 		t.Fatalf("Failed to decode: %v", err)
 	}
 
-	if !config.Notifications.Enabled {
+	if !config.Notifications.GetEnabled() {
 		t.Error("Expected Notifications.Enabled to be true")
 	}
 	if config.Notifications.MaxShown != 4 {
@@ -1309,7 +1310,7 @@ max_shown = 8
 	ClearUserConfigCache()
 
 	settings := GetNotificationsSettings()
-	if !settings.Enabled {
+	if !settings.GetEnabled() {
 		t.Error("GetNotificationsSettings Enabled: should be true from config")
 	}
 	if settings.MaxShown != 8 {
@@ -1373,7 +1374,7 @@ enabled = true
 	ClearUserConfigCache()
 
 	settings := GetNotificationsSettings()
-	if !settings.Enabled {
+	if !settings.GetEnabled() {
 		t.Error("GetNotificationsSettings Enabled: should be true")
 	}
 	if settings.MaxShown != 6 {
@@ -2195,5 +2196,476 @@ footer = "full"
 	}
 	if got := c.UI.GetFooter(); got != FooterFull {
 		t.Errorf("GetFooter() = %q, want %q", got, FooterFull)
+	}
+}
+
+// TestSaveUserConfig_OmitsZeroValueFields verifies that SaveUserConfig does not
+// bloat config.toml with zero-value fields the user never set (issue #1360).
+// TestUserConfig_GroupDefaults_Decode verifies that [group_defaults].max_concurrent
+// decodes into a *int that distinguishes unset (nil) from explicit 0 and N.
+func TestUserConfig_GroupDefaults_Decode(t *testing.T) {
+	zero := 0
+	four := 4
+	cases := []struct {
+		name string
+		toml string
+		want *int
+	}{
+		{name: "unset", toml: "", want: nil},
+		{name: "explicit zero", toml: "[group_defaults]\nmax_concurrent = 0\n", want: &zero},
+		{name: "explicit N", toml: "[group_defaults]\nmax_concurrent = 4\n", want: &four},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg UserConfig
+			if _, err := toml.Decode(tc.toml, &cfg); err != nil {
+				t.Fatalf("toml.Decode: %v", err)
+			}
+			got := cfg.GroupDefaults.MaxConcurrent
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("expected nil MaxConcurrent, got *%d", *got)
+			case tc.want != nil && got == nil:
+				t.Errorf("expected *%d MaxConcurrent, got nil", *tc.want)
+			case tc.want != nil && got != nil && *got != *tc.want:
+				t.Errorf("expected MaxConcurrent=%d, got %d", *tc.want, *got)
+			}
+		})
+	}
+}
+
+// TestUserConfig_GroupDefaults_RoundTripZeroSurvives verifies that an explicit
+// 0 (unlimited) survives encode+decode. The [group_defaults] section has content
+// (max_concurrent = 0), so stripEmptyTOMLSections does NOT remove it, and the
+// *int field (with omitempty, NOT omitzero) keeps *0 through the round-trip.
+func TestUserConfig_GroupDefaults_RoundTripZeroSurvives(t *testing.T) {
+	zero := 0
+	cfg := &UserConfig{}
+	cfg.GroupDefaults.MaxConcurrent = &zero
+
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(cfg); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if !strings.Contains(buf.String(), "max_concurrent = 0") {
+		t.Fatalf("encoded TOML missing max_concurrent = 0:\n%s", buf.String())
+	}
+
+	var decoded UserConfig
+	if _, err := toml.Decode(buf.String(), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.GroupDefaults.MaxConcurrent == nil {
+		t.Fatal("round-trip lost max_concurrent (got nil, expected *0)")
+	}
+	if *decoded.GroupDefaults.MaxConcurrent != 0 {
+		t.Errorf("round-trip changed max_concurrent: expected 0, got %d", *decoded.GroupDefaults.MaxConcurrent)
+	}
+}
+
+func TestSaveUserConfig_OmitsZeroValueFields(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
+
+	branchPrefix := ""
+	dangerousFalse := false
+	config := &UserConfig{
+		DefaultTool: "claude",
+		Theme:       "dark",
+		Claude: ClaudeSettings{
+			DangerousMode:      &dangerousFalse,
+			AllowDangerousMode: false,
+		},
+		Worktree: WorktreeSettings{
+			BranchPrefix: &branchPrefix,
+		},
+		Updates: UpdateSettings{
+			AutoUpdate: false,
+		},
+		Feedback: FeedbackSettings{
+			Disabled: true,
+		},
+		UI: UISettings{
+			HiddenTools: []string{"codex", "copilot"},
+		},
+	}
+
+	if err := SaveUserConfig(config); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config.toml: %v", err)
+	}
+
+	content := string(raw)
+
+	// Zero-value sections that were never set must NOT appear.
+	for _, absent := range []string{
+		"[gemini]",
+		"[opencode]",
+		"[codex]",
+		"[copilot]",
+		"[crush]",
+		"[hermes]",
+		"[global_search]",
+		"[logs]",
+		"[mcp_pool]",
+		"[conductor]",
+		"[group_defaults]",
+		"[docker]",
+		"[openclaw]",
+		"[costs]",
+		"[system_stats]",
+		"[watcher]",
+		"[terminal]",
+		"[web]",
+		"[notifications]",
+		"[maintenance]",
+		"[status]",
+		"[display]",
+		"[instances]",
+		"[shell]",
+		"[fork]",
+		"[selfheal]",
+	} {
+		if strings.Contains(content, absent) {
+			t.Errorf("config.toml should not contain zero-value section %q", absent)
+		}
+	}
+
+	// Fields that ARE set must be present.
+	for _, present := range []string{
+		`default_tool = "claude"`,
+		"[feedback]",
+		"disabled = true",
+		"[worktree]",
+		`branch_prefix = ""`,
+		"[ui]",
+		"hidden_tools",
+	} {
+		if !strings.Contains(content, present) {
+			t.Errorf("config.toml should contain %q", present)
+		}
+	}
+
+	// The file must be compact — under 50 lines for a minimal config.
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	if len(lines) > 50 {
+		t.Errorf("config.toml is %d lines; expected under 50 for a minimal config.\nContent:\n%s", len(lines), content)
+	}
+}
+
+// TestSaveUserConfig_ZeroValueConfigProducesNoSections saves a completely empty
+// UserConfig and asserts NO section headers appear. This catches new struct fields
+// that lack omitempty/omitzero without needing to maintain a deny-list.
+func TestSaveUserConfig_ZeroValueConfigProducesNoSections(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
+
+	if err := SaveUserConfig(&UserConfig{}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config.toml: %v", err)
+	}
+
+	content := strings.TrimSpace(string(raw))
+
+	// A zero-value UserConfig should produce at most the file header comment — no
+	// section headers. Any [section] means a field leaks its zero value.
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) > 0 && trimmed[0] == '[' {
+			t.Errorf("zero-value UserConfig produced section header: %s\nFull content:\n%s", trimmed, content)
+		}
+	}
+}
+
+// TestSaveUserConfig_LoadMutateSavePreservesExistingFields simulates the
+// persistClaudeDialogDefaults path: load existing config, mutate a few fields,
+// save. The existing user settings must survive the round-trip without bloat.
+func TestSaveUserConfig_LoadMutateSavePreservesExistingFields(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
+
+	// Write a minimal config (what a dotfile user would have).
+	initial := `default_tool = "claude"
+theme = "dark"
+
+[claude]
+  dangerous_mode = false
+  allow_dangerous_mode = false
+
+[worktree]
+  branch_prefix = ""
+
+[updates]
+  check_enabled = false
+
+[feedback]
+  disabled = true
+
+[ui]
+  hidden_tools = ["codex", "copilot"]
+`
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(initial), 0600); err != nil {
+		t.Fatalf("write initial config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	// Simulate persistClaudeDialogDefaults: load, mutate, save.
+	cfg, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig: %v", err)
+	}
+	skipPerms := false
+	cfg.Claude.DangerousMode = &skipPerms
+	cfg.Claude.AllowDangerousMode = false
+	cfg.Claude.AutoMode = false
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	content := string(raw)
+
+	// The file must NOT have bloated with zero-value sections.
+	for _, absent := range []string{
+		"[gemini]",
+		"[opencode]",
+		"[codex]",
+		"[copilot]",
+		"[conductor]",
+		"[docker]",
+	} {
+		if strings.Contains(content, absent) {
+			t.Errorf("after load-mutate-save, config.toml should not contain %q\nContent:\n%s", absent, content)
+		}
+	}
+
+	// Existing settings must be preserved.
+	for _, present := range []string{
+		`default_tool = "claude"`,
+		"[feedback]",
+		"disabled = true",
+		"[worktree]",
+		`branch_prefix = ""`,
+		"[ui]",
+		"hidden_tools",
+		"[updates]",
+		"check_enabled = false",
+	} {
+		if !strings.Contains(content, present) {
+			t.Errorf("after load-mutate-save, config.toml should contain %q\nContent:\n%s", present, content)
+		}
+	}
+}
+
+// TestSaveUserConfig_PreservesPointerFalse verifies that *bool fields set to
+// explicit false survive the save round-trip (they must not be stripped by
+// omitempty since nil and *false have different semantics).
+func TestSaveUserConfig_PreservesPointerFalse(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	dangerousFalse := false
+	config := &UserConfig{
+		Claude: ClaudeSettings{
+			DangerousMode: &dangerousFalse,
+		},
+	}
+
+	if err := SaveUserConfig(config); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+
+	ClearUserConfigCache()
+	loaded, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig: %v", err)
+	}
+
+	if loaded.Claude.DangerousMode == nil {
+		t.Fatal("DangerousMode should be non-nil (*false), got nil")
+	}
+	if *loaded.Claude.DangerousMode {
+		t.Fatal("DangerousMode should be *false, got *true")
+	}
+}
+
+func TestSaveUserConfig_PreservesDefaultTrueBoolsSetToFalse(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	explicitFalse := false
+	config := &UserConfig{
+		MCPPool: MCPPoolSettings{
+			Enabled:        true,
+			AutoStart:      &explicitFalse,
+			ShutdownOnExit: &explicitFalse,
+			FallbackStdio:  &explicitFalse,
+			ShowStatus:     &explicitFalse,
+		},
+		Logs: LogSettings{
+			DebugCompress: &explicitFalse,
+		},
+		GlobalSearch: GlobalSearchSettings{
+			Enabled: &explicitFalse,
+		},
+	}
+
+	if err := SaveUserConfig(config); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+
+	ClearUserConfigCache()
+	loaded, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig: %v", err)
+	}
+
+	if loaded.MCPPool.GetAutoStart() {
+		t.Error("MCPPool.AutoStart: expected false after round-trip, got true")
+	}
+	if loaded.MCPPool.GetShutdownOnExit() {
+		t.Error("MCPPool.ShutdownOnExit: expected false after round-trip, got true")
+	}
+	if loaded.MCPPool.GetFallbackStdio() {
+		t.Error("MCPPool.FallbackStdio: expected false after round-trip, got true")
+	}
+	if loaded.MCPPool.GetShowStatus() {
+		t.Error("MCPPool.ShowStatus: expected false after round-trip, got true")
+	}
+	if loaded.Logs.GetDebugCompress() {
+		t.Error("Logs.DebugCompress: expected false after round-trip, got true")
+	}
+	if loaded.GlobalSearch.GetEnabled() {
+		t.Error("GlobalSearch.Enabled: expected false after round-trip, got true")
+	}
+}
+
+func TestUserConfig_GetGroupSort(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", "creation"},
+		{"creation", "creation"},
+		{"actionable", "actionable"},
+		{"garbage", "creation"},
+		{"ACTIONABLE", "creation"}, // case-sensitive; only exact "actionable" opts in
+	}
+	for _, c := range cases {
+		cfg := &UserConfig{GroupSort: c.in}
+		if got := cfg.GetGroupSort(); got != c.want {
+			t.Errorf("GetGroupSort(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestLoadUserConfig_SetsGroupSortMode(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+	t.Cleanup(func() { SetGroupSortMode("creation") })
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("group_sort = \"actionable\"\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if _, err := LoadUserConfig(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := currentGroupSortMode(); got != "actionable" {
+		t.Fatalf("LoadUserConfig did not apply group_sort: mode = %q, want actionable", got)
+	}
+}
+
+// TestSaveUserConfig_OmitsUnsetGroupSort guards the minimal-config guarantee
+// (issue #1383 / #1360): an unset GroupSort must NOT be written, so a
+// load→mutate→save round-trip never injects group_sort = "" into a
+// previously-minimal config. A set value must still survive the round-trip.
+func TestSaveUserConfig_OmitsUnsetGroupSort(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
+
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+
+	// Unset GroupSort must be omitted entirely.
+	if err := SaveUserConfig(&UserConfig{DefaultTool: "claude"}); err != nil {
+		t.Fatalf("SaveUserConfig (unset): %v", err)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config.toml: %v", err)
+	}
+	if strings.Contains(string(raw), "group_sort") {
+		t.Errorf("config.toml must not contain group_sort when unset; got:\n%s", raw)
+	}
+
+	// A set GroupSort must round-trip back out.
+	if err := SaveUserConfig(&UserConfig{DefaultTool: "claude", GroupSort: "actionable"}); err != nil {
+		t.Fatalf("SaveUserConfig (set): %v", err)
+	}
+	raw, err = os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config.toml: %v", err)
+	}
+	if !strings.Contains(string(raw), `group_sort = "actionable"`) {
+		t.Errorf("config.toml must contain a set group_sort; got:\n%s", raw)
 	}
 }

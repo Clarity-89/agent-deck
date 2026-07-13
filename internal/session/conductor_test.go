@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/BurntSushi/toml"
 )
 
 // --- Systemd template generation tests ---
@@ -300,22 +302,29 @@ func TestConductorMetaSaveAndLoad(t *testing.T) {
 	}
 }
 
+func intPtr(v int) *int { return &v }
+
 func TestGetHeartbeatInterval(t *testing.T) {
 	tests := []struct {
-		interval int
+		name     string
+		interval *int
 		expected int
 	}{
-		{0, 0},   // zero means disabled
-		{-1, 15}, // negative defaults to 15
-		{10, 10}, // custom
-		{30, 30}, // custom
+		{"nil means disabled", nil, 0},
+		{"zero means disabled", intPtr(0), 0},
+		{"negative means default 15", intPtr(-1), 15},
+		{"setup default 15", intPtr(15), 15},
+		{"custom 10", intPtr(10), 10},
+		{"custom 30", intPtr(30), 30},
 	}
 
 	for _, tt := range tests {
-		settings := &ConductorSettings{HeartbeatInterval: tt.interval}
-		if got := settings.GetHeartbeatInterval(); got != tt.expected {
-			t.Errorf("GetHeartbeatInterval() with %d = %d, want %d", tt.interval, got, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &ConductorSettings{HeartbeatInterval: tt.interval}
+			if got := settings.GetHeartbeatInterval(); got != tt.expected {
+				t.Errorf("GetHeartbeatInterval() = %d, want %d", got, tt.expected)
+			}
+		})
 	}
 }
 
@@ -981,6 +990,42 @@ func TestSetupConductorWithAgent_Codex(t *testing.T) {
 	}
 	if meta.GetClearOnCompact() {
 		t.Fatal("codex conductor should not enable clear_on_compact")
+	}
+}
+
+func TestSetupConductorWithAgent_DefaultsHeartbeatInterval(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "hb-default"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentClaude, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	if meta.HeartbeatInterval != 15 {
+		t.Fatalf("HeartbeatInterval = %d, want 15 (fresh conductor with heartbeat enabled)", meta.HeartbeatInterval)
+	}
+}
+
+func TestSetupConductorWithAgent_HeartbeatDisabledKeepsZeroInterval(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "hb-off"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentClaude, false, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	if meta.HeartbeatInterval != 0 {
+		t.Fatalf("HeartbeatInterval = %d, want 0 (heartbeat disabled)", meta.HeartbeatInterval)
 	}
 }
 
@@ -2225,9 +2270,9 @@ func TestBridgeTemplate_DiscordListenModeSupport(t *testing.T) {
 	template := conductorBridgePy
 	patterns := []string{
 		`listen_mode = str(config["discord"].get("listen_mode", "all") or "all").strip().lower()`,
-		`if listen_mode not in {"all", "mentions"}:`,
-		`if listen_mode == "mentions":`,
-		`if not message_mentions_bot(message):`,
+		`if listen_mode not in {"all", "mentions", "mentions_all_channels"}:`,
+		`if listen_mode != "mentions_all_channels" and message.channel.id != bot.target_channel_id:`,
+		`if listen_mode in ("mentions", "mentions_all_channels") and not message_mentions_bot(message):`,
 		`text = strip_bot_mentions(text)`,
 		`return re.sub(rf"<@!?{bot.user.id}>", "", text).strip()`,
 	}
@@ -2392,18 +2437,19 @@ func TestConductorHeartbeatScript_GroupScoped(t *testing.T) {
 	}
 }
 
-// TestGetHeartbeatInterval_ZeroMeansDisabled verifies interval=0 means disabled,
-// negative means use default, and positive means use the configured value.
+// TestGetHeartbeatInterval_ZeroMeansDisabled verifies nil and zero mean
+// disabled, negative means default (15), and positive values pass through.
 func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
 	tests := []struct {
 		name     string
-		interval int
+		interval *int
 		expected int
 	}{
-		{"zero means disabled", 0, 0},
-		{"negative means default", -1, 15},
-		{"custom value", 30, 30},
-		{"explicit default", 15, 15},
+		{"nil means disabled", nil, 0},
+		{"negative means default", intPtr(-1), 15},
+		{"zero means disabled", intPtr(0), 0},
+		{"custom value", intPtr(30), 30},
+		{"explicit fifteen", intPtr(15), 15},
 	}
 
 	for _, tt := range tests {
@@ -2411,7 +2457,7 @@ func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
 			settings := ConductorSettings{HeartbeatInterval: tt.interval}
 			got := settings.GetHeartbeatInterval()
 			if got != tt.expected {
-				t.Errorf("GetHeartbeatInterval() with %d = %d, want %d", tt.interval, got, tt.expected)
+				t.Errorf("GetHeartbeatInterval() = %d, want %d", got, tt.expected)
 			}
 		})
 	}
@@ -2817,18 +2863,26 @@ func TestBridgeTemplate_DoesNotHardcodeLegacyAgentDeckRoot(t *testing.T) {
 		t.Error("template must retain a legacy ~/.agent-deck fallback (issue #1350)")
 	}
 
-	// CONDUCTOR_DIR / CONFIG_PATH must be computed via the resolvers.
-	if !strings.Contains(template, `CONDUCTOR_DIR = resolve_data_dir("conductor")`) {
-		t.Error("template must compute CONDUCTOR_DIR via resolve_data_dir (issue #1350)")
+	// CONDUCTOR_DIR / CONFIG_PATH must be computed via the resolvers. CONDUCTOR_DIR
+	// now prefers the AGENT_DECK_CONDUCTOR_DIR override (injected by the Go side
+	// from [conductor].dir) but must still fall back through resolve_data_dir so
+	// the #1350 XDG/legacy behavior is preserved when no override is set.
+	if !strings.Contains(template, `resolve_data_dir("conductor") / "conductor"`) {
+		t.Error("template must retain the resolve_data_dir CONDUCTOR_DIR fallback (issue #1350)")
+	}
+	if !strings.Contains(template, `os.environ.get("AGENT_DECK_CONDUCTOR_DIR"`) {
+		t.Error("template must honor the AGENT_DECK_CONDUCTOR_DIR override before the XDG fallback")
 	}
 	if !strings.Contains(template, `CONFIG_PATH = resolve_config_path("config.toml")`) {
 		t.Error("template must compute CONFIG_PATH via resolve_config_path (issue #1350)")
 	}
 }
 
-// TestBridgeTemplate_ResolverMirrorsRealBridgeFile ensures the embedded const
-// and the on-disk conductor/bridge.py share a byte-identical resolver region,
-// so a fix to one is never silently dropped from the other.
+// TestBridgeTemplate_ResolverMirrorsRealBridgeFile ensures the embedded value
+// and the canonical on-disk bridge source share a byte-identical resolver
+// region. There is now a single canonical file
+// (internal/session/conductor_bridge.py) embedded directly, so this also guards
+// that the #1350 resolver markers remain present in the deployed bytes.
 func TestBridgeTemplate_ResolverMirrorsRealBridgeFile(t *testing.T) {
 	const marker = "# --- issue #1350: XDG path resolution (mirror of internal/agentpaths) ---"
 	const endMarker = "# --- end issue #1350 resolver ---"
@@ -2845,23 +2899,22 @@ func TestBridgeTemplate_ResolverMirrorsRealBridgeFile(t *testing.T) {
 		return src[start : start+end+len(endMarker)]
 	}
 
-	embedded := extract(conductorBridgePy, "embedded const")
+	embedded := extract(conductorBridgePy, "embedded value")
 
-	// Locate conductor/bridge.py relative to this test file.
+	// Locate the canonical internal/session/conductor_bridge.py next to this test.
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
-	bridgePath := filepath.Join(repoRoot, "conductor", "bridge.py")
+	bridgePath := filepath.Join(filepath.Dir(thisFile), "conductor_bridge.py")
 	data, err := os.ReadFile(bridgePath)
 	if err != nil {
 		t.Fatalf("read %s: %v", bridgePath, err)
 	}
-	onDisk := extract(string(data), "conductor/bridge.py")
+	onDisk := extract(string(data), "conductor_bridge.py")
 
 	if embedded != onDisk {
-		t.Errorf("resolver region drift between embedded const and conductor/bridge.py:\n--- embedded ---\n%s\n--- on disk ---\n%s", embedded, onDisk)
+		t.Errorf("resolver region drift between embedded value and conductor_bridge.py:\n--- embedded ---\n%s\n--- on disk ---\n%s", embedded, onDisk)
 	}
 }
 
@@ -2887,11 +2940,12 @@ func TestGenerateSystemdBridgeService_InjectsXDGEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateSystemdBridgeService: %v", err)
 	}
-	if !strings.Contains(unit, "Environment=XDG_DATA_HOME="+xdgData) {
-		t.Errorf("systemd unit must inject XDG_DATA_HOME=%q:\n%s", xdgData, unit)
+	// Values are double-quoted so systemd does not split paths on whitespace.
+	if !strings.Contains(unit, `Environment="XDG_DATA_HOME=`+xdgData+`"`) {
+		t.Errorf("systemd unit must inject quoted XDG_DATA_HOME=%q:\n%s", xdgData, unit)
 	}
-	if !strings.Contains(unit, "Environment=XDG_CONFIG_HOME="+xdgConfig) {
-		t.Errorf("systemd unit must inject XDG_CONFIG_HOME=%q:\n%s", xdgConfig, unit)
+	if !strings.Contains(unit, `Environment="XDG_CONFIG_HOME=`+xdgConfig+`"`) {
+		t.Errorf("systemd unit must inject quoted XDG_CONFIG_HOME=%q:\n%s", xdgConfig, unit)
 	}
 }
 
@@ -2979,5 +3033,95 @@ func TestBridgeXDGEnv_AgreesWithConductorDir(t *testing.T) {
 	}
 	if bridgeCfg != cfgPath {
 		t.Errorf("bridge-computed config path %q != GetUserConfigPath() %q", bridgeCfg, cfgPath)
+	}
+}
+
+// conductorTrustEntry reads the root ~/.claude.json and returns the trust
+// entry for dir, or nil if there is none.
+func conductorTrustEntry(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(GetUserMCPRootPath())
+	if err != nil {
+		return nil
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal ~/.claude.json: %v", err)
+	}
+	projects, _ := cfg["projects"].(map[string]any)
+	entry, _ := projects[dir].(map[string]any)
+	return entry
+}
+
+// Issue #1359: setting up a Claude conductor must pre-accept the trust dialog
+// for the just-created conductor directory, so first boot (and heartbeat) does
+// not stall on Claude Code's "do you trust the files in this folder?" prompt.
+func TestSetupConductorWithAgent_PreAcceptsClaudeTrust(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "trust-claude"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentClaude, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	entry := conductorTrustEntry(t, dir)
+	if entry == nil {
+		t.Fatalf("no trust entry for conductor dir %q in %s", dir, GetUserMCPRootPath())
+	}
+	if entry["hasTrustDialogAccepted"] != true {
+		t.Fatalf("hasTrustDialogAccepted = %v, want true", entry["hasTrustDialogAccepted"])
+	}
+}
+
+// Non-Claude conductors (e.g. Codex) must not get a Claude trust entry — the
+// pre-accept is Claude-specific.
+func TestSetupConductorWithAgent_NoClaudeTrustForCodex(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "trust-codex"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	if entry := conductorTrustEntry(t, dir); entry != nil {
+		t.Fatalf("unexpected Claude trust entry for Codex conductor dir %q: %v", dir, entry)
+	}
+}
+
+// Issue #1359 parity: Codex conductors must pre-accept workspace trust for the
+// just-created conductor directory so first boot does not stall on the dialog.
+func TestSetupConductorWithAgent_PreAcceptsCodexTrust(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "trust-codex"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	configPath := GetCodexConfigPath(filepath.Join(tmpHome, ".codex"))
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read codex config: %v", err)
+	}
+	var cfg map[string]any
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal codex config: %v", err)
+	}
+	projects, ok := cfg["projects"].(map[string]any)
+	if !ok {
+		t.Fatalf("projects key missing or wrong type: %T", cfg["projects"])
+	}
+	entry, ok := projects[dir].(map[string]any)
+	if !ok {
+		t.Fatalf("no trust entry for conductor dir %q in %s", dir, configPath)
+	}
+	if entry["trust_level"] != "trusted" {
+		t.Fatalf("trust_level = %v, want trusted", entry["trust_level"])
 	}
 }

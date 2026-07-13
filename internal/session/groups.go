@@ -1,15 +1,23 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"unicode"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 )
+
+// ErrGroupAlreadyExists is returned by RenameGroup when the target path collides with an existing group.
+var ErrGroupAlreadyExists = errors.New("group already exists at target path")
+
+// ErrGroupNotFound is returned by RenameGroup when oldPath does not resolve to an existing group.
+var ErrGroupNotFound = errors.New("group not found")
 
 // DefaultGroupName is the display name for the default group where ungrouped sessions go
 const DefaultGroupName = "My Sessions"
@@ -26,6 +34,7 @@ const (
 	ItemTypeRemoteGroup
 	ItemTypeRemoteSession
 	ItemTypeWindow
+	ItemTypeDivider // Non-selectable separator between view-mode sections (running-on-top, etc.)
 )
 
 // Item represents a single item in the flattened group tree view
@@ -51,6 +60,7 @@ type Item struct {
 	CreatingID          string             // Non-empty for placeholder items (worktree creation in progress)
 	CreatingTitle       string             // Display title for creating placeholder
 	CreatingTool        string             // Tool for creating placeholder
+	DividerLabel        string             // Label shown on an ItemTypeDivider row (e.g. "idle / done")
 }
 
 // Group represents a group of sessions
@@ -73,6 +83,13 @@ type GroupTree struct {
 	Groups    map[string]*Group // path -> group
 	GroupList []*Group          // Ordered list of groups
 	Expanded  map[string]bool   // Collapsed state persistence
+
+	// DefaultMaxConcurrent is the max_concurrent value copied into groups
+	// created via CreateGroup/CreateSubgroup. nil → built-in serial default (1),
+	// preserving v1.9.1 behavior when [group_defaults] is unset. Seeded by the
+	// command/UI layer from [group_defaults].max_concurrent before a create; an
+	// explicit `group create --max-concurrent` flag still wins per-group.
+	DefaultMaxConcurrent *int
 }
 
 // actionablePriority maps a session.Status to an "attention-needed" rank
@@ -108,9 +125,72 @@ func actionablePriority(s Status) int {
 	return 5
 }
 
-// SortInstancesByActionable sorts the given slice in place so the most
-// recently actionable sessions surface first within a group (issue #857).
-// Key precedence:
+// pinZone maps a session to its outermost sort band (pin-sessions feature).
+// Lower bands surface higher in the group's list.
+//
+//	-1 maestro      the fleet supervisor — a fixed point of reference that
+//	                surfaces above everything, including pin-top
+//	0  pin-top      fixed at the top, exempt from status/recency
+//	1  normal       the within-group sort (creation Order, or actionable
+//	                status → recency → Order — see group_sort config)
+//	2  pin-bottom   fixed at the bottom, exempt from status/recency
+func pinZone(inst *Instance) int {
+	if inst.IsMaestro() {
+		return -1
+	}
+	switch inst.Pin {
+	case PinTop:
+		return 0
+	case PinBottom:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// stablePinPartition reorders insts in place into pin-top, normal, and
+// pin-bottom bands (pinZone), preserving the relative order of sessions within
+// each band. Unlike SortInstancesByActionable it never reorders by
+// status/recency, so it is safe to run on every render (Flatten): it moves only
+// pinned rows, leaving the load-time order (creation or actionable, per the
+// group_sort config) — and any live K/J manual order — of the normal band
+// untouched. This is what makes a pin edit take effect live instead of only
+// after a restart.
+func stablePinPartition(insts []*Instance) {
+	sort.SliceStable(insts, func(i, j int) bool {
+		zi, zj := pinZone(insts[i]), pinZone(insts[j])
+		if zi != zj {
+			return zi < zj
+		}
+		// Maestro (-1), pin-top (0), and pin-bottom (2) bands are fully fixed by
+		// Order, matching the load-time SortInstancesByActionable. Ordering them
+		// here means a freshly pinned row lands in its correct Order slot live —
+		// not wherever it happened to sit in slice order before the pin edit.
+		if zi != 1 {
+			return insts[i].Order < insts[j].Order
+		}
+		// Normal (1) band is already sorted at load (creation Order, or actionable
+		// per group_sort); return false so SliceStable leaves its relative order
+		// untouched.
+		return false
+	})
+}
+
+// SortInstancesByActionable sorts the given slice in place according to the
+// active within-group sort mode (see SetGroupSortMode), while honoring
+// per-session pins (pin-sessions feature). The outermost key is the pin zone
+// (see pinZone); within the normal zone the sort depends on mode:
+//
+//   - "creation" (default): Order asc only — sessions keep their creation /
+//     K/J manual order unchanged.
+//   - "actionable" (issue #857): status→recency tiers apply before Order so
+//     the most recently actionable sessions surface first.
+//
+// Pin-top and pin-bottom bands are always ordered by Order alone (fully fixed
+// — status and recency are ignored, so K/J reordering still works inside a
+// band).
+//
+// Actionable-mode normal-zone key precedence:
 //
 //  1. actionablePriority(Status)   asc  — error/waiting/running first
 //  2. LastAccessedAt              desc  — recent attention first
@@ -119,17 +199,60 @@ func actionablePriority(s Status) int {
 //     (TestSessionOrderPersistence,
 //     TestSessionOrderMigration)
 func SortInstancesByActionable(insts []*Instance) {
+	mode := currentGroupSortMode()
 	sort.SliceStable(insts, func(i, j int) bool {
-		pi, pj := actionablePriority(insts[i].Status), actionablePriority(insts[j].Status)
-		if pi != pj {
-			return pi < pj
+		// The outermost key is the band: maestro (the fleet supervisor, a fixed
+		// point of reference that surfaces first regardless of status), then
+		// pin-top, normal, and pin-bottom (see pinZone).
+		zi, zj := pinZone(insts[i]), pinZone(insts[j])
+		if zi != zj {
+			return zi < zj
 		}
-		ai, aj := insts[i].LastAccessedAt, insts[j].LastAccessedAt
-		if !ai.Equal(aj) {
-			return ai.After(aj)
+		// Maestro (-1), pin-top (0), and pin-bottom (2) bands are fully fixed:
+		// Order only.
+		if zi != 1 {
+			return insts[i].Order < insts[j].Order
+		}
+		// Normal band. In actionable mode (issue #857) the status→recency tiers
+		// apply before Order; in creation mode (default) Order alone decides, so
+		// sessions keep their creation order (or K/J manual order).
+		if mode == "actionable" {
+			pi, pj := actionablePriority(insts[i].Status), actionablePriority(insts[j].Status)
+			if pi != pj {
+				return pi < pj
+			}
+			ai, aj := insts[i].LastAccessedAt, insts[j].LastAccessedAt
+			if !ai.Equal(aj) {
+				return ai.After(aj)
+			}
 		}
 		return insts[i].Order < insts[j].Order
 	})
+}
+
+// groupSortMode caches the active within-group sort mode ("creation" or
+// "actionable"). It is refreshed from LoadUserConfig on every config (re)load,
+// so SortInstancesByActionable can read it without a disk hit and without
+// threading a parameter through the tree constructors. Defaults to "creation"
+// until SetGroupSortMode is first called.
+var groupSortMode atomic.Value // holds string
+
+// SetGroupSortMode updates the cached within-group sort mode. Any value other
+// than "actionable" normalizes to "creation".
+func SetGroupSortMode(mode string) {
+	if mode != "actionable" {
+		mode = "creation"
+	}
+	groupSortMode.Store(mode)
+}
+
+// currentGroupSortMode returns the cached mode, defaulting to "creation" when
+// it has never been set.
+func currentGroupSortMode() string {
+	if v, ok := groupSortMode.Load().(string); ok && v != "" {
+		return v
+	}
+	return "creation"
 }
 
 // NewGroupTree creates a new group tree from instances
@@ -265,6 +388,16 @@ func (t *GroupTree) rebuildGroupList() {
 		// Always pin the "conductor" group to the top
 		if g.Path == "conductor" && g.Order >= 0 {
 			g.Order = -1
+		}
+		// The group holding the fleet supervisor (Maestro) pins above
+		// everything, including the legacy "conductor" pin.
+		if g.Order >= -1 {
+			for _, inst := range g.Sessions {
+				if inst.IsMaestro() {
+					g.Order = -2
+					break
+				}
+			}
 		}
 		t.GroupList = append(t.GroupList, g)
 	}
@@ -464,6 +597,18 @@ func (t *GroupTree) Flatten() []Item {
 				}
 			}
 
+			// Apply pin ordering live (pin-sessions): a pin edit mutates
+			// Instance.Pin but does not rebuild the tree, so the load-time
+			// SortInstancesByActionable has not re-run. Stable-partition the
+			// display slices by pin zone here so a pinned session moves to the
+			// top/bottom of its group immediately — without this, the pin only
+			// takes effect after a restart. Operates on Flatten's local copies,
+			// never the tree's group.Sessions, and preserves unpinned order.
+			stablePinPartition(parentSessions)
+			for parentID := range subSessionsByParent {
+				stablePinPartition(subSessionsByParent[parentID])
+			}
+
 			// Count total top-level items (parent sessions + orphan sub-sessions whose parent is in different group)
 			// For determining IsLastInGroup, we need to know how many top-level items there are
 			topLevelCount := len(parentSessions)
@@ -523,19 +668,34 @@ func (t *GroupTree) Flatten() []Item {
 				topLevelIndex++
 			}
 
-			// Add any orphaned sub-sessions (parent not in this group)
+			// Add any orphaned sub-sessions (parent not in this group). Collect
+			// the remaining map entries into a slice and sort by Order so the
+			// emission order is deterministic — iterating subSessionsByParent
+			// directly would use Go's randomized map order and shuffle these
+			// rows between renders.
+			orphans := make([]*Instance, 0, len(subSessionsByParent))
 			for _, subs := range subSessionsByParent {
-				for _, sub := range subs {
-					topLevelIndex++
-					items = append(items, Item{
-						Type:          ItemTypeSession,
-						Session:       sub,
-						Level:         groupLevel + 1,
-						Path:          group.Path,
-						IsLastInGroup: topLevelIndex == topLevelCount,
-						IsSubSession:  true, // Still a sub-session, just orphaned in this group
-					})
+				orphans = append(orphans, subs...)
+			}
+			sort.SliceStable(orphans, func(i, j int) bool {
+				if orphans[i].Order != orphans[j].Order {
+					return orphans[i].Order < orphans[j].Order
 				}
+				// Tie-break on ID so equal-Order orphans (collected from the
+				// randomized subSessionsByParent map) still emit in a stable,
+				// run-independent order rather than leaking map-iteration order.
+				return orphans[i].ID < orphans[j].ID
+			})
+			for _, sub := range orphans {
+				topLevelIndex++
+				items = append(items, Item{
+					Type:          ItemTypeSession,
+					Session:       sub,
+					Level:         groupLevel + 1,
+					Path:          group.Path,
+					IsLastInGroup: topLevelIndex == topLevelCount,
+					IsSubSession:  true, // Still a sub-session, just orphaned in this group
+				})
 			}
 		}
 	}
@@ -874,6 +1034,16 @@ func sanitizeGroupName(name string) string {
 	return cleaned
 }
 
+// newGroupMaxConcurrent resolves the MaxConcurrent assigned to a group made
+// via CreateGroup/CreateSubgroup. nil tree-default → 1 (serial, the v1.9.1
+// built-in). A configured value is used as-is (0 = unlimited, N = cap).
+func (t *GroupTree) newGroupMaxConcurrent() int {
+	if t.DefaultMaxConcurrent != nil {
+		return *t.DefaultMaxConcurrent
+	}
+	return 1
+}
+
 // CreateGroup creates a new empty group
 func (t *GroupTree) CreateGroup(name string) *Group {
 	// Sanitize name to prevent path traversal and security issues
@@ -901,7 +1071,9 @@ func (t *GroupTree) CreateGroup(name string) *Group {
 		// to prevent the parallel-worker cascade observed on 2026-05-08.
 		// Pre-existing groups loaded via NewGroupTreeWithGroups keep their
 		// stored MaxConcurrent (0 → unlimited for backward compat).
-		MaxConcurrent: 1,
+		// [group_defaults].max_concurrent can override this default via the
+		// DefaultMaxConcurrent the caller seeds; nil keeps the serial 1.
+		MaxConcurrent: t.newGroupMaxConcurrent(),
 	}
 	t.Groups[path] = group
 	t.Expanded[path] = true
@@ -935,7 +1107,8 @@ func (t *GroupTree) CreateSubgroup(parentPath, name string) *Group {
 		Sessions: []*Instance{},
 		Order:    siblingCount, // Order among siblings
 		// v1.9.1: subgroups also default to serial. See CreateGroup.
-		MaxConcurrent: 1,
+		// [group_defaults].max_concurrent overrides via DefaultMaxConcurrent.
+		MaxConcurrent: t.newGroupMaxConcurrent(),
 	}
 	t.Groups[fullPath] = group
 	t.Expanded[fullPath] = true
@@ -969,29 +1142,45 @@ func (t *GroupTree) CreateGroupPath(path string) *Group {
 	return leaf
 }
 
-// RenameGroup renames a group and updates all subgroups
-func (t *GroupTree) RenameGroup(oldPath, newName string) {
+// RenameTargetPath returns the group path that RenameGroup(oldPath, newName)
+// would move the group to, applying the same sanitization and parent-path
+// preservation. Exposed so callers can detect a collision with an existing,
+// different group at the target before renaming (see the reload-race reapply).
+func (t *GroupTree) RenameTargetPath(oldPath, newName string) string {
+	newBasePath := strings.ReplaceAll(sanitizeGroupName(newName), " ", "-")
+	if parentPath := getParentPath(oldPath); parentPath != "" {
+		return parentPath + "/" + newBasePath
+	}
+	return newBasePath
+}
+
+// RenameGroup renames a group and updates all subgroups.
+// Returns ErrGroupNotFound if oldPath doesn't exist, or ErrGroupAlreadyExists if the target path collides.
+func (t *GroupTree) RenameGroup(oldPath, newName string) error {
 	group, exists := t.Groups[oldPath]
 	if !exists {
-		return
+		return fmt.Errorf("%w: %s", ErrGroupNotFound, oldPath)
 	}
 
 	// Sanitize name to prevent path traversal and security issues
 	sanitizedName := sanitizeGroupName(newName)
-	newBasePath := strings.ReplaceAll(sanitizedName, " ", "-")
-
-	// Preserve parent path for subgroups
-	parentPath := getParentPath(oldPath)
-	var newPath string
-	if parentPath != "" {
-		newPath = parentPath + "/" + newBasePath
-	} else {
-		newPath = newBasePath
-	}
+	newPath := t.RenameTargetPath(oldPath, newName)
 
 	if newPath == oldPath {
 		group.Name = sanitizedName
-		return
+		return nil
+	}
+
+	if _, clash := t.Groups[newPath]; clash {
+		return fmt.Errorf("%w: %s", ErrGroupAlreadyExists, newPath)
+	}
+	for path := range t.Groups {
+		if strings.HasPrefix(path, oldPath+"/") {
+			newSubPath := newPath + path[len(oldPath):]
+			if _, clash := t.Groups[newSubPath]; clash {
+				return fmt.Errorf("%w: %s", ErrGroupAlreadyExists, newSubPath)
+			}
+		}
 	}
 
 	// Update all sessions in the group
@@ -1033,6 +1222,7 @@ func (t *GroupTree) RenameGroup(oldPath, newName string) {
 	t.Expanded[newPath] = group.Expanded
 
 	t.rebuildGroupList()
+	return nil
 }
 
 // MoveGroupTo reparents a group (and its entire subtree) under destParentPath.
@@ -1403,8 +1593,8 @@ func mostRecentPathForSessions(sessions []*Instance) string {
 	return ""
 }
 
-// resolveGroupDefaultPath normalizes a default path and maps git worktree paths
-// to their base repository root.
+// resolveGroupDefaultPath normalizes a default path and maps linked git
+// worktree paths to their base repository root.
 func resolveGroupDefaultPath(defaultPath string) string {
 	defaultPath = strings.TrimSpace(defaultPath)
 	if defaultPath == "" {
@@ -1434,6 +1624,15 @@ func resolveGroupDefaultPath(defaultPath string) string {
 	}
 
 	if !git.IsGitRepo(defaultPath) {
+		return defaultPath
+	}
+
+	// Only collapse LINKED worktrees (`git worktree add`) to their base
+	// repository root — a transient worktree path shouldn't become the stored
+	// default. A plain subdirectory inside the main working tree is a
+	// legitimate default path, so store it verbatim: GetWorktreeBaseRoot would
+	// otherwise map it to the repo root via GetRepoRoot.
+	if !git.IsLinkedWorktree(defaultPath) {
 		return defaultPath
 	}
 

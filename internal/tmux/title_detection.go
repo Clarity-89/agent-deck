@@ -125,9 +125,12 @@ func RefreshPaneInfoCache() {
 	// (#687 follow-up, v1.7.55).
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	// pane_title is free-text (apps set it via OSC) so it goes LAST; every
+	// other field is a sanitized name, integer, or 0/1 flag that cannot
+	// contain tmuxFieldSep. See tmuxFieldSep for why TAB is unusable here.
 	cmd := tmuxExecContext(ctx, DefaultSocketName(),
 		"list-panes", "-a", "-F",
-		"#{session_name}\t#{pane_title}\t#{pane_current_command}\t#{pane_dead}\t#{window_index}\t#{pane_index}")
+		tmuxFmt("#{session_name}", "#{pane_current_command}", "#{pane_dead}", "#{window_index}", "#{pane_index}", "#{pane_title}"))
 	output, err := cmd.Output()
 	if err != nil {
 		paneCacheMu.Lock()
@@ -137,31 +140,54 @@ func RefreshPaneInfoCache() {
 		return
 	}
 
+	newCache, windowTools := parseListPanesOutput(string(output))
+
+	paneCacheMu.Lock()
+	paneCacheData = newCache
+	paneCacheTime = time.Now()
+	paneCacheMu.Unlock()
+
+	updateWindowToolCache(windowTools)
+}
+
+// parseListPanesOutput parses `tmux list-panes -a` output in the format
+// tmuxFmt("#{session_name}", "#{pane_current_command}", "#{pane_dead}",
+// "#{window_index}", "#{pane_index}", "#{pane_title}"). pane_title is last so a
+// tmuxFieldSep inside it survives SplitN. Returns the per-session primary
+// PaneInfo and the session→windowIndex→tool map. Extracted from
+// RefreshPaneInfoCache so the no-client delimiter handling is unit-testable.
+func parseListPanesOutput(output string) (map[string]PaneInfo, map[string]map[int]string) {
 	newCache := make(map[string]PaneInfo)
 	windowTools := make(map[string]map[int]string) // session -> windowIndex -> tool
-	seenWindowTool := make(map[string]bool)        // "session\twinIdx" -> already processed
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+	seenWindowTool := make(map[string]bool)        // "session|winIdx" -> already processed
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 6)
+		// Field order: session_name | pane_current_command | pane_dead |
+		// window_index | pane_index | pane_title (pane_title last, free-text).
+		parts := strings.SplitN(line, tmuxFieldSep, 6)
 		if len(parts) != 6 {
 			continue
 		}
 		name := parts[0]
+		paneCommand := parts[1]
+		paneDead := parts[2]
+		windowIndex := parts[3]
+		paneTitle := parts[5]
 
 		// Collect tool info for the first pane of each window (handles any base-index).
 		// list-panes outputs panes sorted by window then pane index, so first hit = primary.
-		windowKey := name + "\t" + parts[4]
+		windowKey := name + tmuxFieldSep + windowIndex
 		if !seenWindowTool[windowKey] {
 			seenWindowTool[windowKey] = true
 			var winIdx int
-			_, _ = fmt.Sscanf(parts[4], "%d", &winIdx)
+			_, _ = fmt.Sscanf(windowIndex, "%d", &winIdx)
 			// Try pane_current_command first, then pane_title (Claude shows as "bash"
 			// in command but "Claude Code" in title via OSC escape sequences).
-			tool := detectToolFromCommand(parts[2])
+			tool := detectToolFromCommand(paneCommand)
 			if tool == "" {
-				tool = detectToolFromCommand(parts[1])
+				tool = detectToolFromCommand(paneTitle)
 			}
 			if tool != "" {
 				if windowTools[name] == nil {
@@ -175,33 +201,38 @@ func RefreshPaneInfoCache() {
 		// Handles any base-index config — first entry in sorted list-panes output is primary.
 		if _, seen := newCache[name]; !seen {
 			newCache[name] = PaneInfo{
-				Title:          parts[1],
-				CurrentCommand: parts[2],
-				Dead:           parts[3] == "1",
+				Title:          paneTitle,
+				CurrentCommand: paneCommand,
+				Dead:           paneDead == "1",
 			}
 		}
 	}
-
-	paneCacheMu.Lock()
-	paneCacheData = newCache
-	paneCacheTime = time.Now()
-	paneCacheMu.Unlock()
-
-	updateWindowToolCache(windowTools)
+	return newCache, windowTools
 }
 
 // GetCachedPaneInfo returns cached pane info for a session.
 // Returns (info, true) if found and cache is fresh, (zero, false) otherwise.
 func GetCachedPaneInfo(sessionName string) (PaneInfo, bool) {
+	info, _, ok := GetCachedPaneInfoSnapshot(sessionName)
+	return info, ok
+}
+
+// GetCachedPaneInfoSnapshot is GetCachedPaneInfo plus the time the cache
+// snapshot was taken. Callers that promote state based on pane info (e.g. the
+// shell foreground running indicator) use the snapshot time to reject entries
+// that predate an event of interest — a pane snapshot taken before a session
+// was (re)started describes the previous same-name session, not the current
+// one. The same 4s freshness window applies (2 refresh ticks).
+func GetCachedPaneInfoSnapshot(sessionName string) (PaneInfo, time.Time, bool) {
 	paneCacheMu.RLock()
 	defer paneCacheMu.RUnlock()
 
 	if paneCacheData == nil || time.Since(paneCacheTime) > 4*time.Second {
-		return PaneInfo{}, false
+		return PaneInfo{}, time.Time{}, false
 	}
 
 	info, ok := paneCacheData[sessionName]
-	return info, ok
+	return info, paneCacheTime, ok
 }
 
 // AnalyzePaneTitle determines session state from the pane title.
@@ -229,6 +260,32 @@ func AnalyzePaneTitle(title, _ string) TitleState {
 	}
 
 	return TitleStateUnknown
+}
+
+// CleanPaneTitle strips spinner/done-marker characters from a tmux pane title
+// and returns the task description. Returns "" for empty or generic tool titles
+// ("Claude Code", "Gemini CLI", "Codex CLI").
+//
+// This is the canonical implementation shared by internal/ui (TUI) and
+// internal/web (web server). Both packages import internal/tmux, so placing
+// the logic here avoids a circular dependency.
+func CleanPaneTitle(title string) string {
+	if title == "" {
+		return ""
+	}
+	// Strip known spinner/done-marker runes (·✳✽✶✻✢ and braille ⠋⠙⠹…).
+	cleaned := StripSpinnerRunes(title)
+	// Also strip any remaining Braille characters (U+2800-28FF) that Claude Code
+	// may use as spinner frames beyond the canonical set.
+	cleaned = strings.TrimLeftFunc(cleaned, func(r rune) bool {
+		return r >= 0x2800 && r <= 0x28FF
+	})
+	cleaned = strings.TrimSpace(cleaned)
+	switch cleaned {
+	case "", "Claude Code", "Gemini CLI", "Codex CLI":
+		return ""
+	}
+	return cleaned
 }
 
 // containsBrailleChar returns true if the string contains any Unicode Braille

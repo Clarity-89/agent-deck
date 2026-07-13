@@ -85,8 +85,17 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 			BusyPatterns: []string{
 				"ctrl+c to interrupt",
 				"esc to interrupt",
+				// Subagent activity: pi writes task markers to the pane
+				// when subagents are actively running. These patterns are
+				// specific enough to NOT match the idle status bar or
+				// package-update banners.
+				"delegate_task",
+				`re:(?m)^\[subagent\]`,
+				`re:(?m)^\[running\]`,
+				`re:(?m)^\s*→\s`,
 			},
 			PromptPatterns: []string{`re:(?m)^\s*pi>\s*`},
+			SpinnerChars:   []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
 		}
 	case "copilot":
 		// GitHub Copilot CLI (the standalone `copilot` binary, Issue #556).
@@ -120,6 +129,9 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 			PromptPatterns: []string{
 				"How can I help",
 				`re:(?m)^\s*›\s`,
+				"Ask questions",
+				"Plan mode",
+				"Switch modes",
 			},
 		}
 	case "shell":

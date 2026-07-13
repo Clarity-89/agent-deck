@@ -8,6 +8,7 @@ Complete reference for all agent-deck CLI commands.
 - [Basic Commands](#basic-commands)
 - [Web Command](#web-command)
 - [Session Commands](#session-commands)
+- [Worktree Commands](#worktree-commands)
 - [MCP Commands](#mcp-commands)
 - [Skill Commands](#skill-commands)
 - [Group Commands](#group-commands)
@@ -40,6 +41,7 @@ agent-deck add [path] [options]
 | `--parent` | Parent session (creates child) |
 | `--no-parent` | Disable automatic parent linking |
 | `--mcp` | Attach MCP (repeatable) |
+| `--attach` | Start and attach to the session immediately after creating it (requires an interactive terminal; not supported with `--ssh`/`--json`) |
 
 ```bash
 agent-deck add -t "My Project" -c claude .
@@ -47,10 +49,12 @@ agent-deck add -t "Child" --parent "Parent" -c claude /tmp/x
 agent-deck add -g ard --parent "conductor-ard" -c claude .
 agent-deck add -c "codex --dangerously-bypass-approvals-and-sandbox" .
 agent-deck add -t "Research" -c claude --mcp exa --mcp firecrawl /tmp/r
+agent-deck add -t "Quick" -c claude --attach .   # create → start → drop into the pane
 ```
 
 Notes:
 - Parent auto-link is enabled by default when `AGENT_DECK_SESSION_ID` is present and neither `--parent` nor `--no-parent` is passed.
+- `--attach` does create → start → attach in one step. Without an interactive terminal (or with `--json`) it exits non-zero with a clear error, leaving the session created and started so you can attach later.
 - `--parent` and `--no-parent` are mutually exclusive.
 - Explicit `-g/--group` overrides inherited parent group.
 - If `--cmd` contains extra args and no explicit `--wrapper` is provided, agent-deck auto-generates a wrapper to preserve those args.
@@ -67,7 +71,11 @@ Examples:
 agent-deck launch . -c claude -m "Review this module"
 agent-deck launch . -g ard -c claude -m "Review dataset"
 agent-deck launch . -c "codex --dangerously-bypass-approvals-and-sandbox"
+agent-deck launch -g book-keeper -c claude   # no path: lands on the group's default_path
 ```
+
+Notes:
+- `[path]` omitted: resolves the target group's `default_path`, then the global `default_path` config key, then cwd — the same chain as `add` (#1303). An explicit `.` always means the current directory.
 
 ### list - List sessions
 
@@ -92,6 +100,14 @@ agent-deck status [-v|-q|--json]
 - Default: `2 waiting - 5 running - 3 idle`
 - `-v`: Detailed list by status
 - `-q`: Just waiting count (for scripts)
+
+### migrate-paths - Copy legacy data into XDG layout
+
+```bash
+agent-deck migrate-paths [--dry-run] [--force]
+```
+
+Copies known legacy `~/.agent-deck` files into the split XDG layout (config under `~/.config/agent-deck`, durable data under `~/.local/share/agent-deck`, cache under `~/.cache/agent-deck`) without deleting the legacy directory. Use `--dry-run` to preview what would be copied.
 
 ## Web Command
 
@@ -126,10 +142,11 @@ http://127.0.0.1:8420/?token=my-secret
 ### session start
 
 ```bash
-agent-deck session start <id|title> [-m "message"] [--json] [-q]
+agent-deck session start <id|title> [-m "message"] [--attach] [--json] [-q]
 ```
 
 `-m` sends initial message after agent is ready.
+`--attach` drops you into the session's pane after it starts (requires an interactive terminal; refused under `--json`). On a clean detach you return to the shell; without a TTY it exits non-zero, leaving the session started.
 Flags can be placed before or after the session identifier.
 
 ### session stop
@@ -146,13 +163,15 @@ agent-deck session restart <id|title>
 
 Reloads MCPs without losing conversation (Claude/Gemini).
 
-### session fork (Claude and Pi)
+### session fork (Claude, OpenCode, Pi, Codex)
 
 ```bash
 agent-deck session fork <id|title> [-t "title"] [-g "group"]
 ```
 
 Creates a new session with the same conversation context for supported tools.
+
+In the TUI, quick fork (`f`) is comprehensive by default: it creates a new git worktree + branch, carries the parent's uncommitted state, matches Docker isolation, and inherits the Claude launch options. Defaults are configured in the `[fork]` section — see [config-reference.md](config-reference.md#fork-section). The Web/API fork is a plain tool-native fork and does not apply the `[fork]` defaults.
 
 **Requirements:**
 - Claude sessions must have a valid Claude session ID
@@ -204,7 +223,7 @@ agent-deck session current --json
 
 **Profile auto-detection priority:**
 1. `AGENTDECK_PROFILE` env var
-2. Parse from `CLAUDE_CONFIG_DIR` (`~/.claude-work` -> `work`)
+2. Parse from `CLAUDE_CONFIG_DIR` (`~/.claude-team` -> `work`)
 3. Config default or `default`
 
 ### session set
@@ -213,7 +232,9 @@ agent-deck session current --json
 agent-deck session set <id|title> <field> <value>
 ```
 
-**Fields:** title, path, command, tool, claude-session-id, gemini-session-id
+**Fields:** title, path, command, tool, claude-session-id, gemini-session-id, account
+
+Setting `account` auto-migrates the Claude conversation into the target account's config dir (same migration as `session switch-account`, but without the automatic stop/restart).
 
 ### session send
 
@@ -226,6 +247,18 @@ Default behavior:
 - Verifies processing starts after send.
 - If Claude leaves a pasted prompt unsent (`[Pasted text ...]`), retries `Enter` automatically.
 - Avoids unnecessary retry `Enter` presses when session is already `waiting`/`idle`.
+
+### session approve
+
+```bash
+agent-deck session approve <id|title> [once|always|session|N] [--timeout 5s] [-q] [--json]
+```
+
+Resolves one currently visible Codex numbered approval menu. It validates that
+the same menu is still visible immediately before sending one digit keypress,
+then verifies that the original prompt clears. It never sends Enter or retries
+the decision automatically. Do not use `session send <id> "1"` for a Codex
+approval: that path sends composer text followed by Enter.
 
 ### session output
 
@@ -241,6 +274,46 @@ Get last response from Claude/Gemini session.
 agent-deck session set-parent <session> <parent>
 agent-deck session unset-parent <session>
 ```
+
+### session switch-account
+
+```bash
+agent-deck session switch-account <session> <account>
+```
+
+Moves a session — conversation included — to another configured Claude account: stops the session, migrates the Claude conversation file into the target account's config dir (copy-only, with a destination backup and size verification), sets the account, and restarts with `--resume`.
+
+```bash
+agent-deck session switch-account "My Project" work
+```
+
+Accounts are the profiles named in `config.toml` (`[profiles.<name>.claude].config_dir`).
+
+## Worktree Commands
+
+### worktree list
+
+```bash
+agent-deck worktree list
+```
+
+Lists worktrees and their associated sessions.
+
+### worktree info
+
+```bash
+agent-deck worktree info <session>
+```
+
+Shows detailed worktree info for a session.
+
+### worktree cleanup
+
+```bash
+agent-deck worktree cleanup [--force]
+```
+
+Finds orphaned worktrees/sessions. Dry-run by default; `--force` performs the cleanup.
 
 ## MCP Commands
 
