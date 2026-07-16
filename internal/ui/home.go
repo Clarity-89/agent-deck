@@ -10889,8 +10889,9 @@ const setupWarningMaxLen = 300
 // verbose output stays in the log (see createWorktreeWithSetupAndLog).
 func formatSetupWarning(setupErr error) string {
 	msg := strings.Join(strings.Fields(tmux.StripANSI(setupErr.Error())), " ")
-	if len(msg) > setupWarningMaxLen {
-		msg = msg[:setupWarningMaxLen] + "…"
+	// Truncate by rune, not byte, so a multi-byte character is never split.
+	if runes := []rune(msg); len(runes) > setupWarningMaxLen {
+		msg = string(runes[:setupWarningMaxLen]) + "…"
 	}
 	return "worktree setup script failed: " + msg
 }

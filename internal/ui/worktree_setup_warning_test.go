@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 )
@@ -45,6 +46,18 @@ func TestFormatSetupWarning(t *testing.T) {
 			t.Fatalf("want ellipsis suffix, got %q", body)
 		}
 		// setupWarningMaxLen runes of content + the ellipsis rune.
+		if runes := []rune(body); len(runes) != setupWarningMaxLen+1 {
+			t.Fatalf("body rune length = %d, want %d", len(runes), setupWarningMaxLen+1)
+		}
+	})
+
+	t.Run("multi-byte output truncates on rune boundaries, stays valid UTF-8", func(t *testing.T) {
+		// Each 'é' is 2 bytes; byte-slicing would split one and corrupt the string.
+		got := formatSetupWarning(errors.New(strings.Repeat("é", setupWarningMaxLen+50)))
+		body := strings.TrimPrefix(got, prefix)
+		if !utf8.ValidString(body) {
+			t.Fatalf("truncated body is not valid UTF-8: %q", body)
+		}
 		if runes := []rune(body); len(runes) != setupWarningMaxLen+1 {
 			t.Fatalf("body rune length = %d, want %d", len(runes), setupWarningMaxLen+1)
 		}
