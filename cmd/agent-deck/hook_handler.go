@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
@@ -63,10 +64,17 @@ func resolveStopHookActive(p hookPayload) bool {
 
 // hookStatusFile is the JSON written to ~/.agent-deck/hooks/{instance_id}.json
 type hookStatusFile struct {
-	Status    string `json:"status"`
-	SessionID string `json:"session_id,omitempty"`
-	Event     string `json:"event"`
-	Timestamp int64  `json:"ts"`
+	Status                   string `json:"status"`
+	SessionID                string `json:"session_id,omitempty"`
+	Event                    string `json:"event"`
+	Timestamp                int64  `json:"ts"`
+	CodexStartedGeneration   string `json:"codex_started_generation,omitempty"`
+	CodexCompletedGeneration string `json:"codex_completed_generation,omitempty"`
+	CodexStartedSessionID    string `json:"codex_started_session_id,omitempty"`
+	CodexCompletedSessionID  string `json:"codex_completed_session_id,omitempty"`
+	HookGeneration           string `json:"hook_generation,omitempty"`
+	Sequence                 uint64 `json:"sequence,omitempty"`
+	InitialMessagePending    bool   `json:"initial_message_pending,omitempty"`
 	// DoneStatus/DoneSummary carry a worker-printed completion sentinel
 	// detected on the Stop edge (issue #1186). omitempty so ordinary Stops
 	// (no sentinel) leave the fields absent, which the daemon reads as
@@ -78,6 +86,19 @@ type hookStatusFile struct {
 	// (issue #1186 flush race). The daemon re-scans this path on its poll
 	// loop; the synchronous Stop hook (#1225) must not wait out the flush.
 	TranscriptPath string `json:"transcript_path,omitempty"`
+	// Cwd is the working directory the hook payload reported for this event.
+	// Issue #1729: the session-binding path uses it as same-session evidence —
+	// a candidate session id whose cwd is provably outside the instance's
+	// declared paths (e.g. a headless `claude -p` worker at $TMPDIR that
+	// inherited AGENTDECK_INSTANCE_ID) must never bind. omitempty keeps legacy
+	// files byte-identical when the agent sends no cwd.
+	Cwd string `json:"cwd,omitempty"`
+}
+
+type hookGenerationControl struct {
+	Generation            string `json:"generation"`
+	NextSequence          uint64 `json:"next_sequence"`
+	InitialMessagePending bool   `json:"initial_message_pending,omitempty"`
 }
 
 // normalizeHookEventKey folds hook event names from Claude (PascalCase), Cursor
@@ -104,14 +125,36 @@ func mapEventToStatus(event string) string {
 		return "running" // Gemini received user input and is processing
 	case "afteragent":
 		return "waiting" // Gemini completed response, back to waiting
+	case "prellmcall":
+		return "running" // Hermes: turn started (LLM/tool-calling loop), agent is working
+	case "postllmcall":
+		return "waiting" // Hermes: turn complete, final response produced, back at prompt
 	case "pretoolcall", "pretooluse":
 		return "running" // executing a tool call
-	case "posttoolcall", "posttooluse", "posttoolusefailure":
+	case "posttoolcall":
+		// Hermes only (other tools' post-tool events normalize to
+		// "posttooluse"). Mid-turn a finished tool call means the LLM is
+		// generating the next step, not that the agent is back at the prompt;
+		// post_llm_call owns the turn-end waiting edge.
+		return "running"
+	case "posttooluse", "posttoolusefailure":
 		return "waiting" // finished a tool call, back at prompt
 	case "onsessionstart":
 		return "waiting" // Hermes session started, waiting for first prompt
 	case "onsessionend":
-		return "dead" // Hermes session ended
+		// Hermes fires on_session_end at the end of EVERY run_conversation
+		// call — once per user message — NOT at process exit. It is the
+		// turn-end edge, and the only one an interrupted turn gets
+		// (post_llm_call is skipped when interrupted). Mapping it to dead
+		// showed an error ✕ after every completed turn.
+		return "waiting"
+	case "onsessionfinalize":
+		return "dead" // Hermes process exit / session reset — the real session end
+	case "preapirequest", "postapirequest":
+		// Per-API-call heartbeat within a turn: refreshes "running" so a
+		// long multi-step turn doesn't outlive the hook freshness window
+		// and fade to idle mid-work.
+		return "running"
 	case "userpromptsubmit", "beforesubmitprompt":
 		return "running" // user sent prompt, agent is processing
 	case "stop":
@@ -205,9 +248,9 @@ func handleHookHandler() {
 	}
 
 	if isStopHookEvent(payload.HookEventName) {
-		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, detectDoneSentinel(data))
+		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, detectDoneSentinel(data))
 	} else {
-		writeHookStatus(instanceID, status, sessionID, payload.HookEventName)
+		writeHookStatus(instanceID, status, sessionID, payload.HookEventName, payload.Cwd)
 	}
 
 	// #572: Sync agent-deck title from Claude Code's --name / /rename value.
@@ -234,6 +277,20 @@ func handleHookHandler() {
 	// unchanged.
 	if normalizeHookEventKey(payload.HookEventName) == "permissionrequest" && parentIsDSP() {
 		fmt.Println(`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"allow"}}`)
+	}
+
+	// Conductor fleet snapshot: on the Claude turn-start edges (UserPromptSubmit,
+	// SessionStart), a parent session gets a compact children-status snapshot
+	// injected as additionalContext. State, not events — complements the #1225
+	// Stop-edge drain below, which delivers queued deltas. No-op for sessions
+	// without children; AGENTDECK_NO_CHILDREN_CONTEXT=1 opts a session out.
+	if ctxEvent := claudeContextEventName(payload.HookEventName); ctxEvent != "" &&
+		os.Getenv("AGENTDECK_NO_CHILDREN_CONTEXT") != "1" {
+		if summary := buildChildrenContextSummary(instanceID); summary != "" {
+			if out := childrenContextJSON(ctxEvent, summary); out != "" {
+				fmt.Println(out)
+			}
+		}
 	}
 
 	// Issue #1225: on the Stop edge (the turn boundary), a parent drains its
@@ -277,19 +334,19 @@ func parentIsDSP() bool {
 // writeHookStatus writes a hook status file atomically for one instance.
 // The optional done argument carries a completion sentinel (issue #1186);
 // when supplied its status/summary are persisted alongside the hook status.
-func writeHookStatus(instanceID, status, sessionID, event string, done ...session.DoneSignal) {
+func writeHookStatus(instanceID, status, sessionID, event, cwd string, done ...session.DoneSignal) {
 	scan := doneScanResult{}
 	if len(done) > 0 {
 		scan.signal = &done[0]
 	}
-	writeHookStatusWithScan(instanceID, status, sessionID, event, scan)
+	writeHookStatusWithScan(instanceID, status, sessionID, event, cwd, scan)
 }
 
 // writeHookStatusWithScan is writeHookStatus plus the full Stop-edge scan
 // outcome: a parsed sentinel persists as done_status/done_summary; an
 // unflushed tail persists as transcript_path so the daemon can finish the
 // scan (issue #1186 flush race).
-func writeHookStatusWithScan(instanceID, status, sessionID, event string, scan doneScanResult) {
+func writeHookStatusWithScan(instanceID, status, sessionID, event, cwd string, scan doneScanResult) {
 	if instanceID == "" || status == "" {
 		return
 	}
@@ -305,23 +362,58 @@ func writeHookStatusWithScan(instanceID, status, sessionID, event string, scan d
 	}
 
 	sessionID = strings.TrimSpace(sessionID)
-	// Preserve legacy hook JSON semantics: empty stays empty.
-	// Persist non-empty session IDs in a sidecar, to be used only when reading.
-	if sessionID != "" {
-		session.WriteHookSessionAnchor(instanceID, sessionID)
-	}
 
 	statusFile := hookStatusFile{
 		Status:    status,
 		SessionID: sessionID,
 		Event:     event,
 		Timestamp: time.Now().Unix(),
+		Cwd:       strings.TrimSpace(cwd),
 	}
 	if scan.signal != nil {
 		statusFile.DoneStatus = scan.signal.Status
 		statusFile.DoneSummary = scan.signal.Summary
 	}
 	statusFile.TranscriptPath = scan.pendingTranscript
+	writeHookStatusFile(instanceID, statusFile, true)
+}
+
+func writeHookStatusFile(instanceID string, statusFile hookStatusFile, mutateAnchor bool) bool {
+	hooksDir := getHooksDir()
+	generation := strings.TrimSpace(os.Getenv("AGENTDECK_HOOK_GENERATION"))
+	if generation != "" {
+		lockPath := filepath.Join(hooksDir, filepath.Base(instanceID)+".lock")
+		lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return false
+		}
+		defer closeChecked(lock)
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+			return false
+		}
+		defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+		controlPath := filepath.Join(hooksDir, filepath.Base(instanceID)+".generation.json")
+		var control hookGenerationControl
+		data, err := readHookFileBounded(controlPath)
+		if err != nil || json.Unmarshal(data, &control) != nil || control.Generation != generation {
+			return false
+		}
+		// StartWithMessage stays running until the agent-level completion edge.
+		if normalizeHookEventKey(statusFile.Event) == "onsessionstart" && control.InitialMessagePending {
+			return false
+		}
+		control.NextSequence++
+		statusFile.HookGeneration, statusFile.Sequence = generation, control.NextSequence
+		completionEvent := normalizeHookEventKey(statusFile.Event)
+		if completionEvent == "postllmcall" || completionEvent == "onsessionend" {
+			control.InitialMessagePending = false
+		}
+		statusFile.InitialMessagePending = control.InitialMessagePending
+		b, err := json.Marshal(control)
+		if err != nil || atomicHookWrite(controlPath, b) != nil {
+			return false
+		}
+	}
 
 	jsonData, err := json.Marshal(statusFile)
 	if err != nil {
@@ -329,35 +421,61 @@ func writeHookStatusWithScan(instanceID, status, sessionID, event string, scan d
 			slog.String("instance", instanceID),
 			slog.String("error", err.Error()),
 		)
-		return
+		return false
 	}
 
 	filePath := filepath.Join(hooksDir, filepath.Base(instanceID)+".json")
-	tmpPath := filePath + ".tmp"
-	if err := os.WriteFile(tmpPath, jsonData, 0600); err != nil {
+	if err := atomicHookWrite(filePath, jsonData); err != nil {
 		hookHandlerLog.Warn("hook_status_write_failed",
-			slog.String("path", tmpPath),
+			slog.String("path", filePath),
 			slog.String("instance", instanceID),
 			slog.String("error", err.Error()),
 		)
-		return
+		return false
 	}
-	if err := os.Rename(tmpPath, filePath); err != nil {
-		hookHandlerLog.Warn("hook_status_rename_failed",
-			slog.String("from", tmpPath),
-			slog.String("to", filePath),
-			slog.String("instance", instanceID),
-			slog.String("error", err.Error()),
-		)
-		// Best-effort cleanup of the orphaned temp file.
-		_ = os.Remove(tmpPath)
-		return
+	// Keep anchor mutation in the same generation-locked critical section as
+	// acceptance and status publication. Restart cannot rotate generations in
+	// between these operations.
+	if mutateAnchor && statusFile.SessionID != "" {
+		session.WriteHookSessionAnchor(instanceID, statusFile.SessionID)
 	}
-
-	// Clear sticky session mapping when the upstream session is explicitly ended.
-	if isTerminalHookEvent(event) {
+	if mutateAnchor && isTerminalHookEvent(statusFile.Event) {
 		session.ClearHookSessionAnchor(instanceID)
 	}
+	return true
+}
+
+func readHookFileBounded(path string) ([]byte, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = syscall.Close(fd)
+		return nil, errors.New("open hook file")
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, 64<<10))
+}
+
+func atomicHookWrite(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(data)
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func isTerminalHookEvent(event string) bool {
@@ -370,7 +488,7 @@ func isTerminalHookEvent(event string) bool {
 	// sidecar on ordinary non-terminal "Stop"/turn-complete style events.
 	switch norm {
 	case "sessionend", "sessionended", "sessionclose", "sessionclosed", "sessiondone", "sessionexit", "sessionexited",
-		"onsessionend", // Hermes: on_session_end normalized
+		"onsessionfinalize", // Hermes final process/session event
 		"threadend", "threadended", "threadterminate", "threadterminated", "threadclose", "threadclosed",
 		"threaddone", "threadexit", "threadexited":
 		return true
@@ -433,6 +551,36 @@ func cleanStaleHookFiles() {
 
 	cutoff := time.Now().Add(-24 * time.Hour)
 	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".generation.json") {
+			continue // generation controls are never age-reaped
+		}
+		if strings.HasSuffix(entry.Name(), ".lock") {
+			info, err := entry.Info()
+			if err != nil || !info.ModTime().Before(cutoff) {
+				continue
+			}
+			id := strings.TrimSuffix(entry.Name(), ".lock")
+			if strings.HasSuffix(entry.Name(), ".codex-writer.lock") {
+				id = strings.TrimSuffix(entry.Name(), ".codex-writer.lock")
+			}
+			if _, err := os.Stat(filepath.Join(hooksDir, id+".json")); err == nil {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(hooksDir, id+".generation.json")); err == nil {
+				continue
+			}
+			path := filepath.Join(hooksDir, entry.Name())
+			f, err := os.OpenFile(path, os.O_RDWR, 0600)
+			if err != nil {
+				continue
+			}
+			if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+				_ = os.Remove(path)
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			}
+			_ = f.Close()
+			continue
+		}
 		ext := filepath.Ext(entry.Name())
 		if entry.IsDir() || (ext != ".json" && ext != ".sid") {
 			continue
@@ -445,6 +593,24 @@ func cleanStaleHookFiles() {
 			_ = os.Remove(filepath.Join(hooksDir, entry.Name()))
 		}
 	}
+	// Crash-orphaned unique temp files are safe to reap by age. WalkDir does
+	// not follow symlinked directories, preserving sandbox scope boundaries.
+	root, rootErr := os.OpenRoot(hooksDir)
+	if rootErr != nil {
+		return
+	}
+	defer func() { _ = root.Close() }()
+	_ = filepath.WalkDir(hooksDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() || !strings.Contains(entry.Name(), ".tmp-") {
+			return nil
+		}
+		if info, err := entry.Info(); err == nil && info.ModTime().Before(cutoff) {
+			if rel, err := filepath.Rel(hooksDir, path); err == nil {
+				_ = root.Remove(rel)
+			}
+		}
+		return nil
+	})
 }
 
 // handleHooks handles the "hooks" CLI subcommand for manual hook management.

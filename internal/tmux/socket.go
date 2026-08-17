@@ -2,12 +2,15 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmuxutf8"
 )
 
 // tmuxSubprocessWaitDelay is the deadline cmd.Wait() waits for stdio I/O
@@ -136,27 +139,47 @@ func tmuxFmt(fields ...string) string {
 	return strings.Join(fields, tmuxFieldSep)
 }
 
-// tmuxArgs builds the full `tmux …` argv for a command, inserting the
-// `-L <name>` socket selector at the front when socketName is non-empty
-// and non-whitespace. An empty socket name is the pre-v1.7.50 default and
-// produces an unmodified argv — zero behavior change for users who do not
-// opt in to socket isolation (scope decision 1: empty default).
+// tmuxArgs builds the full `tmux …` argv for a command: tmux's global `-u`
+// (UTF-8) flag, then the `-L <name>` socket selector when socketName is
+// non-empty and non-whitespace, then the caller's subcommand. An empty socket
+// name is the pre-v1.7.50 default and produces no `-L` — zero behavior change
+// for users who do not opt in to socket isolation (scope decision 1: empty
+// default).
+//
+// The `-u` is the #1867 fix and is why this function, not the call sites, is
+// where the argv is assembled: a tmux client with no UTF-8 locale (systemd,
+// launchd, a bare container, CI) receives every non-ASCII byte rewritten to
+// "_", which destroys the braille spinner that the status fast path reads out
+// of `#{pane_title}`. Adding it here means a future call site is safe for
+// free. See internal/tmuxutf8 for the full rationale and for why forcing a
+// locale into the child environment was rejected instead.
 //
 // The returned slice is always freshly allocated; the caller's args slice
 // is never mutated or aliased.
 //
 // See CHANGELOG v1.7.50 and docs/README socket-isolation section.
 func tmuxArgs(socketName string, args ...string) []string {
-	name := strings.TrimSpace(socketName)
-	if name == "" {
-		out := make([]string, len(args))
-		copy(out, args)
-		return out
+	// Some attach call sites retain a literal leading -u because the repo-wide
+	// AST lint guards the shipped #1789 contract at each spawn. Remove it before
+	// inserting the socket selector; Prepend below restores exactly one global
+	// flag in the correct position.
+	if len(args) > 0 && args[0] == tmuxutf8.Flag {
+		args = args[1:]
 	}
-	out := make([]string, 0, len(args)+2)
-	out = append(out, "-L", name)
-	out = append(out, args...)
-	return out
+	name := strings.TrimSpace(socketName)
+	var out []string
+	if name == "" {
+		out = make([]string, len(args))
+		copy(out, args)
+	} else {
+		if len(args) > int(^uint(0)>>1)-2 {
+			panic("tmux argument list too large")
+		}
+		out = make([]string, 0, len(args)+2)
+		out = append(out, "-L", name)
+		out = append(out, args...)
+	}
+	return tmuxutf8.Prepend(out)
 }
 
 // tmuxExec constructs an *exec.Cmd that invokes `tmux` with the given
@@ -168,6 +191,9 @@ func tmuxArgs(socketName string, args ...string) []string {
 // `exec.Command("tmux", args...)`, preserving the contract of every
 // pre-v1.7.50 call site that was rewritten in #697.
 func tmuxExec(socketName string, args ...string) *exec.Cmd {
+	// Refuse, before the subprocess exists, to point a test binary at the
+	// user's live default server. See default_socket_guard.go.
+	assertTmuxSpawnIsolated(socketName, args)
 	// #nosec G204,G702 -- "tmux" is a fixed binary and every dynamic value is
 	// passed as a distinct argv element, never through a shell. Call sites may
 	// supply user-selected paths, but those cannot alter the executable or argv
@@ -182,6 +208,7 @@ func tmuxExec(socketName string, args ...string) *exec.Cmd {
 // timeout (e.g. SetEnvironment at internal/tmux/tmux.go:1412); this keeps
 // the -L plumbing centralised for them too.
 func tmuxExecContext(ctx context.Context, socketName string, args ...string) *exec.Cmd {
+	assertTmuxSpawnIsolated(socketName, args)
 	cmd := exec.CommandContext(ctx, "tmux", tmuxArgs(socketName, args...)...)
 	cmd.WaitDelay = tmuxSubprocessWaitDelay
 	return cmd
@@ -316,6 +343,72 @@ func (s *Session) runBoundedRun(args ...string) error {
 	return runBoundedRun(s.SocketName, args...)
 }
 
+// tmuxMutationTimeout bounds the state-CHANGING tmux commands: kill-session,
+// switch-client, detach-client. The fd leak that motivates every deadline in
+// this file is a property of the tmux CLIENT, not of the subcommand it carries,
+// so a mutation client wedges exactly like a poll client — and these run on the
+// same cadences (the notification-bar sweep issues one switch/detach per
+// attached client; kill-session runs on every teardown).
+//
+// It is deliberately longer than tmuxPollTimeout. The asymmetry is in what a
+// FALSE timeout costs: a read that gives up too early is re-issued by the next
+// poll a second later, while a kill-session abandoned early can leave a session
+// the user asked to be gone lingering until the next sweep. Both directions are
+// tolerated at the call sites — Kill/KillAndWait re-probe Exists() and treat
+// "gone" as success, SwitchAttachedClients falls back to a focus_request,
+// DetachClientsOnSockets leaves the TUI attached where it was — so the failure
+// mode is a no-op, never a corrupted half-state.
+var tmuxMutationTimeout = 5 * time.Second
+
+// errTmuxTimeout marks a command we abandoned at its deadline, as opposed to
+// one tmux answered with a failure. Callers need the distinction: "we gave up"
+// is a benign, retryable non-event that should fall through to a slower path,
+// while "tmux said no" is a real error that must surface. Without it every
+// timeout arrives as an opaque `signal: killed` ExitError and gets treated as
+// the latter.
+var errTmuxTimeout = errors.New("tmux command exceeded its deadline")
+
+// annotateDeadline wraps a failed run with errTmuxTimeout when the command's
+// context deadline had fired, preserving the original error for logs. The
+// deadline only matters for a run that FAILED: a command can complete
+// successfully just as its deadline expires, and that is a success.
+func annotateDeadline(ctxErr, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", errTmuxTimeout, err)
+	}
+	return err
+}
+
+// runBoundedMutation runs a state-changing tmux command under
+// tmuxMutationTimeout. Timeout-guarded replacement for the bare
+// tmuxExec(socket, args...).Run() / s.tmuxCmd(args...).Run() mutation sites.
+// A deadline failure comes back wrapped in errTmuxTimeout.
+func runBoundedMutation(socketName string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), tmuxMutationTimeout)
+	defer cancel()
+	err := tmuxExecContext(ctx, socketName, args...).Run()
+	return annotateDeadline(ctx.Err(), err)
+}
+
+// runBoundedMutation is the per-Session convenience wrapper, targeting the
+// session's own socket (see tmuxCmd for why the socket must not drift).
+func (s *Session) runBoundedMutation(args ...string) error {
+	return runBoundedMutation(s.SocketName, args...)
+}
+
+// OutputBounded is the public counterpart to runBoundedOutput, for cadence
+// queries fired from outside internal/tmux (internal/session pane-PID probes,
+// CLI helpers). Prefer it over Exec(...).Output() for anything on a timer:
+// Exec has no deadline, and a tmux client that has leaked its fd table spins
+// at 100% CPU forever rather than exiting, so an unbounded .Output() never
+// returns. See tmuxPollTimeout.
+func OutputBounded(socketName string, args ...string) ([]byte, error) {
+	return runBoundedOutput(socketName, args...)
+}
+
 // Exec is the public package counterpart to tmuxExec. Call sites outside
 // internal/tmux (the session package, CLI helpers, web terminal bridge) use
 // this when they have a socket name — typically Instance.TmuxSocketName —
@@ -339,12 +432,16 @@ func ExecContext(ctx context.Context, socketName string, args ...string) *exec.C
 // session is launched via `systemd-run --user tmux <args…>`, the socket
 // selector has to live INSIDE the inner tmux argv — after the literal
 // "tmux" that systemd-run execs, before the subcommand. This helper
-// returns just the inner `[-L <name>] <args…>` slice; callers splice it
+// returns just the inner `-u [-L <name>] <args…>` slice; callers splice it
 // after "tmux" in their systemd-run argv (or use it directly when launcher
 // is "tmux").
 //
-// Empty / whitespace-only socket name returns the input args unchanged, so
-// pre-v1.7.50 call sites see byte-identical argv.
+// Empty / whitespace-only socket name omits only `-L`; `-u` remains because it
+// controls client encoding rather than server selection.
 func buildInnerTmuxArgs(socketName string, args ...string) []string {
+	// This argv is always spawned (directly, or spliced into a systemd-run
+	// argv), so it needs the same refusal as the exec factories — the layer of
+	// indirection is the only difference. See default_socket_guard.go.
+	assertTmuxSpawnIsolated(socketName, args)
 	return tmuxArgs(socketName, args...)
 }

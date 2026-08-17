@@ -66,7 +66,9 @@ Commands accept: **exact title**, **ID prefix** (e.g., first 4 chars), **path**,
 | `running` (green) | Claude is actively processing | Do nothing. Wait. |
 | `waiting` (yellow) | Claude finished, needs input | Read output, decide: auto-respond or escalate |
 | `idle` (gray) | Waiting, but user acknowledged | User knows about it. Skip unless asked. |
-| `error` (red) | Session crashed or missing | Try `session restart`. If that fails, escalate. |
+| `error` (red) | Crashed, missing, or wedged (auth/model failure) | Check the substate first. Then try `session restart`; if that fails, escalate. |
+
+**Substate (Claude sessions only; refines status in `list`/`show` JSON):** `auth-401` covers two different pane banners. A credential banner (`Please run /login`, `API Error: 401`) means the fleet is HOLDING the session; restarting will NOT fix it. Check `session show --json <id>` for the `auth_hold` object (the authoritative source, present even after the pane exits) and escalate for re-login. A dropped-socket banner (`socket connection closed`) also classifies as `auth-401` but is NOT held and IS restart-recoverable: restart it. `model-unavailable` means the selected model is down (shows as error, not running); self-heal currently only observes this and takes no action, so switch it yourself with `agent-deck -p {PROFILE} session set <id> model <model>` then `agent-deck -p {PROFILE} session restart <id>`. `idle-at-empty-prompt` (shown as coarse status `idle` or `waiting`) means the session is genuinely sitting at its prompt with nothing happening. Never restart-loop an `error` session that `auth_hold` confirms is credential-held.
 
 ## Heartbeat Protocol
 
@@ -220,7 +222,7 @@ When you first start (or after a restart):
 Each conductor that owns a Telegram bot must follow this topology, or pollers leak and the bot stops responding with 409 Conflict after a few hours:
 
 - **Activate per-session only**: set `channels = ["plugin:telegram@claude-plugins-official"]` on this conductor's agent-deck record (via `agent-deck session set <conductor> channels ...`).
-- **Inject `TELEGRAM_STATE_DIR` via `env_file`**: in `~/.agent-deck/config.toml`, set `[conductors.{PROFILE}.claude].env_file = "~/.agent-deck/conductor/{PROFILE}/.envrc"` (and a matching `[groups.{PROFILE}.claude]` block). The `.envrc` file contains a single line: `export TELEGRAM_STATE_DIR=<profile-state-dir>`. Never use a session wrapper (`agent-deck session set <conductor> wrapper "TELEGRAM_STATE_DIR=... {command}"`) — it works on resume but silently fails on fresh-start.
+- **Inject `TELEGRAM_STATE_DIR` via `env_file`**: in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`), set `[conductors.{PROFILE}.claude].env_file = "~/.agent-deck/conductor/{PROFILE}/.envrc"` (and a matching `[groups.{PROFILE}.claude]` block). The `.envrc` file contains a single line: `export TELEGRAM_STATE_DIR=<profile-state-dir>`. Never use a session wrapper (`agent-deck session set <conductor> wrapper "TELEGRAM_STATE_DIR=... {command}"`) — it works on resume but silently fails on fresh-start.
 - **Child sessions auto-strip `TELEGRAM_STATE_DIR`** (issue #680, v1.7.35+): when `[conductors.{PROFILE}]` AND `[groups.{PROFILE}.claude].env_file` are both set (the mirrored pattern above), agent-deck appends `unset TELEGRAM_STATE_DIR` to the spawn env for any non-conductor session in that group. This prevents child sessions from auto-starting a competing `bun telegram` poller on the same bot token. Conductors keep the variable; groups without a paired conductor block are unaffected.
 - **Keep global telegram disabled**: `enabledPlugins."telegram@claude-plugins-official"` must be absent or `false` in this profile's `settings.json`. If it is `true`, every claude child session loads the plugin, and the conductor loads it twice.
 - **Preflight checklist before expecting messages to flow**:

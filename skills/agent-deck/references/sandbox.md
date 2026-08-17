@@ -17,7 +17,7 @@ Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Codex CLI, 
 | Enable sandbox | `--sandbox` flag | Checkbox toggle |
 | Custom image | `--sandbox-image <image>` | Not supported |
 | Container cleanup | Automatic on remove | Automatic on remove |
-| Settings | `~/.agent-deck/config.toml` | `S` (Settings panel) |
+| Settings | `$XDG_CONFIG_HOME/agent-deck/config.toml` | `S` (Settings panel) |
 
 ## One-Liner Commands
 
@@ -28,8 +28,9 @@ agent-deck add --sandbox .
 # Create sandboxed session with custom image
 agent-deck add --sandbox-image myregistry/custom:v1 .
 
-# One-shot sandboxed task
-agent-deck try "refactor the auth module"
+# Sandboxed scratch session in a dated experiment folder
+# (argument is an experiment NAME, not a prompt — see the Scratch Sessions section in SKILL.md)
+agent-deck try auth-refactor --sandbox
 
 # Remove session (auto-cleans container)
 agent-deck remove <session>
@@ -180,7 +181,7 @@ docker build -t my-sandbox:latest .
 ```
 
 ```toml
-# Set as default in ~/.agent-deck/config.toml
+# Set as default in $XDG_CONFIG_HOME/agent-deck/config.toml (default ~/.config/agent-deck/config.toml)
 [docker]
 default_image = "my-sandbox:latest"
 ```

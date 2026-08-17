@@ -120,8 +120,8 @@ type SettingsPanel struct {
 // builtinToolNames and builtinToolValues are the built-in tools. Custom tools
 // from config are appended dynamically in LoadConfig.
 var (
-	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Cursor", "Hermes"}
-	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes"}
+	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Cursor", "Hermes", "DeepSeek"}
+	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek"}
 )
 
 // Search tier names for radio selection
@@ -352,6 +352,7 @@ func (s *SettingsPanel) buildToolLists(config *session.UserConfig) {
 			"claude": true, "gemini": true, "opencode": true,
 			"codex": true, "pi": true, "crush": true, "copilot": true,
 			"shell": true, "cursor": true, "aider": true, "hermes": true,
+			"deepseek": true,
 		}
 		var custom []string
 		for name := range config.Tools {
@@ -1228,8 +1229,24 @@ func (s *SettingsPanel) View() string {
 		if s.scrollOffset < 0 {
 			s.scrollOffset = 0
 		}
-		if maxOff := totalLines - availHeight; s.scrollOffset > maxOff {
+		maxOff := totalLines - availHeight
+		if s.scrollOffset > maxOff {
 			s.scrollOffset = maxOff
+		}
+		// When the cursor sits on the last navigable setting, scroll all the
+		// way to the bottom so the trailing info lines (MCP config-path hint +
+		// help bar) come into view and the "▼ more below" indicator clears.
+		// Scrolling is cursor-anchored, so without this the tail is
+		// unreachable (issue #1659). Never scroll past the cursor's context
+		// window, in case the tail ever grows taller than the viewport.
+		if s.cursor == settingsCount-1 && s.scrollOffset < maxOff {
+			bottomOff := maxOff
+			if lim := cursorLine - 2; bottomOff > lim {
+				bottomOff = lim
+			}
+			if s.scrollOffset < bottomOff {
+				s.scrollOffset = bottomOff
+			}
 		}
 
 		// Determine visible window, replacing edge content lines with scroll indicators

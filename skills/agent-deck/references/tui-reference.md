@@ -36,6 +36,8 @@ Complete reference for agent-deck Terminal UI features.
 | `f` | Quick fork (Claude/OpenCode/Pi/Codex) |
 | `F` | Fork with options (Claude/OpenCode/Pi/Codex) |
 
+For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses or moves to the parent. Remote-session reorder keys move only within the current remote group; the order is saved on the viewing machine, while remote group headers remain name-sorted.
+
 ### Group Actions
 
 | Key | Action |
@@ -67,7 +69,7 @@ Complete reference for agent-deck Terminal UI features.
 | `Ctrl+Q` | Detach (keep tmux running) |
 | `q` / `Ctrl+C` | Quit |
 
-## Status Indicators
+## Local Status Indicators
 
 | Symbol | Status | Color | Meaning |
 |--------|--------|-------|---------|
@@ -76,6 +78,8 @@ Complete reference for agent-deck Terminal UI features.
 | `○` | Idle | Gray | Stopped, acknowledged |
 | `✕` | Error | Red | tmux session doesn't exist |
 | `⟳` | Starting | Yellow | Session launching |
+
+Federated remote rows currently carry coarse running/waiting/idle/error status; local Honest Status substates are not included in the remote payload.
 
 ## Dialogs
 
@@ -94,7 +98,7 @@ Enter-advances is the default (`[ui].new_session_enter_advances = true`), so typ
 
 Pressing `n` on a remote group/session opens a remote-aware dialog (remote paths and group pre-filled); the session is created over SSH on the remote, never on localhost.
 
-Claude New Session defaults are remembered in `~/.agent-deck/config.toml` under `[claude]`, except start query and resume IDs, which are per-launch values.
+Claude New Session defaults are remembered in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`) under `[claude]`, except start query and resume IDs, which are per-launch values.
 
 ### MCP Manager (`m`)
 

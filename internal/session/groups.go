@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
@@ -61,6 +63,15 @@ type Item struct {
 	CreatingTitle       string             // Display title for creating placeholder
 	CreatingTool        string             // Tool for creating placeholder
 	DividerLabel        string             // Label shown on an ItemTypeDivider row (e.g. "idle / done")
+}
+
+// IsCreatingPlaceholder reports whether this row is a still-creating session
+// placeholder: a session-typed row whose *Instance has not been created yet
+// (Session == nil). Mutations (move/rename/fork) must be refused on such rows —
+// dereferencing the nil Instance panics (#1540). This is the single model-layer
+// predicate that generalizes the per-call-site nil guards.
+func (it Item) IsCreatingPlaceholder() bool {
+	return it.Type == ItemTypeSession && it.Session == nil
 }
 
 // Group represents a group of sessions
@@ -555,24 +566,71 @@ func GetGroupLevel(path string) int {
 	return strings.Count(path, "/")
 }
 
+// ancestorsExpanded reports whether every ancestor on path's chain is expanded,
+// i.e. whether a group at that path is reachable in the rendered tree.
+//
+// Issue #1878: this used to be an immediate-parent check, so collapsing a
+// top-level group hid its children but not its grandchildren — CollapseGroup
+// flips only the targeted group's own Expanded flag and never cascades, so a
+// grandchild's parent still reported Expanded == true and the row leaked out at
+// the top level, disconnected from any visible parent. Visibility is a property
+// of the whole chain, so the whole chain has to be walked.
+//
+// memo carries results across every group in one Flatten pass and must be
+// non-nil. Each ancestor prefix is resolved at most once and then reused, so a
+// whole pass is O(number of distinct group prefixes) — linear in the tree, not
+// O(groups × depth) with a fresh string rescan per level. Recursion depth is
+// the path depth (a handful of segments).
+//
+// A path segment that does not resolve to an existing group (a dangling
+// intermediate, an empty segment from a malformed path like "a//b", or a
+// trailing separator) is treated as expanded rather than collapsed: that
+// preserves the pre-existing "unknown parent ⇒ still show it" tolerance, while
+// the walk continues upward so a real collapsed ancestor above the gap still
+// hides the subtree.
+func (t *GroupTree) ancestorsExpanded(path string, memo map[string]bool) bool {
+	if v, ok := memo[path]; ok {
+		return v
+	}
+
+	visible := true
+	// getParentPath strictly shortens the path, so this bottoms out at root.
+	if parent := getParentPath(path); parent != "" {
+		if g, exists := t.Groups[parent]; exists && !g.Expanded {
+			visible = false
+		} else {
+			visible = t.ancestorsExpanded(parent, memo)
+		}
+	}
+
+	memo[path] = visible
+	return visible
+}
+
 // Flatten returns a flat list of items for cursor navigation
 func (t *GroupTree) Flatten() []Item {
 	items := []Item{}
+
+	// Visibility memo shared by every group in this pass (see ancestorsExpanded).
+	// Flatten runs on every render, so it is only allocated when some group is
+	// actually collapsed: with nothing collapsed anywhere, every group is
+	// visible and the ancestor walk is skipped entirely.
+	var visibleMemo map[string]bool
+	for _, g := range t.GroupList {
+		if !g.Expanded {
+			visibleMemo = make(map[string]bool, len(t.GroupList))
+			break
+		}
+	}
 
 	for _, group := range t.GroupList {
 		// Calculate group nesting level from path
 		groupLevel := GetGroupLevel(group.Path)
 
-		// Check if parent group is collapsed - if so, skip this group
-		if groupLevel > 0 {
-			idx := strings.LastIndex(group.Path, "/")
-			if idx == -1 {
-				continue // Malformed path, skip
-			}
-			parentPath := group.Path[:idx]
-			if parentGroup, exists := t.Groups[parentPath]; exists && !parentGroup.Expanded {
-				continue // Parent is collapsed, skip this subgroup
-			}
+		// A group renders only when EVERY ancestor on its path is expanded —
+		// not just its immediate parent (issue #1878).
+		if groupLevel > 0 && visibleMemo != nil && !t.ancestorsExpanded(group.Path, visibleMemo) {
+			continue // An ancestor is collapsed; this group and its sessions stay hidden
 		}
 
 		// Add group header
@@ -965,6 +1023,12 @@ func (t *GroupTree) DemoteSession(inst *Instance) {
 
 // MoveSessionToGroup moves a session to a different group
 func (t *GroupTree) MoveSessionToGroup(inst *Instance, newGroupPath string) {
+	// Defense in depth: a creating-session placeholder row (Item.Type ==
+	// ItemTypeSession but Item.Session == nil) can reach a caller that forgets
+	// to nil-check. Refuse to dereference a nil instance instead of panicking.
+	if inst == nil {
+		return
+	}
 	oldGroupPath := inst.GroupPath
 
 	// Remove from old group
@@ -1644,19 +1708,128 @@ func resolveGroupDefaultPath(defaultPath string) string {
 	return baseRoot
 }
 
-// DefaultPathForGroup returns the effective default path for creating new sessions
-// in the group: explicit configured default_path first, then most recent session path.
-func (t *GroupTree) DefaultPathForGroup(groupPath string) string {
+// resolveGroupDefaultPath does an os.Stat plus up to three git subprocess calls
+// (IsGitRepo, IsLinkedWorktree, GetWorktreeBaseRoot). updateGroupDefaultPath
+// calls it once per group on EVERY tree build, and a tree build runs on the
+// bubbletea main goroutine inside the loadSessionsMsg handler (fired on each
+// storage change). On a large deck this measured ~21ms × N groups ≈ 800ms of
+// main-goroutine freeze per reload — the same subprocess-storm class as the
+// nav-freeze fix, just in the group-tree path.
+//
+// The result is a pure function of the path's on-disk git/worktree state, which
+// is effectively static across reloads (a repo does not flip linked-worktree
+// status every 30s). So cache it stale-while-revalidate: serve the last known
+// result to the main goroutine instantly and, when the entry is past TTL,
+// refresh it once in the background. Only the first-ever resolution of a path
+// blocks (cold cache, one-time splash cost); every subsequent reload is O(map
+// lookup). The background refresher touches ONLY this mutex-guarded map — never
+// a GroupTree/Group/Instance — so it cannot corrupt group state.
+//
+// Set-time callers (SetDefaultPathForGroup, ReconcileDeclarativeGroups,
+// DefaultPathForGroup) deliberately keep using resolveGroupDefaultPath directly
+// so an explicit "use this path" always resolves fresh; only the defensive
+// per-load re-normalization in updateGroupDefaultPath goes through the cache.
+
+const defaultPathCacheTTL = 60 * time.Second
+
+type resolvedDefaultPathEntry struct {
+	result     string
+	computedAt time.Time
+	refreshing bool
+}
+
+var (
+	defaultPathCacheMu sync.Mutex
+	defaultPathCache   = map[string]*resolvedDefaultPathEntry{}
+)
+
+// resolveGroupDefaultPathCached is the reload-path variant of
+// resolveGroupDefaultPath: non-blocking after the first resolution of a given
+// path (stale-while-revalidate). See resolveGroupDefaultPath's header.
+func resolveGroupDefaultPathCached(defaultPath string) string {
+	if strings.TrimSpace(defaultPath) == "" {
+		return ""
+	}
+
+	defaultPathCacheMu.Lock()
+	if entry, ok := defaultPathCache[defaultPath]; ok {
+		if time.Since(entry.computedAt) > defaultPathCacheTTL && !entry.refreshing {
+			entry.refreshing = true
+			go refreshGroupDefaultPathCache(defaultPath)
+		}
+		result := entry.result
+		defaultPathCacheMu.Unlock()
+		return result
+	}
+	defaultPathCacheMu.Unlock()
+
+	// Cold cache: resolve synchronously (first-ever lookup of this path).
+	result := resolveGroupDefaultPath(defaultPath)
+	defaultPathCacheMu.Lock()
+	defaultPathCache[defaultPath] = &resolvedDefaultPathEntry{result: result, computedAt: time.Now()}
+	defaultPathCacheMu.Unlock()
+	return result
+}
+
+// refreshGroupDefaultPathCache re-resolves a path off the main goroutine and
+// replaces its cache entry. Runs only via resolveGroupDefaultPathCached, one at
+// a time per path (guarded by the entry.refreshing flag).
+func refreshGroupDefaultPathCache(defaultPath string) {
+	result := resolveGroupDefaultPath(defaultPath)
+	defaultPathCacheMu.Lock()
+	defaultPathCache[defaultPath] = &resolvedDefaultPathEntry{result: result, computedAt: time.Now()}
+	defaultPathCacheMu.Unlock()
+}
+
+// ExplicitDefaultPathForGroup returns the group's explicitly configured
+// default_path (resolved), and whether one is set at all. It never falls back
+// to the most-recent-session heuristic.
+//
+// Issue #1879: DefaultPathForGroup collapses "the user configured this group's
+// default_path" and "nothing is configured, here's a guess from the group's
+// sessions" into one string, so a caller cannot tell them apart. Any CLI that
+// implements the documented resolution chain (group default_path → global
+// config default_path → cwd) must consult this, not DefaultPathForGroup —
+// otherwise a single session in the group makes the global default_path
+// unreachable.
+func (t *GroupTree) ExplicitDefaultPathForGroup(groupPath string) (string, bool) {
+	group, exists := t.Groups[groupPath]
+	if !exists || group.DefaultPath == "" {
+		return "", false
+	}
+
+	resolved := resolveGroupDefaultPath(group.DefaultPath)
+	if resolved == "" {
+		return "", false
+	}
+	return resolved, true
+}
+
+// RecentSessionPathForGroup returns the derived, non-authoritative default: the
+// project path (or worktree repo root) of the group's most recently accessed
+// session. It is a convenience guess, not a configured value — see
+// ExplicitDefaultPathForGroup.
+func (t *GroupTree) RecentSessionPathForGroup(groupPath string) string {
 	group, exists := t.Groups[groupPath]
 	if !exists {
 		return ""
 	}
 
-	if group.DefaultPath != "" {
-		return resolveGroupDefaultPath(group.DefaultPath)
+	return resolveGroupDefaultPath(mostRecentPathForSessions(group.Sessions))
+}
+
+// DefaultPathForGroup returns the effective default path for creating new sessions
+// in the group: explicit configured default_path first, then most recent session path.
+//
+// The two sources are indistinguishable in the return value, which is fine for
+// UI prefill (the TUI new-session dialog) but wrong for the CLI resolution
+// chain — see ExplicitDefaultPathForGroup / RecentSessionPathForGroup.
+func (t *GroupTree) DefaultPathForGroup(groupPath string) string {
+	if explicit, ok := t.ExplicitDefaultPathForGroup(groupPath); ok {
+		return explicit
 	}
 
-	return resolveGroupDefaultPath(mostRecentPathForSessions(group.Sessions))
+	return t.RecentSessionPathForGroup(groupPath)
 }
 
 // SetDefaultPathForGroup sets (or clears) an explicit default path for a group.
@@ -1679,6 +1852,10 @@ func (t *GroupTree) updateGroupDefaultPath(groupPath string) {
 	}
 
 	if group.DefaultPath != "" {
-		group.DefaultPath = resolveGroupDefaultPath(group.DefaultPath)
+		// Cached (stale-while-revalidate): this runs once per group on every
+		// tree build, which happens on the bubbletea main goroutine during the
+		// loadSessionsMsg handler. The uncached resolveGroupDefaultPath here was
+		// ~800ms of main-thread freeze per reload on a large deck.
+		group.DefaultPath = resolveGroupDefaultPathCached(group.DefaultPath)
 	}
 }

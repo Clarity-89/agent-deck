@@ -29,6 +29,8 @@ func handleWorktree(profile string, args []string) {
 		handleWorktreeCleanup(profile, args[1:])
 	case "finish":
 		handleWorktreeFinish(profile, args[1:])
+	case "trust-scripts":
+		handleWorktreeTrustScripts(args[1:])
 	case "help", "-h", "--help":
 		printWorktreeUsage()
 	default:
@@ -49,6 +51,7 @@ func printWorktreeUsage() {
 	fmt.Println("  info <session>    Show worktree info for a session")
 	fmt.Println("  finish <session>  Merge branch, remove worktree, and delete session")
 	fmt.Println("  cleanup [--force] Find and remove orphaned worktrees/sessions")
+	fmt.Println("  trust-scripts <repo-path>  Approve .agent-deck/worktree-*.sh for this repo")
 	fmt.Println()
 	fmt.Println("Global Options:")
 	fmt.Println("  -p, --profile <name>   Use specific profile")
@@ -63,6 +66,124 @@ func printWorktreeUsage() {
 	fmt.Println("  agent-deck worktree finish \"My Session\" --into develop")
 	fmt.Println("  agent-deck worktree cleanup")
 	fmt.Println("  agent-deck worktree cleanup --force")
+	fmt.Println("  agent-deck worktree trust-scripts .")
+	fmt.Println("  agent-deck worktree trust-scripts . --revoke")
+}
+
+// handleWorktreeTrustScripts pre-approves (or revokes approval for) the
+// .agent-deck/worktree-setup.sh and worktree-destruction.sh scripts found in
+// a repository, recording their current SHA-256 so [worktree]
+// run_repo_scripts = "prompt" (the default) never needs to ask interactively
+// for this exact content again. This is the intended way to grant consent
+// from a non-interactive context (CI approving a change ahead of time,
+// scripting) rather than relying on the terminal prompt or
+// --allow-repo-scripts.
+// partitionWorktreeTrustScriptsArgs splits args into flag tokens and
+// positional tokens so `agent-deck worktree trust-scripts` accepts a flag
+// in any position relative to the repo-path positional.
+//
+// Go's stdlib flag.Parse stops consuming flags at the first non-flag
+// argument. Our own usage text prints "trust-scripts . --revoke" (repo path
+// before the flag) — under a plain fs.Parse(args), "." is seen first,
+// parsing stops immediately, and "--revoke" is swallowed into the
+// positional args instead of being recognized, so *revoke stays false and
+// the command silently GRANTS trust instead of revoking it. Partitioning
+// args by leading "-" before handing them to flag.Parse fixes that: flag
+// position relative to the repo-path positional no longer matters.
+//
+// A literal "--" is honored as the conventional end-of-flags marker
+// (matching flag.Parse's own behavior): everything after it is treated as
+// positional even if it starts with "-", so a repo path that itself begins
+// with a dash can still be passed via `trust-scripts --revoke -- -repo`.
+// This subcommand only ever declares boolean flags, so there is no case
+// where a flag's value (as opposed to the flag itself) needs to be
+// distinguished from a positional argument.
+func partitionWorktreeTrustScriptsArgs(args []string) (flagArgs, positional []string) {
+	endOfFlags := false
+	for _, a := range args {
+		switch {
+		case endOfFlags:
+			positional = append(positional, a)
+		case a == "--":
+			endOfFlags = true
+		case strings.HasPrefix(a, "-") && a != "-":
+			flagArgs = append(flagArgs, a)
+		default:
+			positional = append(positional, a)
+		}
+	}
+	return flagArgs, positional
+}
+
+func handleWorktreeTrustScripts(args []string) {
+	flagArgs, positional := partitionWorktreeTrustScriptsArgs(args)
+
+	fs := flag.NewFlagSet("worktree trust-scripts", flag.ExitOnError)
+	revoke := fs.Bool("revoke", false, "Remove previously stored trust instead of granting it")
+	_ = fs.Parse(flagArgs)
+
+	if len(positional) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: agent-deck worktree trust-scripts <repo-path> [--revoke]")
+		os.Exit(1)
+	}
+
+	repoRoot, err := git.GetRepoRoot(positional[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %s is not inside a git repository: %v\n", positional[0], err)
+		os.Exit(1)
+	}
+
+	kinds := []struct {
+		name string
+		find func(string) (string, os.FileMode)
+	}{
+		{"setup", git.FindWorktreeSetupScript},
+		{"destruction", git.FindWorktreeDestructionScript},
+	}
+
+	found := 0
+	for _, k := range kinds {
+		scriptPath, _ := k.find(repoRoot)
+		if *revoke {
+			// Always attempt revocation, independent of whether the script
+			// still exists on disk right now — the trust store can hold an
+			// entry for a script that was since deleted or renamed, and
+			// that entry must still be removable via the CLI rather than
+			// becoming permanently stale.
+			existed, err := git.RevokeScriptConsent(repoRoot, k.name)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error revoking trust for %s script in %s: %v\n", k.name, repoRoot, err)
+				os.Exit(1)
+			}
+			if existed {
+				found++
+				if scriptPath != "" {
+					fmt.Printf("Revoked trust for %s script: %s\n", k.name, scriptPath)
+				} else {
+					fmt.Printf("Revoked trust for %s script (no longer present on disk) in %s\n", k.name, repoRoot)
+				}
+			}
+			continue
+		}
+		if scriptPath == "" {
+			continue
+		}
+		found++
+		hash, err := git.TrustScript(repoRoot, k.name, scriptPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error trusting %s: %v\n", scriptPath, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Trusted %s script: %s (sha256:%s)\n", k.name, scriptPath, hash[:12])
+	}
+
+	if found == 0 {
+		if *revoke {
+			fmt.Printf("No stored trust found for worktree setup/destruction scripts under %s\n", repoRoot)
+		} else {
+			fmt.Printf("No .agent-deck/worktree-setup.sh or worktree-destruction.sh found under %s\n", repoRoot)
+		}
+	}
 }
 
 // handleWorktreeList lists all worktrees with session associations
@@ -113,10 +234,15 @@ func handleWorktreeList(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Build session map: path -> session title
+	// Build session map: LOCAL path -> session. A remote session contributes
+	// nothing: its ProjectPath is a placeholder, not a checkout, so listing it
+	// here labels a local worktree with a session running on another host
+	// (#1852 site 2).
 	sessionByPath := make(map[string]*session.Instance)
 	for _, inst := range instances {
-		sessionByPath[inst.ProjectPath] = inst
+		if loc := locationOf(inst); loc.IsLocal() && loc.Path != "" {
+			sessionByPath[loc.Path] = inst
+		}
 		if inst.WorktreePath != "" {
 			sessionByPath[inst.WorktreePath] = inst
 		}
@@ -330,14 +456,11 @@ func handleWorktreeCleanup(profile string, args []string) {
 		cleanupBackend = backend
 		worktrees, wErr := cleanupBackend.ListWorktrees()
 		if wErr == nil {
-			// Build set of paths that sessions use
-			sessionPaths := make(map[string]bool)
-			for _, inst := range instances {
-				sessionPaths[inst.ProjectPath] = true
-				if inst.WorktreePath != "" {
-					sessionPaths[inst.WorktreePath] = true
-				}
-			}
+			// Build the set of LOCAL paths that sessions occupy. This is the
+			// harmful direction of #1852 site 3: a remote session's placeholder
+			// inserted here makes a genuinely orphaned worktree look in-use, so
+			// cleanup silently skips it forever.
+			sessionPaths := localSessionPaths(instances)
 
 			// Check each worktree (skip the first one which is usually the main repo)
 			for i, wt := range worktrees {
@@ -679,6 +802,22 @@ func handleWorktreeFinish(profile string, args []string) {
 	if err := storage.RemoveSessionAndVerify(inst.ID, remaining, groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session data: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	// Issue #1576: sweep transition-notifier state for the removed session,
+	// mirroring the #910 cleanup on `agent-deck rm` / `session remove`.
+	// Without this, `worktree finish` leaves orphan records in
+	// runtime/transition-notify-state.json and stale inbox JSONL lines that
+	// keep re-firing [EVENT] deliveries to the parent conductor. Best-effort:
+	// failures warn but never block the finish (the SQLite removal above is
+	// the user-visible contract).
+	if swept, err := session.SweepInboxesForChildSession(inst.ID); err != nil && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "warn: inbox sweep for %s failed: %v\n", inst.ID, err)
+	} else if swept > 0 && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "swept %d stale inbox event(s) for removed session\n", swept)
+	}
+	if _, err := session.RemoveNotifyStateRecord(inst.ID); err != nil && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "warn: notify-state sweep for %s failed: %v\n", inst.ID, err)
 	}
 
 	if *jsonOutput {

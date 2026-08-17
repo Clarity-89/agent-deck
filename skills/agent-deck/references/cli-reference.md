@@ -8,12 +8,15 @@ Complete reference for all agent-deck CLI commands.
 - [Basic Commands](#basic-commands)
 - [Web Command](#web-command)
 - [Session Commands](#session-commands)
+- [Fleet Recovery Commands](#fleet-recovery-commands)
 - [Worktree Commands](#worktree-commands)
 - [MCP Commands](#mcp-commands)
 - [Skill Commands](#skill-commands)
 - [Group Commands](#group-commands)
 - [Profile Commands](#profile-commands)
 - [Remote Commands](#remote-commands)
+- [Codex Hook Commands](#codex-hook-commands)
+- [DeepSeek Commands](#deepseek-commands)
 - [Conductor Commands](#conductor-commands)
 
 ## Global Options
@@ -42,6 +45,8 @@ agent-deck add [path] [options]
 | `--no-parent` | Disable automatic parent linking |
 | `--mcp` | Attach MCP (repeatable) |
 | `--attach` | Start and attach to the session immediately after creating it (requires an interactive terminal; not supported with `--ssh`/`--json`) |
+| `--ssh <user@host>` | Run the session over SSH; this is a destination, not a registered remote name |
+| `--remote-path <absolute-path>` | Working directory on the SSH host; an absolute positional path with `--ssh` is equivalent |
 
 ```bash
 agent-deck add -t "My Project" -c claude .
@@ -58,6 +63,7 @@ Notes:
 - `--parent` and `--no-parent` are mutually exclusive.
 - Explicit `-g/--group` overrides inherited parent group.
 - If `--cmd` contains extra args and no explicit `--wrapper` is provided, agent-deck auto-generates a wrapper to preserve those args.
+- SSH session identity is the SSH destination plus remote working directory. Configure key selection with `IdentityFile`/`Host` in `~/.ssh/config` or use `ssh-agent`; agent-deck has no private-key flag.
 
 ### launch - Create + start (+ optional message)
 
@@ -158,10 +164,24 @@ agent-deck session stop <id|title>
 ### session restart
 
 ```bash
-agent-deck session restart <id|title>
+agent-deck session restart <id|title> [--env KEY=VALUE ...]
 ```
 
 Reloads MCPs without losing conversation (Claude/Gemini).
+
+`--env` injects an environment variable into the replacement process for this
+restart only. It can be repeated, and a command-line value overrides configured
+environment sources with the same name. The value is not saved to the session:
+
+```bash
+agent-deck session restart my-project --env API_URL=https://api.example.com
+agent-deck session restart my-project --env FOO=one --env BAR="two words"
+```
+
+Supplying `--env` forces the requested restart past the recent-session guard.
+Use `--all --env KEY=VALUE` to inject the variable into every active session.
+Claude's existing protection that removes `TELEGRAM_*` variables from sessions
+that do not own a Telegram channel remains in effect.
 
 ### session fork (Claude, OpenCode, Pi, Codex)
 
@@ -239,7 +259,15 @@ Setting `account` auto-migrates the Claude conversation into the target account'
 ### session send
 
 ```bash
-agent-deck session send <id|title> "message" [--no-wait] [-q] [--json]
+agent-deck session send <id|title> "message" [--wait|--stream|--no-wait] [-q] [--json]
+agent-deck session send <id|title> --message-file <file|-> [--wait|--stream|--no-wait] [-q] [--json]
+```
+
+Use `--message-file` for long or multiline messages, or `--message-file -` for stdin. Do not combine it with an inline message.
+
+```bash
+git diff | agent-deck session send my-project --message-file -
+agent-deck session send my-project --message-file task.md --wait
 ```
 
 Default behavior:
@@ -266,7 +294,7 @@ approval: that path sends composer text followed by Enter.
 agent-deck session output [id|title] [--json] [-q]
 ```
 
-Get last response from Claude/Gemini session.
+Get the last response from a session. Transcript-backed extraction is tool-dependent; use `--pane` for a raw tmux capture when structured output is unavailable.
 
 ### session set-parent / unset-parent
 
@@ -288,6 +316,93 @@ agent-deck session switch-account "My Project" work
 ```
 
 Accounts are the profiles named in `config.toml` (`[profiles.<name>.claude].config_dir`).
+
+## Fleet Recovery Commands
+
+Recovery from a *fleet-wide* session death: every managed pane on the host gone
+at once (a killed tmux server, a host reboot, an auth cascade that made the
+agents exit). For a single session use `session restart`; for sessions whose
+pane is still alive but whose control pipe broke use `session revive`.
+
+### fleet status
+
+```bash
+agent-deck fleet status [--group <path>] [--include-idle] [--json]
+```
+
+Reports which sessions the registry believes are alive but whose tmux session is
+gone. **Read-only** — no restarts, no writes. Prints a `MASS DEATH detected` line
+when the down set is large enough (both in absolute count and as a share of
+should-be-alive sessions) to be a fleet-wide event rather than one crash.
+
+A session is only counted as down after two independent tmux probes agree it is
+gone (`--confirm-probes`), because a single `has-session` miss right after a tmux
+server restart is not proof of death.
+
+Sessions you stopped or queued, and archived sessions, are never counted. Status
+`idle` is excluded by default (it is also the status of a session that was added
+but never started) — `--include-idle` opts in.
+
+### fleet recover
+
+```bash
+agent-deck fleet recover                       # plan only (dry run)
+agent-deck fleet recover --yes                 # actually recover
+agent-deck fleet recover --yes --spacing 8s --limit 10
+agent-deck fleet recover --yes --group agent-deck --json
+```
+
+Restarts the down sessions **one at a time**, waiting `--spacing` (default 5s,
+jittered) between boots and verifying each boot before starting the next.
+Sequential spacing is the point: a burst of simultaneous agent boots is what
+forks a shared rotating OAuth refresh token and 401s the whole fleet.
+
+**Dry run by default.** Without `--yes` the command prints the plan (order,
+waits, estimated runtime) and exits without restarting anything.
+
+Each boot is verified before the next begins: the pane must be back AND the
+session must reach a state only a booted agent produces. A restart that returns
+successfully but never proves it booted is reported as `unverified`, never as
+`recovered`.
+
+The sweep halts early when the trouble looks systemic:
+
+| Brake | Flag | Default | Why |
+|-------|------|---------|-----|
+| Consecutive failed restarts | `--max-failures` | 3 | Three failures in a row means a common cause; grinding through the rest multiplies the damage |
+| Sessions that restart and then die immediately | `--max-dead-boots` | 3 | A pane that is gone again by verification time means the session exited on boot — the way a dead credential actually presents (the agent quits on the 401, so there is no banner to read). Three in a row is a host- or credential-level fault (`0` disables) |
+| Sessions booting into an auth failure | `--auth-halt-after` | 2 | Restarting the fleet against a broken credential deepens the cascade (`0` disables) |
+
+A slow boot is not a dead one: a pane that is up but still `starting` when the
+verify timeout expires is reported `unverified` and does not trip any brake.
+
+A halted sweep exits non-zero (with `--json` too) and reports the reason.
+
+Options:
+
+```bash
+--yes                    Actually restart (without it, plan only)
+--dry-run                Force plan-only mode even with --yes
+--spacing <dur>          Gap between boots (default 5s; 0 disables — not recommended)
+--jitter <fraction>      Random +/- fraction applied to each gap (default 0.2)
+--limit <n>              Restart at most N sessions (0 = all)
+--verify-timeout <dur>   How long one session may take to prove it booted (default 30s)
+--verify-poll <dur>      Verification poll interval (default 500ms)
+--max-failures <n>       Halt after N consecutive failed restarts (default 3)
+--max-dead-boots <n>     Halt after N consecutive boots whose pane died immediately (default 3, 0 disables)
+--auth-halt-after <n>    Halt after N auth-failed boots (default 2, 0 disables)
+--group <path>           Only consider sessions in this group and its descendants
+--include-idle           Also treat status=idle sessions as down
+--confirm-probes <n>     Probes that must agree a session is gone (default 2)
+--confirm-delay <dur>    Delay between confirming probes (default 750ms)
+--min-dead <n>           Minimum down sessions for a mass-death verdict (default 3)
+--dead-fraction <f>      Share of should-be-alive sessions that must be down (default 0.5)
+--json, -q               Machine-readable / minimal output
+```
+
+Recovery only ever writes the rows it restarted, one at a time, through a
+targeted write with no table sweep — a session added by another process during
+the (multi-minute) sweep can never be lost.
 
 ## Worktree Commands
 
@@ -471,7 +586,9 @@ agent-deck conductor list [--profile <name>]
 
 Manage agent-deck instances running on remote SSH servers. Remote sessions appear alongside local sessions in the TUI and CLI.
 
-Remote configuration is stored in `~/.agent-deck/config.toml` under the `[remotes]` map.
+Registered remotes are named fleet endpoints. They are separate from the per-session SSH destination used by `agent-deck add --ssh`.
+
+Remote configuration is stored in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`) under the `[remotes]` map.
 
 ### remote add
 
@@ -510,7 +627,9 @@ Lists all configured remotes. Use `--json` for scripting.
 agent-deck remote sessions [name] [--json]
 ```
 
-Fetches active sessions from all remotes, or from a specific remote if `name` is provided. Displays title, tool, status, and session ID. Use `--json` for scripting.
+Fetches active sessions from all remotes, or from a specific remote if `name` is provided. Displays title, tool, live status, and session ID. Use `--json` for scripting.
+
+In the TUI, remote sessions use the same status indicators and nested group tree as local sessions. Remote headers and groups can be collapsed, and `K`/`J` preserve a manual order within each remote group. A session's location (local or SSH host plus remote path) is part of its identity, so identical titles at different locations do not collide.
 
 ### remote attach
 
@@ -548,6 +667,41 @@ agent-deck remote rename dev my-session new-name
 agent-deck remote update          # update all remotes
 agent-deck remote update dev      # update specific remote
 ```
+
+SSH uses OpenSSH host-key verification and `BatchMode=yes`; unknown or changed hosts fail instead of prompting. Authenticate with an SSH agent or configured key and establish trust in `known_hosts` before registering a remote. `remote update` verifies the downloaded archive against the release checksums before deployment.
+
+## Codex Hook Commands
+
+```bash
+agent-deck codex-hooks install
+agent-deck codex-hooks status
+agent-deck codex-hooks uninstall
+```
+
+Codex turn-level status uses its notify hook. Install it once per Codex home; if `CODEX_HOME` is set, use the same environment for installation and Codex sessions.
+
+## DeepSeek Commands
+
+Inspect the DeepSeek Harness (`dsh`) integration. Read-only; every subcommand takes `--json`.
+
+```bash
+agent-deck deepseek status              # resolved binary, version, DSH_HOME, profile, resume/fork support
+agent-deck deepseek profiles            # profiles under $DSH_HOME/profiles, with their bundle layers
+agent-deck deepseek sessions [path]     # dsh sessions recorded for a workspace (default: cwd)
+```
+
+The tool is named for the vendor; the binary it launches is `dsh`
+(`npm install -g @deepseek-ai/dsh`). Launch a session with
+`agent-deck launch -c deepseek`.
+
+`status --json` reports `resume_supported` and `fork_supported` as explicit booleans:
+`dsh` has no fork command, and neither shipped profile (`web`, `headless`) accepts a
+resume flag, so both are false on a default install. Configure with `[deepseek]`
+(`command`, `config_dir` → `DSH_HOME`, `profile`, `patches`, `host`/`port`/
+`trusted_hosts`, `resume_flag`, `extra_args`, `env_file`) and give each account its own
+harness home with `[profiles.<account>.deepseek].config_dir`.
+
+See [docs/tools/deepseek.md](../../../docs/tools/deepseek.md) for the full guide.
 
 ## Session Resolution
 

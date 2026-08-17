@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -33,6 +34,9 @@ func main() {
 	mutationsAllowed := flag.Bool("allow-mutations", true, "Allow POST/DELETE actions through the web API")
 	portFile := flag.String("port-file", "", "If set, write the bound TCP port to this file once listening (used with :0)")
 	startupToken := flag.String("startup-token", "", "Echoed at /__fixture/whoami so callers can verify they're talking to this exact process")
+	trustedDomains := flag.String("trusted-domains", "", "Comma-separated `[web].trusted_domains` hosts served by GET /api/settings (issue #1682)")
+	confirmLinkOpen := flag.Bool("confirm-link-open", true, "Value of `[web].confirm_link_open` served by GET /api/settings (issue #1682)")
+	authToken := flag.String("auth-token", "", "Bearer token for API/WS access. When set the fixture behaves like `agent-deck web --token`, so specs can exercise the authenticated browser path.")
 	flag.Parse()
 
 	store := newFixtureStore()
@@ -61,7 +65,18 @@ func main() {
 		Profile:      "fixture",
 		ReadOnly:     false,
 		WebMutations: *mutationsAllowed,
-		MenuData:     store,
+		// Link-open policy (issue #1682). Normalized through the same
+		// helper `agent-deck web` uses so the fixture cannot serve a shape
+		// the real server never would.
+		TrustedDomains:  session.NormalizeTrustedDomains(splitCSV(*trustedDomains)),
+		ConfirmLinkOpen: confirmLinkOpen,
+		MenuData:        store,
+		RemoteFleet:     store,
+		// Empty by default, so the existing suite keeps running
+		// unauthenticated. mcp-auth.spec.js boots a second fixture WITH a
+		// token: without that, no browser test ever exercises the
+		// Authorization header and a pane can drop it unnoticed.
+		Token: *authToken,
 	})
 	server.SetMutator(store)
 	// Hold the MCP manager on the store so /__fixture/reset clears its
@@ -117,20 +132,45 @@ func main() {
 	_ = server.Shutdown(ctx)
 }
 
+func (s *fixtureStore) Start(context.Context) {}
+
+func (s *fixtureStore) Snapshot() session.RemoteFleetSnapshot {
+	s.mu.Lock()
+	enabled := s.remotesEnabled
+	s.mu.Unlock()
+	if !enabled {
+		return session.RemoteFleetSnapshot{Remotes: []session.RemoteFleetRemote{}}
+	}
+	return session.RemoteFleetSnapshot{
+		ObservedAt: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC),
+		Counts:     session.RemoteFleetCounts{RemotesOnline: 1, RemotesOffline: 1, Sessions: 3, Running: 1, Waiting: 1, Idle: 1},
+		Remotes: []session.RemoteFleetRemote{
+			{Name: "build", Online: true, LatencyMS: 24, Sessions: []session.RemoteSessionInfo{
+				{ID: "remote-1", Title: "release", Path: "/srv/release", Tool: "codex", Status: "running"},
+				{ID: "remote-2", Title: "review", Path: "/srv/review", Tool: "claude", Status: "waiting"},
+			}},
+			{Name: "offline", Issue: "unavailable", Stale: true, AgeSeconds: 37, Sessions: []session.RemoteSessionInfo{
+				{ID: "remote-stale", Title: "last-known", Tool: "codex", Status: "idle"},
+			}},
+		},
+	}
+}
+
 // fixtureStore implements both web.MenuDataLoader and web.SessionMutator
 // against in-memory state. All operations are concurrency-safe.
 type fixtureStore struct {
-	mu           sync.Mutex
-	now          func() time.Time
-	profile      string
-	groups       map[string]*web.MenuGroup // keyed by path
-	sessions     map[string]*web.MenuSession
-	order        []string // session id order
-	nextID       int
-	startupToken string // echoed at /__fixture/whoami for spawn verification
-	catalog      []session.SkillCandidate
-	attached     map[string][]session.ProjectSkillAttachment // by projectPath
-	mcpMgr       *fixtureMCPManager                          // reset alongside the store on /__fixture/reset
+	mu             sync.Mutex
+	now            func() time.Time
+	profile        string
+	groups         map[string]*web.MenuGroup // keyed by path
+	sessions       map[string]*web.MenuSession
+	order          []string // session id order
+	nextID         int
+	startupToken   string // echoed at /__fixture/whoami for spawn verification
+	catalog        []session.SkillCandidate
+	attached       map[string][]session.ProjectSkillAttachment // by projectPath
+	mcpMgr         *fixtureMCPManager                          // reset alongside the store on /__fixture/reset
+	remotesEnabled bool
 
 	// undoStack tracks recently-deleted sessions for ctrl+z undo. Capped
 	// at 10 entries (FIFO eviction) to match the TUI Home.undoStack.
@@ -159,6 +199,7 @@ func newFixtureStore() *fixtureStore {
 func (s *fixtureStore) seed() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.remotesEnabled = false
 	s.groups = map[string]*web.MenuGroup{
 		"work":           {Name: "work", Path: "work", Expanded: true, Order: 0, SessionCount: 2},
 		"work/innotrade": {Name: "innotrade", Path: "work/innotrade", Expanded: true, Order: 1, SessionCount: 1},
@@ -169,7 +210,7 @@ func (s *fixtureStore) seed() {
 	sandboxCPU := "2.0"
 	s.sessions = map[string]*web.MenuSession{
 		"sess-001": {
-			ID: "sess-001", Title: "agent-deck", Tool: "claude",
+			ID: "sess-001", Title: "agent-deck", Tool: "claude", MCPSupported: true,
 			Status: session.StatusIdle, GroupPath: "work", ProjectPath: "/srv/agent-deck",
 			Order: 0, CreatedAt: now,
 			// Populate every promoted MenuSession field on a single session so
@@ -214,7 +255,7 @@ func (s *fixtureStore) seed() {
 			},
 		},
 		"sess-002": {
-			ID: "sess-002", Title: "frontend", Tool: "claude",
+			ID: "sess-002", Title: "frontend", Tool: "claude", MCPSupported: true,
 			Status: session.StatusRunning, GroupPath: "work", ProjectPath: "/srv/frontend",
 			Order: 1, CreatedAt: now,
 			// Populate tmux internals on the running session so parity-state
@@ -224,12 +265,12 @@ func (s *fixtureStore) seed() {
 			TmuxSocketName: "agentdeck-fixture",
 		},
 		"sess-003": {
-			ID: "sess-003", Title: "innotrade-api", Tool: "codex",
+			ID: "sess-003", Title: "innotrade-api", Tool: "codex", MCPSupported: true,
 			Status: session.StatusIdle, GroupPath: "work/innotrade", ProjectPath: "/srv/innotrade-api",
 			Order: 0, CreatedAt: now,
 		},
 		"sess-004": {
-			ID: "sess-004", Title: "scratch", Tool: "shell",
+			ID: "sess-004", Title: "scratch", Tool: "shell", MCPSupported: false,
 			Status: session.StatusIdle, GroupPath: "personal", ProjectPath: "/home/dev/scratch",
 			Order: 0, CreatedAt: now,
 		},
@@ -312,13 +353,13 @@ func (s *fixtureStore) LoadArchivedMenuSnapshot() (*web.MenuSnapshot, error) {
 }
 
 // CreateSession implements web.SessionMutator.
-func (s *fixtureStore) CreateSession(title, tool, projectPath, groupPath, modelID string) (string, error) {
+func (s *fixtureStore) CreateSession(title, tool, projectPath, groupPath, modelID, reasoningEffort string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := fmt.Sprintf("sess-%03d", s.nextID)
 	s.nextID++
 	s.sessions[id] = &web.MenuSession{
-		ID: id, Title: title, Tool: tool,
+		ID: id, Title: title, Tool: tool, MCPSupported: session.ToolSupportsMCPManager(tool),
 		Status: session.StatusIdle, GroupPath: groupPath, ProjectPath: projectPath,
 		Order: len(s.order), CreatedAt: s.now(),
 	}
@@ -472,7 +513,7 @@ func (s *fixtureStore) ForkSession(parentID string) (string, error) {
 	id := fmt.Sprintf("sess-%03d", s.nextID)
 	s.nextID++
 	s.sessions[id] = &web.MenuSession{
-		ID: id, Title: parent.Title + " (fork)", Tool: parent.Tool,
+		ID: id, Title: parent.Title + " (fork)", Tool: parent.Tool, MCPSupported: parent.MCPSupported,
 		Status: session.StatusIdle, GroupPath: parent.GroupPath, ProjectPath: parent.ProjectPath,
 		ParentSessionID: parentID, Order: len(s.order), CreatedAt: s.now(),
 	}
@@ -606,6 +647,16 @@ func (s *fixtureStore) adminHandler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(snap)
 	})
+	mux.HandleFunc("/__fixture/remotes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		s.mu.Lock()
+		s.remotesEnabled = true
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/__fixture/session/", func(w http.ResponseWriter, r *http.Request) {
 		// /__fixture/session/{id}/status?to=active
 		// Lets tests force a status transition without going through start/stop
@@ -638,6 +689,23 @@ func (s *fixtureStore) adminHandler() http.Handler {
 		}
 	})
 	return mux
+}
+
+// splitCSV splits a comma-separated flag value into non-empty trimmed parts.
+// Returns nil for an empty value so the fixture's default is "no trusted
+// domains" rather than one blank entry.
+func splitCSV(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func indexOf(s string, c byte) int {

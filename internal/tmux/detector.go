@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"regexp"
 	"strings"
 )
 
@@ -84,11 +85,49 @@ func (d *PromptDetector) HasPrompt(content string) bool {
 	case "cursor":
 		return d.hasCursorPrompt(content)
 
+	case "deepseek":
+		return d.hasDeepSeekPrompt(content)
+
 	default:
 		// Generic shell - check for common prompts
 		return d.hasShellPrompt(content)
 	}
 }
+
+// hasDeepSeekPrompt detects a DeepSeek Harness pane that is waiting.
+//
+// Without this arm deepseek fell through to hasShellPrompt, which looks for
+// "$ ", "# " and "% " — shell prompt glyphs a dsh pane never prints, so the
+// detector and the deepseek pattern preset disagreed about the same pane
+// (PR #1942 adversarial review).
+//
+// "Waiting" for the shipped profiles means the web server has announced itself
+// and is serving nothing: `dsh web: http://127.0.0.1:3080`. Busy is checked
+// first so a working turn on an installed interactive profile is never read as
+// idle. The headless profile has no waiting state at all — it answers and exits.
+//
+// This arm strictly ADDS to the previous behaviour rather than replacing it. An
+// INSTALLED interactive profile brings a prompt glyph agent-deck cannot know in
+// advance, so anything the web banner does not explain falls through to the same
+// generic heuristic deepseek used before this arm existed. Answering a hard
+// "not ready" for those panes would deny the startup-window fast path forever
+// and make readiness strictly worse than having no arm at all.
+func (d *PromptDetector) hasDeepSeekPrompt(content string) bool {
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "esc to interrupt") ||
+		strings.Contains(lower, "ctrl+c to interrupt") {
+		return false
+	}
+	if deepSeekWebReadyLine.MatchString(content) {
+		return true
+	}
+	return d.hasShellPrompt(content)
+}
+
+// deepSeekWebReadyLine matches the single line `dsh web` prints once it is
+// serving. Mirrors the prompt pattern in the deepseek preset (patterns.go) so
+// the two cannot drift.
+var deepSeekWebReadyLine = regexp.MustCompile(`(?mi)^dsh web:\s+https?://`)
 
 // hasClaudePrompt detects if Claude Code is waiting for input
 // Handles BOTH normal mode AND --dangerously-skip-permissions mode
@@ -412,6 +451,19 @@ var claudeBannerStructuralMarkers = []string{" · ", `{"type":"error"`}
 // hasClaudeErrorBanner scans the last 15 non-empty lines (same window as
 // hasClaudePrompt) for a banner-shaped error line.
 func hasClaudeErrorBanner(content string) bool {
+	return scanClaudeBannerLines(content, claudeErrorBannerSubstrings)
+}
+
+// scanClaudeBannerLines reports whether any of the last 15 non-empty lines is a
+// banner-shaped line containing one of patterns. It carries the over-match
+// guards that make banner detection trustworthy — quoted/input lines are
+// skipped, and an assistant-turn line must also show a structural banner marker
+// so prose merely mentioning the text does not match.
+//
+// Shared by hasClaudeErrorBanner (any tool-rendered failure banner) and the
+// auth-specific scan (authFailureBannerPatterns) so the two can never drift
+// apart on the guards.
+func scanClaudeBannerLines(content string, patterns []string) bool {
 	lines := strings.Split(content, "\n")
 	checked := 0
 	for i := len(lines) - 1; i >= 0 && checked < 15; i-- {
@@ -428,7 +480,7 @@ func hasClaudeErrorBanner(content string) bool {
 		if strings.HasPrefix(line, claudeAssistantLinePrefix) && !containsAny(line, claudeBannerStructuralMarkers) {
 			continue
 		}
-		for _, pat := range claudeErrorBannerSubstrings {
+		for _, pat := range patterns {
 			if strings.Contains(line, pat) {
 				return true
 			}

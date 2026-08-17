@@ -1,7 +1,9 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -529,9 +531,21 @@ config_dir = "~/.claude-work"
 		t.Errorf("Should use custom command 'cdw' from config, got: %s", cmd)
 	}
 
-	// Should include CLAUDE_CONFIG_DIR since config_dir is explicitly set
-	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
-		t.Errorf("Should include CLAUDE_CONFIG_DIR for capture-resume commands, got: %s", cmd)
+	// #1822 F3: a custom Claude command/alias (e.g. "cdw") is expected to
+	// resolve CLAUDE_CONFIG_DIR itself, so the deck must not also export
+	// its own resolved value ahead of it -- doing so would override the
+	// alias's own fallback resolution with the deck's value, which is the
+	// same wrong-account bug class #1822 exists to fix. This gate now
+	// applies uniformly across every buildClaudeCommandWithMessage branch
+	// (previously only continue/resume/-r respected it; the default
+	// capture-resume path here did not -- see PR #1822 review Finding 3).
+	// AGENTDECK_RESOLVED_CONFIG_DIR (the informational hint var, not the
+	// live override) is still always emitted.
+	if strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
+		t.Errorf("Should NOT export CLAUDE_CONFIG_DIR for a custom-alias command, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "AGENTDECK_RESOLVED_CONFIG_DIR=") {
+		t.Errorf("Should still emit the AGENTDECK_RESOLVED_CONFIG_DIR hint var, got: %s", cmd)
 	}
 
 	// Should use --session-id with a literal Go-generated UUID (not shell variable)
@@ -769,7 +783,10 @@ func TestInstance_UpdateClaudeSession_RejectZombie(t *testing.T) {
 		}
 	}()
 
-	projectPath := "/tmp/claude-zombie-reject"
+	// A real directory: this test calls Start(), and a session whose project
+	// directory does not exist is now refused rather than silently started in
+	// $HOME (#1713). The path only needs to be stable within the test.
+	projectPath := t.TempDir()
 	projectDir := filepath.Join(configDir, "projects", ConvertToClaudeDirName(projectPath))
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
@@ -1797,27 +1814,71 @@ func TestCanRestartCursor(t *testing.T) {
 		t.Fatal("CanRestart() should return true for a running Cursor session with live tmux pane")
 	}
 
-	// Simulate persisted command from a real Cursor session before restart.
-	inst.Command = "cursor agent"
+	// Stand in for the persisted Cursor command. A real `cursor agent` cannot be
+	// assumed: required CI installs tmux and zoxide only, and without the binary
+	// the respawned login shell exits at once and tmux drops the session — which
+	// is what made this test fail on every such host. The stand-in keeps the
+	// Cursor respawn path executing for real instead of being skipped.
+	inst.Command = fakeCursorExecutable(t, "exec sleep 60")
 
 	if err := inst.Restart(); err != nil {
 		t.Fatalf("Restart failed: %v", err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	if inst.tmuxSession == nil || !inst.tmuxSession.Exists() {
-		t.Fatal("tmux session should exist after Restart")
-	}
+	// Require STABLE liveness rather than one sample. respawn-pane swaps the pane
+	// leader, so a single check can catch a pane that is about to exit — and the
+	// fixed 100ms sleep this replaces is the flakiness skipIfClaudePaneUnreliable
+	// already documents for the Claude path ("a single 400ms sample was flaky
+	// under the full test suite").
+	requireStableLivePane(t, inst, time.Second)
 	if inst.Status == StatusError {
 		t.Fatalf("after Restart, Status = %s; want != error", inst.Status)
 	}
 }
 
+// Pins the liveness probe itself. A Cursor binary that exists but quits
+// immediately must be reported as not-live — Session.Exists can still say
+// otherwise from a positive cache hit or the PipeManager connection RespawnPane
+// re-establishes, and Session.IsPaneDead reads a list-panes error as "not dead".
+// Without this, requireStableLivePane could pass on a dead session and the
+// regression above would be decorative.
+func TestCanRestartCursor_ProbeNoticesImmediateExit(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	inst := NewInstanceWithTool("cursor-restart-probe-test", "/tmp", "cursor")
+	inst.Command = "sleep 60"
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Failed to start session: %v", err)
+	}
+	defer func() { _ = inst.Kill() }()
+	inst.Status = StatusRunning
+
+	inst.Command = fakeCursorExecutable(t, "exit 0")
+	// Restart may itself report failure here; the point under test is that the
+	// probe does not claim the pane is live afterwards.
+	_ = inst.Restart()
+
+	if !paneGoneWithin(inst, 3*time.Second) {
+		t.Fatal("probe still reported a live pane after the stand-in exited immediately")
+	}
+}
+
 func TestBuildCursorCommand(t *testing.T) {
+	orig := lookPathFn
+	t.Cleanup(func() { lookPathFn = orig })
+	lookPathFn = func(file string) (string, error) {
+		if file == "agent" {
+			return "/bin/agent", nil
+		}
+		return "", errors.New("not found")
+	}
+	restore := resetUserConfigCache(t, &UserConfig{})
+	defer restore()
+
 	inst := NewInstanceWithTool("c1", "/tmp/c1", "cursor")
 	inst.Command = ""
 	got := inst.buildCursorCommand(inst.Command, false)
-	if !strings.Contains(got, "cursor agent") {
-		t.Fatalf("fresh session: want cursor agent in command, got %q", got)
+	if !strings.Contains(got, "agent") {
+		t.Fatalf("fresh session: want agent in command, got %q", got)
 	}
 	if strings.Contains(strings.ToLower(got), "--continue") {
 		t.Fatalf("fresh session: should not add --continue, got %q", got)
@@ -1827,8 +1888,11 @@ func TestBuildCursorCommand(t *testing.T) {
 	if !strings.Contains(strings.ToLower(got), "--continue") {
 		t.Fatalf("restart: want --continue, got %q", got)
 	}
+	if !strings.Contains(got, "agent") || strings.Contains(got, "cursor agent") {
+		t.Fatalf("restart: want default rewritten to agent, got %q", got)
+	}
 
-	inst.Command = "cursor agent --continue"
+	inst.Command = "agent --continue"
 	got = inst.buildCursorCommand(inst.Command, true)
 	if strings.Count(strings.ToLower(got), "--continue") != 1 {
 		t.Fatalf("duplicate --continue: got %q", got)
@@ -3583,6 +3647,51 @@ func TestExtractCodexSessionIDFromLsofOutput(t *testing.T) {
 	}
 }
 
+// TestCodexLsofProbe_TimeoutBoundsHungLsof reproduces issue #1581: without a
+// timeout, a single lsof call that blocks (there, on reverse-DNS PTR lookups of
+// the codex process's open sockets) stalls the shared status pass indefinitely.
+// It replicates the exact production invocation and asserts (a) the -n -P flags
+// are passed so lsof never resolves hosts/ports, and (b) codexLsofProbeTimeout
+// bounds a hung lsof so the status pass returns promptly instead of hanging.
+func TestCodexLsofProbe_TimeoutBoundsHungLsof(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args.txt")
+	// Fake lsof: record the args it was invoked with, then block for far longer
+	// than the probe timeout (stand-in for a PTR-blackhole resolver stall).
+	fakeLsof := filepath.Join(dir, "lsof")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsFile + "\nsleep 30\n"
+	if err := os.WriteFile(fakeLsof, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake lsof: %v", err)
+	}
+
+	pid := 12345
+	start := time.Now()
+	// Mirror queryCodexSessionFromHostLsof exactly: -n -P plus a hard timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), codexLsofProbeTimeout)
+	defer cancel()
+	// #nosec G204 -- test-only fixed path and flags.
+	err := exec.CommandContext(ctx, fakeLsof, "-n", "-P", "-p", fmt.Sprintf("%d", pid)).Run()
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected the hung lsof to be killed by the timeout, got nil error")
+	}
+	// Must return on the order of the timeout, never near the 30s hang.
+	if elapsed > codexLsofProbeTimeout+3*time.Second {
+		t.Fatalf("probe was not bounded by timeout: took %v (timeout %v)", elapsed, codexLsofProbeTimeout)
+	}
+
+	got, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("fake lsof did not run (no args file): %v", err)
+	}
+	for _, want := range []string{"-n", "-P"} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("lsof invoked without %q flag; args were:\n%s", want, got)
+		}
+	}
+}
+
 func TestExtractCodexSessionIDFromLsofOutput_DockerStyleLine(t *testing.T) {
 	lsofOutput := []byte(`codex 44 root 36w REG 0,608 3392413 5176210 /root/.codex/sessions/2026/02/23/rollout-2026-02-23T18-37-01-019c8a12-e903-7670-bd12-709c6a4c5451.jsonl
 `)
@@ -4570,4 +4679,48 @@ func TestInstance_RefreshLiveSessionIDs_NoOpForNonAgenticTool(t *testing.T) {
 	if inst.GeminiSessionID != "leftover-gemini" {
 		t.Errorf("GeminiSessionID mutated for non-agentic tool: got %q", inst.GeminiSessionID)
 	}
+}
+
+// TestShouldRunCodexProcessProbeSteadyStateBackoff covers issue #1552: once a
+// Codex session ID is known, the process-file probe (lsof on macOS) must back
+// off to codexRotationScanInterval instead of re-running every
+// codexBootstrapScanInterval. Several parked Codex sessions probing lsof every
+// two seconds generated enough filesystem metadata traffic to stall the machine.
+func TestShouldRunCodexProcessProbeSteadyStateBackoff(t *testing.T) {
+	t.Run("bootstrap keeps fast interval while ID unknown", func(t *testing.T) {
+		inst := &Instance{}
+		inst.lastCodexProbeAt = time.Now().Add(-codexBootstrapScanInterval - time.Second)
+		if !inst.shouldRunCodexProcessProbe(false) {
+			t.Fatal("expected probe to run at fast cadence while session ID is unknown")
+		}
+	})
+
+	t.Run("throttles inside fast interval while ID unknown", func(t *testing.T) {
+		inst := &Instance{}
+		inst.lastCodexProbeAt = time.Now()
+		if inst.shouldRunCodexProcessProbe(false) {
+			t.Fatal("expected probe to be throttled within codexBootstrapScanInterval")
+		}
+	})
+
+	t.Run("known ID backs off to steady-state interval", func(t *testing.T) {
+		inst := &Instance{CodexSessionID: "0199a213-81b0-7800-8000-aaaaaaaaaaaa"}
+		inst.lastCodexProbeAt = time.Now().Add(-codexBootstrapScanInterval - time.Second)
+		if inst.shouldRunCodexProcessProbe(false) {
+			t.Fatal("3s after last probe with a known session ID: expected steady-state backoff to skip")
+		}
+
+		inst.lastCodexProbeAt = time.Now().Add(-codexRotationScanInterval - time.Second)
+		if !inst.shouldRunCodexProcessProbe(false) {
+			t.Fatal("past codexRotationScanInterval: expected probe to run")
+		}
+	})
+
+	t.Run("force bypasses backoff", func(t *testing.T) {
+		inst := &Instance{CodexSessionID: "0199a213-81b0-7800-8000-aaaaaaaaaaaa"}
+		inst.lastCodexProbeAt = time.Now()
+		if !inst.shouldRunCodexProcessProbe(true) {
+			t.Fatal("force=true must always probe")
+		}
+	})
 }

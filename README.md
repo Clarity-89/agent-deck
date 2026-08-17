@@ -9,7 +9,7 @@
 
 [![GitHub Stars](https://img.shields.io/github/stars/asheshgoplani/agent-deck?style=for-the-badge&logo=github&color=yellow&labelColor=1a1b26)](https://github.com/asheshgoplani/agent-deck/stargazers)
 [![Downloads](https://img.shields.io/github/downloads/asheshgoplani/agent-deck/total?style=for-the-badge&logo=github&color=bb9af7&labelColor=1a1b26)](https://github.com/asheshgoplani/agent-deck/releases)
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=for-the-badge&logo=go&labelColor=1a1b26)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/Go-1.25.13-00ADD8?style=for-the-badge&logo=go&labelColor=1a1b26)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-9ece6a?style=for-the-badge&labelColor=1a1b26)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20WSL-7aa2f7?style=for-the-badge&labelColor=1a1b26)](https://github.com/asheshgoplani/agent-deck)
 [![Latest Release](https://img.shields.io/github/v/release/asheshgoplani/agent-deck?style=for-the-badge&color=e0af68&labelColor=1a1b26)](https://github.com/asheshgoplani/agent-deck/releases)
@@ -22,6 +22,20 @@
 **Agent Deck is mission control for your AI coding agents.** Running Claude Code on ten projects, OpenCode on five more, another agent somewhere in the background? One terminal shows every session — running, waiting, or done — and one keystroke switches between them. Groups, search, forking, git worktrees, cost tracking, and a phone-controlled [conductor](#conductor) keep a whole fleet manageable.
 
 https://github.com/user-attachments/assets/e4f55917-435c-45ba-92cc-89737d0d1401
+
+## Maintainers & contributors wanted
+
+agent-deck is actively maintained by [Ashesh](https://github.com/asheshgoplani), and it welcomes both contributors and co-maintainers. PRs here don't sit: every incoming PR is validated (applied, built, tested) within about a day, and good ones merge in the next release batch. Recent releases have shipped dozens of community fixes.
+
+Beyond one-off PRs, we're looking for 1-2 regular co-maintainers: people who want to own an area (a tool integration, the TUI, the web view, CI) and help triage and review. The validation pipeline does the heavy lifting; maintainers steer.
+
+To get started:
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) for how the review pipeline works.
+- Start at the pinned issue: [Looking for contributors — start here (#1650)](https://github.com/asheshgoplani/agent-deck/issues/1650).
+- The [agent-deck-contributor skill](.github/skills/agent-deck-contributor) walks an AI agent (or you) through building, testing, and shaping a clean PR.
+
+If you've had a couple of PRs land here and want to help steer, say so on #1650 or open an issue titled "maintainer: your area". We'd love the help.
 
 ## Installation
 
@@ -71,6 +85,7 @@ See [Troubleshooting](skills/agent-deck/references/troubleshooting.md#uninstalli
 agent-deck                        # Launch TUI
 agent-deck add . -c claude        # Add current dir with Claude
 agent-deck session fork my-proj   # Fork a supported session
+agent-deck session send my-proj --message-file task.md # Send a multiline prompt
 agent-deck session remove my-proj # Remove stopped/errored session from registry (transcripts preserved)
 agent-deck mcp attach my-proj exa # Attach MCP to session
 agent-deck skill attach my-proj docs --source pool --restart # Attach skill + restart
@@ -215,6 +230,32 @@ Closes [issue #602](https://github.com/asheshgoplani/agent-deck/issues/602).
 
 `agent-deck session switch-account <session> <account>` moves an existing session to another Claude account — **conversation included**. The session stops, its conversation file is migrated into the target account's config dir (copy-only, with a destination backup and size verification), the account is set, and the session restarts with `--resume`. `session set <session> account <name>` auto-migrates too.
 
+### Session naming
+
+Titles and groups answer different questions — "what is this, at a glance?" versus "why do these sessions belong together?" — and each has its own controls.
+
+#### Stable titles
+
+By default, agent-deck syncs a session's displayed title from the tool's own session name (Claude's `/rename`, `claude --name`, etc.), which is useful for watching a list of live agents but means a title you set can later be overwritten. Pick the control that matches how stable you need the title to be:
+
+| You want | Do this |
+| --- | --- |
+| This one session keeps the title I gave it | `--title-lock` (alias `--no-title-sync`) on `agent-deck add` / `agent-deck launch`, or `agent-deck session set-title-lock <id> on` at runtime |
+| No session in this installation ever gets renamed by its agent | `sync_title = false` in `config.toml` |
+| A throwaway session where the live task description matters more than a fixed name | `agent-deck add --quick` (`-Q` short flag) — the list shows the session's current Claude task in place of the generated handle |
+
+An explicit `-t/--title` locks the title automatically, the same as passing `--title-lock` — there's no separate opt-in needed. There's also no create-time opt-out: if you want a session with an explicit title to still pick up the agent's renames, unlock it afterward with `agent-deck session set-title-lock <id> off`. A locked title is never silently overwritten by the sync path — it only changes via an explicit rename or `session set-title-lock <id> off`.
+
+#### Groups vs. parent linkage
+
+Groups carry real policy — `max_concurrent` (serial vs. bounded parallelism), `default_path`, and per-group Claude account/config (see [Declarative groups](#declarative-groups) and [Per-group Claude config](#per-group-claude-config) above). Treat that policy as the test for whether a new group is warranted:
+
+- **Don't encode dispatch relationships in a group name.** A conductor fanning out workers doesn't need `work`, `work-infra`, `work-hygiene` siblings to say "these came from the same orchestrator" — that's what parent linkage is for. Launch with `--parent <id>` (or let `agent-deck launch` auto-parent), and read the fleet back with `agent-deck session children`.
+- **Create a new group when something policy-shaped differs** from the parent group — a different concurrency cap, working directory, or Claude account. If nothing enforced differs, the thing you have is a topic, not a group; carry it in the title and parent linkage instead.
+- **Don't rely on titles or group names as machine keys.** Both are user-editable; a script or agent matching on either is relying on something that can change under it.
+
+There's no automated warning or enforcement for group sprawl yet — this is a documented convention, not a gate. See [`docs/design/2026-07-26-session-identity-and-group-purpose.md`](docs/design/2026-07-26-session-identity-and-group-purpose.md) for the fuller design writeup (task-identity field, group `--purpose`, advisory sprawl warning) if you hit a concrete gap this section doesn't cover.
+
 ### MCP Socket Pool
 
 Running many sessions? Socket pooling shares MCP processes across all sessions via Unix sockets, reducing MCP memory usage by 85-90%. Connections auto-recover from MCP crashes in ~3 seconds via a reconnecting proxy. Enable with `pool_all = true` in [config.toml](skills/agent-deck/references/config-reference.md).
@@ -277,6 +318,19 @@ default_location = "subdirectory"  # "sibling" (default), "subdirectory", or a c
 ```
 
 `sibling` creates worktrees next to the repo (`repo-branch`). `subdirectory` creates them inside it (`repo/.worktrees/branch`). A custom path like `~/worktrees` or `/tmp/worktrees` creates repo-namespaced worktrees at `<path>/<repo_name>/<branch>`. The `--location` flag overrides the config per session.
+
+#### Sparse Checkout (large monorepos)
+
+If the session you create the worktree from uses [sparse checkout](https://git-scm.com/docs/git-sparse-checkout), a new worktree normally checks out the *whole* repository first — minutes of I/O on a monorepo with hundreds of thousands of files. Opt into inheriting the sparse configuration instead:
+
+```toml
+[worktree]
+sparse_checkout = "inherit"   # "off" (default) keeps git's normal checkout
+```
+
+With `inherit`, agent-deck reads the sparse mode (cone / non-cone, sparse index) and patterns from the worktree you invoked from, creates the new worktree with `--no-checkout`, and materializes it directly with those patterns — the excluded tree is never written. `.worktreeinclude` and `.agent-deck/worktree-setup.sh` still run afterwards, so the setup script sees the same sparse paths the source session has.
+
+A non-sparse source, or `off`/unset, keeps today's behavior exactly. Inheritance replays the patterns through `git sparse-checkout set` and pins the sparse-index setting explicitly, so it needs git 2.32 or newer; the default (`off`) has no version requirement.
 
 #### Copying Gitignored Files (`.worktreeinclude`)
 
@@ -444,6 +498,7 @@ branch_prefix       = "fork/" # auto branch name = <branch_prefix><sanitized-tit
 Done with a session but not ready to delete it? Archive it. Archiving stops the tmux process and hides the session from the default list — the conversation, metadata, worktree, and parent linkage are all preserved.
 
 - `A` archives the selected session; `Shift+U` restores it to the active list **without** auto-starting the process
+- `R` on an archived session restores it to the active list and restarts its process
 - `^` filters the TUI to archived sessions; the web UI has a dedicated **Archived** tab
 - Search and filters work across archived sessions
 - Deleting (`d`) is the destructive cousin — it removes the session from the registry (with a 30-second `Ctrl+Z` undo window)
@@ -665,7 +720,26 @@ Agent Deck works with any terminal-based AI tool:
 | **Crush** (charmbracelet/crush) | Status detection, organization, launch |
 | **Cursor** (terminal) | Status detection, organization |
 | **Hermes Agent** | Organization, launch |
+| **DeepSeek Harness** (`dsh`) | Status detection, organization, launch, restart, per-account `DSH_HOME` |
 | **Custom tools** | Configurable via `[tools.*]` in config.toml |
+
+Codex status detection uses Codex's notify hook. Install and verify it once for each Codex home:
+
+```bash
+agent-deck codex-hooks install
+agent-deck codex-hooks status
+```
+
+If you set `CODEX_HOME`, use the same environment here and when launching Codex. Without the hook, turn-level running/waiting status cannot converge reliably.
+
+DeepSeek Harness is the `dsh` binary from [`@deepseek-ai/dsh`](https://github.com/deepseek-ai/deepseek-harness)
+(`npm install -g @deepseek-ai/dsh`). It boots *profiles*: `web` (a browser UI served
+from the pane) and `headless` (answer one task, print it, exit) ship in the box, and
+`dsh plugin --profile <name> add <package>` installs others. Pick the profile with
+`[deepseek].profile`, give each account its own `DSH_HOME` with
+`[profiles.<account>.deepseek].config_dir`, and run `agent-deck deepseek status --json`
+to see exactly what agent-deck resolved. dsh has no fork command, and neither shipped
+profile takes a resume flag — see [docs/tools/deepseek.md](docs/tools/deepseek.md).
 
 Hide tools you don't use from the new-session picker with `[ui].hidden_tools` (applies to TUI and web; `shell` is always available).
 
@@ -674,7 +748,7 @@ Hide tools you don't use from the new-session picker with `[ui].hidden_tools` (a
 Track token usage and costs across all your AI agent sessions in real-time.
 
 - **Automatic collection** — Claude Code hook integration reads transcript files on each turn. Gemini/Codex/MiniMax support via output parsing (untested)
-- **14 models priced** — Claude Opus 4.6/4.7, Sonnet 4.6, Haiku 4.5, Gemini Pro/Flash, GPT-4o/4.1, o3, o4-mini, MiniMax M2.7/M2.7-highspeed/M2.5/M2.5-highspeed with daily price refresh
+- **15 models priced** — Claude Opus 4.6/4.7, Sonnet 4.6, Haiku 4.5, Gemini Pro/Flash, GPT-4o/4.1, o3, o4-mini, MiniMax M3/M2.7/M2.7-highspeed/M2.5/M2.5-highspeed with daily price refresh
 - **TUI dashboard** — press `$` to view today/week/month costs, top sessions, model breakdown
 - **Web dashboard** — `/costs` page with Chart.js charts, group drill-down, session detail views, SSE live updates
 - **Budget limits** — configurable daily/weekly/monthly/per-group/per-session limits with 80% warning and 100% hard stop (untested)
@@ -781,13 +855,12 @@ Feedback posts to a public GitHub Discussion at [Feedback Hub](https://github.co
 - Or run `agent-deck feedback` from the CLI (rating 1-5)
 - **Nothing is sent until you explicitly type `y` at the confirmation prompt.** Before the prompt, the CLI shows (1) the public URL the comment will land on, (2) that it posts via the `gh` CLI using your account, (3) your GitHub username as it will appear, and (4) the exact body that will be posted. Default answer is **N** — pressing Enter declines.
 - If `gh` fails (auth required, not installed, network), the CLI prints an error and exits non-zero. No clipboard or browser fallback is triggered on the CLI path.
-- A private/anonymous feedback channel is being designed for a future release — track in [#679](https://github.com/asheshgoplani/agent-deck/issues/679).
 
 **Feedback prompt frequency** (v1.7.41+): the TUI's auto-prompt is paced so brand-new users aren't asked on their first few launches. The first prompt appears only after **7 launches or 3 days** of use, whichever comes later. If you dismiss it, agent-deck waits **14 days** before asking again. You'll see at most **3 prompts per version**, and pressing `n` at any step opts you out permanently — use `agent-deck feedback` or `Ctrl+E` to re-enable on demand. Opt-out always wins over every pacing gate.
 
 ### Remote Instances
 
-Manage agent-deck instances running on remote SSH servers from your local terminal. Remote sessions appear alongside local sessions in the TUI and all CLI commands.
+Manage agent-deck instances running on remote SSH servers from your local terminal. Remote sessions report coarse live status and use the same nested group layout as local sessions; remote groups can be collapsed, and `K`/`J` reorder sessions within a remote group. Session identity includes its location, so the same title can safely exist locally and on different remote host/path pairs.
 
 ```bash
 # Register a remote
@@ -811,25 +884,9 @@ agent-deck remote update          # all remotes
 agent-deck remote update dev      # specific remote
 ```
 
-Remote configuration is stored under `[remotes]` in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`). All `remote` subcommands support `--json` output for scripting. Run `agent-deck remote --help` for the full flag reference.
+Remote configuration is stored under `[remotes]` in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`). `remote list` and `remote sessions` support `--json` output for scripting. See the [Remote Commands reference](skills/agent-deck/references/cli-reference.md#remote-commands) for flags, security behavior, and examples.
 
 Pressing `n` on a remote group or session opens the full new-session dialog in **remote mode**: path suggestions come from the remote host, the remote session's group is pre-filled, and the create routes over SSH with your chosen tool — sessions are never accidentally created on localhost.
-
-#### Security
-
-- **SSH host-key stance.** agent-deck verifies remote host keys against your `~/.ssh/known_hosts` using OpenSSH's secure default — it never sets `StrictHostKeyChecking=no` and never points `UserKnownHostsFile` at `/dev/null`. Every connection (list, attach, deploy) runs with `BatchMode=yes`, so an **unknown or changed host key fails fast** with a clear `Host key verification failed` error instead of silently trusting the host or hanging on a prompt. Add each remote to `known_hosts` first (e.g. `ssh user@host` once interactively, or `ssh-keyscan`), and authenticate with keys/an agent (BatchMode disables interactive password prompts). A changed host key is treated as a potential MITM and refused until you resolve it.
-- **Verified binary deploys.** `agent-deck remote update` downloads the GitHub release archive and verifies its **SHA-256 against the release's published `checksums.txt`** before deploying. A missing `checksums.txt`, a missing entry, or a hash mismatch aborts the deploy — an unverified or tampered artifact is never piped to a remote.
-
-### Reaching services running inside remote sessions
-
-If you run a dev server, REPL, or web UI inside a remote session and want to reach it from your local browser, use **[Tailscale](https://tailscale.com)** rather than ad-hoc SSH port forwarding. Tailscale gives every machine on your tailnet a direct IP, so a service on `localhost:3000` of your remote box is reachable at `http://<remote-tailnet-ip>:3000` from your laptop with no `-L`/`-R` setup, no port collisions when multiple sessions share a remote, and no ControlMaster edge cases.
-
-Setup once:
-1. Install Tailscale on your local machine and on each remote: `curl -fsSL https://tailscale.com/install.sh | sh`
-2. `sudo tailscale up` on both ends, sign in with the same account
-3. Use the remote's tailnet IP (or MagicDNS name) in your browser
-
-This is why agent-deck does not ship native SSH `-L`/`-R` forwarding: Tailscale solves the same problem more robustly with no per-session configuration.
 
 ## Web Mode
 
@@ -858,6 +915,25 @@ agent-deck web --token my-secret
 # then open: http://127.0.0.1:8420/?token=my-secret
 ```
 
+For headless deployments, read the token from a file instead so it never
+appears in the process arguments, where any local user can read it from
+`/proc`. The file must be a regular file that is not group- or world-readable,
+and must hold the token on a single line:
+
+```bash
+install -m 600 /dev/null ~/.config/agent-deck/web-token
+printf '%s' "$(openssl rand -hex 32)" > ~/.config/agent-deck/web-token
+agent-deck web --no-tui --listen 0.0.0.0:8420 --token-file ~/.config/agent-deck/web-token
+```
+
+`--token` and `--token-file` are mutually exclusive. Binding a non-loopback
+address without one of them is refused, because it would expose an
+unauthenticated remote-code-execution surface. MCP administration over the
+HTTP API is only available when a token is configured; without one those
+routes stay unavailable.
+
+The browser UI includes the live Command Center, session terminal, costs, archive, and settings views. See [Command Center](docs/COMMAND-CENTER.md) for the fleet view; use `--read-only` when browser clients should not mutate sessions.
+
 ## Documentation
 
 **Onboarding** — five-minute walkthroughs for new users:
@@ -871,7 +947,6 @@ agent-deck web --token my-secret
 
 | Guide | What's Inside |
 |-------|---------------|
-| [Conductor](docs/conductor/) | What a conductor is, channel pairing, state files, multi-conductor setups |
 | [Skills](documentation/SKILLS.md) | User-level vs pool skills, authoring, attach/detach, when to use which tier |
 | [Watchdog](documentation/WATCHDOG.md) | Optional Python daemon that auto-restarts critical sessions and nudges stuck children |
 | [Watchers](documentation/WATCHERS.md) | Event-forwarding framework: doorbell model, built-in adapters, custom watchers, gotchas |

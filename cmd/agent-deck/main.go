@@ -28,6 +28,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/intervalhook"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
@@ -38,7 +39,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.10.9" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.13.0" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -223,6 +224,26 @@ func main() {
 		_ = os.Setenv("AGENTDECK_PROFILE", profile)
 	}
 
+	// Extract global --allow-repo-scripts before subcommand dispatch (mirrors
+	// -p/--profile above). One-shot, non-persisted bypass of the worktree
+	// script consent gate for non-interactive callers (CI) that can't answer
+	// a prompt and would otherwise fail closed under the "prompt" default.
+	allowRepoScripts, args2 := extractAllowRepoScriptsFlag(args)
+	args = args2
+	if envVal := strings.TrimSpace(os.Getenv("AGENT_DECK_ALLOW_REPO_SCRIPTS")); envVal != "" {
+		allowRepoScripts = allowRepoScripts || envVal == "1" || strings.EqualFold(envVal, "true")
+	}
+	git.SetScriptConsentConfig(git.ScriptConsentConfig{
+		Policy:        session.GetWorktreeSettings().ScriptConsentPolicy(),
+		AllowOverride: allowRepoScripts,
+		// True here: every switch case below that can reach a worktree
+		// script (add/remove/worktree/session/etc.) `return`s before the
+		// TUI/web startup code further down, so it's still a real CLI
+		// invocation with a real, non-raw terminal — safe to prompt as
+		// before. Overridden to false just below for the TUI/web paths.
+		AllowInteractivePrompt: true,
+	})
+
 	// Seed the tmux socket-isolation default from `[tmux].socket_name` once
 	// per process (v1.7.50+, issue #687). Package-level tmux probes
 	// (KillSessionsWithEnvValue, ListAllSessions, version check, stale-
@@ -238,10 +259,10 @@ func main() {
 	tmux.WarnIfVulnerableTmux()
 
 	var webEnabled bool
-	var webArgs []string
 	// webHeadless: true when --no-tui is passed to the `web` subcommand.
 	// Skips bubbletea boot (the bulk of ~60 MB RSS) and runs HTTP-server only.
 	var webHeadless bool
+	var webOptions webCommandOptions
 
 	// Handle subcommands
 	if len(args) > 0 {
@@ -275,6 +296,9 @@ func main() {
 			return
 		case "session":
 			handleSession(profile, args[1:])
+			return
+		case "fleet":
+			handleFleet(profile, args[1:])
 			return
 		case "mcp":
 			handleMCP(profile, args[1:])
@@ -324,11 +348,17 @@ func main() {
 			return
 		case "web":
 			webEnabled = true
-			// Extract --no-tui out of webArgs before buildWebServer's flag set
-			// sees it. The TUI-vs-headless decision is made at bootstrap (it
-			// controls whether bubbletea ever boots), so it lives outside the
-			// per-server flag set.
-			webHeadless, webArgs = extractNoTuiFlag(args[1:])
+			var err error
+			webOptions, err = parseWebCommandOptions(args[1:])
+			if errors.Is(err, flag.ErrHelp) {
+				return
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: web flag parsing failed: %v\n", err)
+				os.Exit(1)
+			}
+			webHeadless = webOptions.noTUI
+			ensureTmuxInPathOrExit()
 			// fall through to TUI launch below (or headless server boot if --no-tui)
 		case "uninstall":
 			handleUninstall(args[1:])
@@ -357,6 +387,9 @@ func main() {
 		case "cursor-hooks":
 			handleCursorHooks(args[1:])
 			return
+		case "deepseek":
+			handleDeepSeek(args[1:])
+			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
 			return
@@ -377,6 +410,23 @@ func main() {
 			return
 		}
 	}
+
+	// Every path that reaches this point boots the bubbletea TUI (which
+	// takes raw-mode ownership of stdin/stdout — term.IsTerminal stays true
+	// in raw mode, so a blocking synchronous read here would race the TUI's
+	// own input reader, most likely never return since Enter yields '\r'
+	// under raw mode rather than the '\n' a prompt waits for, and steal
+	// keystrokes either way) and/or runs the web/remote server (a mutation
+	// arriving over HTTP must never block on the operator's terminal, even
+	// a real non-raw one, since nobody is watching it for that request).
+	// Re-resolve the consent config with interactive prompting forced off;
+	// every CLI subcommand that wants the original prompt-on-a-real-terminal
+	// behavior already returned above and never reaches this line.
+	git.SetScriptConsentConfig(git.ScriptConsentConfig{
+		Policy:                 session.GetWorktreeSettings().ScriptConsentPolicy(),
+		AllowOverride:          allowRepoScripts,
+		AllowInteractivePrompt: false,
+	})
 
 	// Startup reviver scan (v1.7.8, REPORT-D). Fire-and-forget — rebuilds
 	// control pipes for any instance whose tmux server is alive but whose
@@ -440,23 +490,10 @@ func main() {
 		}
 	}
 
-	// Check if tmux is available (with fallback path search)
-	if err := ensureTmuxInPath(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error: tmux not found")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Agent Deck requires tmux. Install with:")
-		switch runtime.GOOS {
-		case "darwin":
-			fmt.Fprintln(os.Stderr, "  brew install tmux")
-		case "linux":
-			fmt.Fprintln(os.Stderr, "  sudo apt install tmux    # Debian/Ubuntu")
-			fmt.Fprintln(os.Stderr, "  sudo dnf install tmux    # Fedora/RHEL")
-			fmt.Fprintln(os.Stderr, "  sudo pacman -S tmux      # Arch")
-		default:
-			fmt.Fprintln(os.Stderr, "  See: https://github.com/tmux/tmux/wiki/Installing")
-		}
-		fmt.Fprintf(os.Stderr, "\nSearched PATH: %s\n", os.Getenv("PATH"))
-		os.Exit(1)
+	// Web parses its own flags and preflights during subcommand dispatch so
+	// help remains tmux-free and startup probes see the repaired PATH.
+	if !webEnabled {
+		ensureTmuxInPathOrExit()
 	}
 
 	// Create storage early to register instance via SQLite
@@ -494,6 +531,17 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-sigChan
+		// Stop interval hooks and wait for their kill to land. Hook commands
+		// run in their own process groups — intentionally detached from the
+		// terminal's hangup safety net — and only the in-app quit path
+		// (performFinalShutdown) stopped the runner, so a hook mid-run when
+		// the terminal closed or the process was signalled kept running until
+		// its own timeout, stacking one orphan per launch/close cycle (#1829).
+		// Stop blocks (bounded) until in-flight runs are reaped, which is
+		// what makes it safe to os.Exit below.
+		if hooks := intervalhook.GetGlobal(); hooks != nil {
+			hooks.Stop()
+		}
 		// Close control-mode pipes so their tmux clients detach cleanly instead
 		// of orphaning. PipeManager.Close drives the staged EOF teardown, which
 		// avoids the signal-driven detach that races tmux/tmux#4980. The clean
@@ -505,6 +553,7 @@ func main() {
 		}
 		if db := statedb.GetGlobal(); db != nil {
 			_ = db.ResignPrimary()
+			_ = db.ReleaseAllClaims()
 			_ = db.UnregisterInstance()
 		}
 		os.Exit(0)
@@ -765,7 +814,19 @@ func main() {
 	// When --no-tui is also set, run the HTTP server in the foreground and
 	// skip bubbletea entirely — the perf win that motivated this flag.
 	if webEnabled {
-		effectiveProfile := session.GetEffectiveProfile(profile)
+		// #1790: resolve (and refuse to silently auto-create) the same way
+		// NewStorageWithProfile does. Without this, GetEffectiveProfile
+		// returns a CLAUDE_CONFIG_DIR-inferred name unconditionally, and
+		// passing that concrete name into NewSessionDataService below makes
+		// its own internal NewStorageWithProfile call look like an explicit
+		// -p selection — bypassing the guard and re-opening the exact
+		// silent-empty-profile hole the guard exists to close, just via the
+		// web/headless entry point instead of the CLI/TUI one.
+		effectiveProfile, err := session.ResolveProfileForStorage(profile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to resolve profile for web server: %v\n", err)
+			os.Exit(1)
+		}
 		fallbackMenuData := web.NewSessionDataService(effectiveProfile)
 		liveMenuData := web.NewMemoryMenuData(fallbackMenuData)
 		homeModel.SetWebMenuData(liveMenuData)
@@ -779,7 +840,7 @@ func main() {
 			homeModel.SetHeadless(true)
 		}
 
-		server, err := buildWebServer(effectiveProfile, webArgs, liveMenuData, ui.NewWebMutator(homeModel))
+		server, err := buildWebServerFromOptions(effectiveProfile, webOptions, liveMenuData, ui.NewWebMutator(homeModel))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: web server setup failed: %v\n", err)
 			os.Exit(1)
@@ -865,6 +926,16 @@ func main() {
 			"and is not required for normal atuin shell history functionality.\n")
 	}
 
+	// Reap orphaned control-mode clients left behind by prior crashed /
+	// SIGKILL'd / OOM-killed TUIs before this process starts connecting its
+	// own pipes. killStaleControlClients only sweeps per-session on Connect(),
+	// so orphans for sessions this TUI never reopens would otherwise pile up
+	// until they exhaust the pty table (observed: 176 orphaned `tmux -C`
+	// clients vs the macOS kern.tty.ptmx_max=511 cap, blocking all new
+	// terminals). This server-wide sweep clears the whole backlog once at
+	// startup; live sibling TUIs (allow_multiple=true) are preserved.
+	tmux.SweepStaleControlClients(tmux.DefaultSocketName())
+
 	p := tea.NewProgram(
 		homeModel,
 		tea.WithAltScreen(),
@@ -899,7 +970,7 @@ var globalFlagSubcommands = map[string]bool{
 	"remote": true, "worktree": true, "wt": true, "costs": true, "web": true,
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
-	"hermes-hooks": true, "cursor-hooks": true, "notify-daemon": true,
+	"hermes-hooks": true, "cursor-hooks": true, "deepseek": true, "notify-daemon": true,
 	"run-task": true, "inbox": true, "feedback": true, "creds-refresh": true,
 	"debug-dump": true, "version": true, "help": true,
 }
@@ -951,6 +1022,27 @@ func extractProfileFlag(args []string) (string, []string) {
 	}
 
 	return profile, remaining
+}
+
+// extractAllowRepoScriptsFlag extracts --allow-repo-scripts from args,
+// returning whether it was present and the args with it removed. Mirrors
+// extractNoTuiFlag's boolean-flag scan (web_cmd.go): supports bare
+// --allow-repo-scripts and --allow-repo-scripts=true/false/1.
+func extractAllowRepoScriptsFlag(args []string) (bool, []string) {
+	allow := false
+	remaining := make([]string, 0, len(args))
+	for _, a := range args {
+		switch {
+		case a == "--allow-repo-scripts":
+			allow = true
+		case strings.HasPrefix(a, "--allow-repo-scripts="):
+			v := strings.TrimPrefix(a, "--allow-repo-scripts=")
+			allow = v == "true" || v == "1"
+		default:
+			remaining = append(remaining, a)
+		}
+	}
+	return allow, remaining
 }
 
 // extractGroupFlag extracts -g or --group from args, returning the group path and remaining args.
@@ -1039,7 +1131,7 @@ func reorderArgsForFlagParsing(args []string) []string {
 		"t": true, "title": true,
 		"g": true, "group": true,
 		"c": true, "cmd": true,
-		"m": true, "message": true,
+		"m": true, "message": true, "message-file": true,
 		"p": true, "parent": true,
 		"mcp":            true,
 		"channel":        true,
@@ -1055,6 +1147,10 @@ func reorderArgsForFlagParsing(args []string) []string {
 		"ssh":            true,
 		"remote-path":    true,
 		"tmux-socket":    true,
+		// #928 follow-up: account was missing here, so `--account work` had its
+		// value stripped off as a positional and reordered away from the flag.
+		// That mis-parse predates the #1923 guard; the guard only made it loud.
+		"account": true,
 	}
 
 	var flags []string
@@ -1088,58 +1184,11 @@ func reorderArgsForFlagParsing(args []string) []string {
 	return append(flags, positional...)
 }
 
-// isDuplicateSession checks if a session with the same title AND path already exists.
-// Returns (isDuplicate, existingInstance)
-// Paths are normalized by removing trailing slashes for comparison.
-func isDuplicateSession(instances []*session.Instance, title, path string) (bool, *session.Instance) {
-	// Normalize path by removing trailing slash (except for root "/")
-	normalizedPath := strings.TrimSuffix(path, "/")
-	if normalizedPath == "" {
-		normalizedPath = "/"
-	}
-
-	for _, inst := range instances {
-		// Normalize existing path for comparison
-		existingPath := strings.TrimSuffix(inst.ProjectPath, "/")
-		if existingPath == "" {
-			existingPath = "/"
-		}
-
-		if existingPath == normalizedPath && inst.Title == title {
-			return true, inst
-		}
-	}
-	return false, nil
-}
-
-// generateUniqueTitle generates a unique title for sessions at the same path.
-// If "project" exists at path, returns "project (2)", then "project (3)", etc.
-func generateUniqueTitle(instances []*session.Instance, baseTitle, path string) string {
-	// Check if base title is available at this path
-	titleExists := func(title string) bool {
-		for _, inst := range instances {
-			if inst.ProjectPath == path && inst.Title == title {
-				return true
-			}
-		}
-		return false
-	}
-
-	if !titleExists(baseTitle) {
-		return baseTitle
-	}
-
-	// Find next available number
-	for i := 2; i <= 100; i++ { // Cap at 100 to prevent infinite loop
-		candidate := fmt.Sprintf("%s (%d)", baseTitle, i)
-		if !titleExists(candidate) {
-			return candidate
-		}
-	}
-
-	// Fallback: use timestamp
-	return fmt.Sprintf("%s (%d)", baseTitle, time.Now().Unix())
-}
+// isDuplicateSession and generateUniqueTitle moved to session_location.go, where
+// they compare WHERE A SESSION RUNS instead of its ProjectPath string. For an
+// --ssh session ProjectPath is only a local placeholder, so the old string
+// comparison reported every remote session registered from one directory as
+// co-located with every other one (#1850, #1852).
 
 // isWorktreeAlreadyExistsError detects whether git worktree creation failed because
 // the destination path already exists. This preserves friendly UX while avoiding
@@ -1199,6 +1248,13 @@ func resolveGroupPathForAdd(groupTree *session.GroupTree, groupSelector string) 
 	return groupSelector
 }
 
+// shouldLockTitle is the #1615-class chokepoint deciding whether a new CLI
+// session's title is locked against Claude's folder-name sync. An explicit
+// user title locks, as do the explicit lock flags.
+func shouldLockTitle(userProvidedTitle, titleLockFlag, noTitleSyncFlag bool) bool {
+	return userProvidedTitle || titleLockFlag || noTitleSyncFlag
+}
+
 // handleAdd adds a new session from CLI
 func handleAdd(profile string, args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
@@ -1230,9 +1286,9 @@ func handleAdd(profile string, args []string) {
 	attach := fs.Bool("attach", false, "Start and attach to the session immediately after creating it (requires an interactive terminal; not supported with --ssh)")
 
 	// Worktree flags
-	worktreeBranch := fs.String("w", "", "Create session in git worktree for branch")
-	worktreeBranchLong := fs.String("worktree", "", "Create session in git worktree for branch")
-	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree)")
+	worktreeBranch := fs.String("w", "", "Create session in git worktree for branch (not supported with --ssh)")
+	worktreeBranchLong := fs.String("worktree", "", "Create session in git worktree for branch (not supported with --ssh)")
+	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree; not supported with --ssh)")
 	newBranchLong := fs.Bool("new-branch", false, "Create new branch")
 	worktreeLocation := fs.String("location", "", "Worktree location: sibling, subdirectory, or custom path")
 
@@ -1309,7 +1365,8 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("Add a new session to Agent Deck.")
 		fmt.Println()
 		fmt.Println("Arguments:")
-		fmt.Println("  [path]    Project directory (defaults to the group or global default_path, else current directory)")
+		fmt.Println("  [path]    Project directory (default: group default_path, then global default_path,")
+		fmt.Println("            then the group's most recent session path, then current directory)")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -1339,17 +1396,35 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add --worktree fix/bug-123 --new-branch /path/to/repo")
 		fmt.Println()
 		fmt.Println("SSH Examples:")
-		fmt.Println("  agent-deck add --ssh user@host --remote-path ~/project -c claude")
+		fmt.Println("  agent-deck add --ssh user@host --remote-path /home/user/project -c claude")
+		fmt.Println("  agent-deck add /home/user/project --ssh user@host -c claude   # positional path shortcut for --remote-path; must be absolute")
 		fmt.Println("  agent-deck add --ssh user@host -c claude -t \"remote-dev\"")
 	}
 
 	// Reorder args: move path to end so flags are parsed correctly
 	// Go's flag package stops parsing at first non-flag argument
 	// This allows: "add . -c claude" to work same as "add -c claude ."
+	// #1923: catch --account swallowing the next flag because its own value was
+	// omitted. `add` stores the account verbatim and never rejects an unknown
+	// name, so otherwise the session is created against a bogus account and only
+	// surfaces later as a quota error the user cannot trace back to here.
+	//
+	// Runs on the ORIGINAL argv, before reordering. reorderArgsForFlagParsing
+	// moves a flag's value when it does not recognise the flag as value-taking,
+	// which can leave two flags adjacent that the user never wrote that way —
+	// so checking after it reports a mistake the user did not make (#1928).
+	if err := checkFlagValueNotFlag(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	args = reorderArgsForFlagParsing(args)
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
+	}
+	if *sshHost != "" && len(pluginFlags) > 0 {
+		fmt.Fprintln(os.Stderr, "Warning: --plugin is persisted but cannot be installed or enabled automatically over SSH; configure the selected plugins in the remote Claude profile.")
 	}
 
 	// Path argument is optional; if omitted with -g/--group, we'll try group default_path.
@@ -1370,7 +1445,11 @@ func handleAdd(profile string, args []string) {
 	sessionGroup := mergeFlags(*group, *groupShort)
 	explicitGroupProvided := strings.TrimSpace(sessionGroup) != ""
 	sessionCommandInput := mergeFlags(*command, *commandShort)
-	sessionCommandTool, sessionCommandResolved, sessionWrapperResolved, sessionCommandNote := resolveSessionCommand(sessionCommandInput, *wrapper)
+	sessionCommandTool, sessionCommandResolved, sessionWrapperResolved, sessionCommandNote, sessionCommandIsPassthrough, cmdErr := resolveSessionCommand(sessionCommandInput, *wrapper)
+	if cmdErr != nil {
+		fmt.Printf("Error: %v\n", cmdErr)
+		os.Exit(1)
+	}
 	sessionParent := mergeFlags(*parent, *parentShort)
 	if sessionParent != "" && *noParent {
 		fmt.Println("Error: --parent and --no-parent cannot be used together")
@@ -1382,6 +1461,18 @@ func handleAdd(profile string, args []string) {
 		tool := firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		if tool != "claude" {
 			fmt.Println("Error: --resume-session only works with Claude sessions (-c claude)")
+			os.Exit(1)
+		}
+		// #1815 (Codex review on #1830): the value below is passed to
+		// MarkClaudeSessionIDVerified — it becomes a VOUCHED ownership
+		// declaration — and is then interpolated into `--session-id "%s"`,
+		// a double-quoted shell context where $(...) still substitutes.
+		// "Operator-named" has to mean the operator named an actual
+		// conversation id, so refuse anything that is not a bare UUID
+		// rather than vouching for it or silently continuing unverified.
+		if !session.IsBareClaudeSessionUUID(*resumeSession) {
+			fmt.Println("Error: --resume-session must be a bare Claude conversation UUID " +
+				"(8-4-4-4-12 lowercase hex, e.g. 91fd7978-1a2b-3c4d-5e6f-7a8b9c0d1e2f)")
 			os.Exit(1)
 		}
 	}
@@ -1452,15 +1543,28 @@ func handleAdd(profile string, args []string) {
 			os.Exit(1)
 		}
 	} else {
-		// No explicit path provided: use group default path first, then global
-		// config default_path, then cwd fallback.
+		// No explicit path provided: use the group's explicitly configured
+		// default_path first, then global config default_path, then the
+		// group's most-recent-session path, then cwd.
+		//
+		// #1879: the most-recent-session path is derived, not configured — it
+		// must not shadow the global config default_path the way an explicit
+		// per-group default_path does.
+		var recentSessionPath string
 		if sessionGroup != "" {
-			path = groupTree.DefaultPathForGroup(sessionGroup)
+			if explicitPath, hasExplicit := groupTree.ExplicitDefaultPathForGroup(sessionGroup); hasExplicit {
+				path = explicitPath
+			} else {
+				recentSessionPath = groupTree.RecentSessionPathForGroup(sessionGroup)
+			}
 		}
 		if path == "" {
 			if userCfg, cfgErr := session.LoadUserConfig(); cfgErr == nil {
 				path = resolveConfiguredDefaultPath(userCfg.DefaultPath)
 			}
+		}
+		if path == "" {
+			path = recentSessionPath
 		}
 		if path == "" {
 			path, err = os.Getwd()
@@ -1473,14 +1577,35 @@ func handleAdd(profile string, args []string) {
 
 	// Verify path exists and is a directory (skip for SSH remote sessions)
 	if *sshHost != "" {
-		// For SSH sessions, use CWD as local placeholder path (project lives on remote)
-		if path == "" {
-			path, err = os.Getwd()
-			if err != nil {
-				fmt.Printf("Error: failed to get current directory: %v\n", err)
-				os.Exit(1)
-			}
+		// An explicitly given path (positional arg, e.g. `add <remote-path>
+		// --ssh <host>`) names the REMOTE working directory when --ssh is in
+		// play: the project lives on the remote host, so this is never a
+		// local path to validate or launch tmux in. Prior to this fix an
+		// explicit positional path was silently dropped on the floor here:
+		// it became the session's local ProjectPath placeholder (nonsensical,
+		// since it names a path that typically doesn't exist locally) while
+		// SSHRemotePath stayed empty, so wrapForSSH never `cd`'d into it and
+		// the session launched in the SSH login shell's default directory
+		// instead of the intended remote worktree. Route it into
+		// --remote-path (an explicit --remote-path flag still wins, matching
+		// the documented `--ssh --remote-path` pattern) and fall back to CWD
+		// as the local placeholder, exactly as the no-positional-path case
+		// already does. Fixes asheshgoplani/agent-deck#1711 / #1710.
+		// A positional path is routed as the RAW argument (rawPathArg, before
+		// resolveAddPath's local ExpandPath/Abs above), never the already
+		// locally-resolved `path`: see resolveSSHAddPaths' doc comment for why
+		// local resolution of a remote path is never correct.
+		if explicitPathProvided && *sshRemotePath != "" {
+			fmt.Fprintf(os.Stderr, "warning: both a positional path (%q) and --remote-path (%q) were given; "+
+				"the positional path is discarded, --remote-path is used\n", rawPathArg, *sshRemotePath)
 		}
+		var localPlaceholder string
+		localPlaceholder, *sshRemotePath, err = resolveSSHAddPaths(explicitPathProvided, rawPathArg, *sshRemotePath)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		path = localPlaceholder
 	} else {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -1496,6 +1621,26 @@ func handleAdd(profile string, args []string) {
 	// Handle worktree creation
 	var worktreePath, worktreeRepoRoot, worktreeType string
 	if wtBranch != "" {
+		// -w/-b worktree creation is a 100% local filesystem operation
+		// (detectAndCreateBackend + git/jj worktree add below all run against
+		// `path` on THIS machine). Combined with --ssh, `path` at this point
+		// is the local CWD placeholder (see the --ssh branch above), never
+		// the remote repo the director intended. Before this fix that meant
+		// silently creating a worktree in the local Mac's checkout instead of
+		// on the remote host, ignoring --remote-path entirely. Remote
+		// worktree creation over SSH is not yet implemented, so refuse loudly
+		// rather than repeat that silent local-Mac side effect. Workaround:
+		// create the worktree on the remote host directly
+		// (ssh <host> "cd <repo> && git worktree add <path> ..."), then
+		// register it with `agent-deck add --ssh <host> --remote-path <path>`.
+		// Tracking: asheshgoplani/agent-deck#1711 / #1710.
+		if *sshHost != "" {
+			fmt.Fprintln(os.Stderr, "Error: -w/--worktree (and -b) cannot be combined with --ssh; agent-deck cannot create a git worktree on a remote host yet")
+			fmt.Fprintln(os.Stderr, "Workaround: create the worktree on the remote host directly, then register it:")
+			fmt.Fprintln(os.Stderr, "  ssh "+*sshHost+" \"cd <remote-repo> && git worktree add <remote-worktree-path> "+wtBranch+"\"")
+			fmt.Fprintln(os.Stderr, "  agent-deck add --ssh "+*sshHost+" --remote-path <remote-worktree-path> ...")
+			os.Exit(1)
+		}
 		backend, err := detectAndCreateBackend(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -1552,7 +1697,11 @@ func handleAdd(profile string, args []string) {
 
 			// Create worktree atomically (git handles existence checks).
 			// This avoids a TOCTOU race from separate check-then-create steps.
-			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+			// Sparse state is inherited from `path` (the directory the user
+			// pointed at), never from backend.RepoDir() — see #1708.
+			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch,
+				git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), path),
+				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				if isWorktreeAlreadyExistsError(err) {
 					fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)
@@ -1582,17 +1731,73 @@ func handleAdd(profile string, args []string) {
 	userProvidedTitle := (mergeFlags(*title, *titleShort) != "")
 	isQuick := *quickCreate || *quickCreateShort
 
+	quietMode := *quiet || *quietShort
+	out := NewCLIOutput(*jsonOutput, quietMode)
+
+	// Registration is a read-decide-write window: the instance list loaded at
+	// the top of this function answers "is this (title, location) taken?", and
+	// the INSERT happens hundreds of lines later. A concurrent `add`/`launch`
+	// can take the pair in between, so two racing `add -t dup <path>` runs would
+	// both see "free" and both create — the exact state #1850 makes `add`
+	// refuse — and two racing bumps would pick the same "(2)".
+	//
+	// The lock closes that window for goroutines AND for separate processes; the
+	// re-read below is the half that matters, because a list loaded before the
+	// lock is the stale snapshot the lock exists to invalidate. Released
+	// explicitly right after the save so an interactive `--attach` does not hold
+	// it for the length of the attach.
+	regLock, regLockErr := session.AcquireRegistrationLock(profile)
+	if regLockErr != nil {
+		out.Error(fmt.Sprintf("failed to acquire session registration lock: %v", regLockErr), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	releaseRegistration := func() {
+		if regLock != nil {
+			regLock.Release()
+			regLock = nil
+		}
+	}
+	defer releaseRegistration()
+	freshInstances, freshGroups, reloadErr := reloadForRegistration(storage)
+	if reloadErr != nil {
+		// Never fall back to the pre-lock snapshot: that is the stale list the
+		// lock exists to invalidate, and `add` would then rewrite the whole
+		// instances table from it, erasing any row registered in between.
+		out.Error(reloadErr.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	instances, groups = freshInstances, freshGroups
+
+	// Where the session will ACTUALLY run. For an --ssh session `path` is only a
+	// local placeholder (it defaults to the controller's working directory), so
+	// deciding identity from it makes every remote session registered from one
+	// directory look co-located with every other one (#1850 case 3). These are
+	// the same two flag values assigned verbatim to the instance below, so the
+	// decision and what gets stored cannot skew.
+	addLocation := localLocation(path)
+	if *sshHost != "" {
+		addLocation = remoteLocation(*sshHost, *sshRemotePath)
+	}
+
 	if isQuick && !userProvidedTitle {
 		// Quick mode: use auto-generated adjective-noun name
 		sessionTitle = session.GenerateUniqueSessionName(instances, sessionGroup)
-	} else if !userProvidedTitle {
-		// User didn't provide title - auto-generate unique title for this path
-		sessionTitle = generateUniqueTitle(instances, sessionTitle, path)
 	} else {
-		// User provided explicit title - check for exact duplicate (same title AND path)
-		if isDupe, existingInst := isDuplicateSession(instances, sessionTitle, path); isDupe {
-			fmt.Printf("Session already exists with same title and path: %s (%s)\n", existingInst.Title, existingInst.ID)
-			os.Exit(0)
+		decision := decideAddTitle(instances, sessionTitle, addLocation, userProvidedTitle)
+		if decision.Duplicate != nil {
+			// #1850 case 1: this used to print a line and exit 0, with --json
+			// ignored entirely, so a script could not tell "created" from
+			// "already existed". Same ALREADY_EXISTS contract as `launch`.
+			msg, code := decision.DuplicateError()
+			out.ErrorWithData(msg, code, decision.DuplicateJSONFields())
+			os.Exit(1)
+		}
+		sessionTitle = decision.Title
+		// #1850 case 2: the rename stays (two agents on one checkout is a real
+		// workflow) but it leaves a trace. stderr keeps stdout and the exit code
+		// unchanged; --json and -q suppress it.
+		if warning := decision.RenameWarning(); warning != "" && !*jsonOutput && !quietMode {
+			fmt.Fprintln(os.Stderr, warning)
 		}
 	}
 
@@ -1633,8 +1838,11 @@ func handleAdd(profile string, args []string) {
 		newInstance.NoTransitionNotify = true
 	}
 
-	// #697: title-lock blocks Claude's session-name sync. Either flag triggers it.
-	if *titleLock || *noTitleSync {
+	// #697/#1615: title-lock blocks Claude's session-name sync. An explicit
+	// user title (-t/--title) locks too — otherwise Claude's folder-name sync
+	// silently clobbers it (the #1615 class), matching the TUI dialog and
+	// `launch` paths.
+	if shouldLockTitle(userProvidedTitle, *titleLock, *noTitleSync) {
 		newInstance.TitleLocked = true
 	}
 
@@ -1642,6 +1850,7 @@ func handleAdd(profile string, args []string) {
 	if sessionCommandInput != "" {
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		newInstance.Command = sessionCommandResolved
+		newInstance.SubcommandPassthrough = sessionCommandIsPassthrough
 	}
 
 	// Apply --channel flags (claude only — channels is a Claude Code CLI flag).
@@ -1730,6 +1939,8 @@ func handleAdd(profile string, args []string) {
 	// Handle --resume-session: set Claude session ID and resume mode
 	if *resumeSession != "" {
 		newInstance.ClaudeSessionID = *resumeSession
+		// #1815: operator-named conversation — explicit ownership.
+		session.MarkClaudeSessionIDVerified(newInstance)
 		newInstance.ClaudeDetectedAt = time.Now()
 
 		opts := newInstance.GetClaudeOptions()
@@ -1749,6 +1960,13 @@ func handleAdd(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	// Materialize the declarative per-group/per-conductor skill+mcp loadout
+	// at create time (ProjectPath, group, and tool are final here), so the
+	// floor exists even before first start. Start/Restart re-assert.
+	for _, w := range session.ApplyConfiguredLoadout(newInstance) {
+		fmt.Fprintf(os.Stderr, "Warning: loadout: %s\n", w)
+	}
+
 	// Add to instances
 	instances = append(instances, newInstance)
 
@@ -1765,6 +1983,9 @@ func handleAdd(profile string, args []string) {
 		fmt.Printf("Error: failed to save session: %v\n", err)
 		os.Exit(1)
 	}
+	// The (title, location) pair is now taken in the state db; everything below
+	// is per-session setup that no other registration can race with.
+	releaseRegistration()
 
 	// Attach MCPs if specified
 	if len(mcpFlags) > 0 {
@@ -1788,8 +2009,8 @@ func handleAdd(profile string, args []string) {
 		}
 	}
 
-	quietMode := *quiet || *quietShort
-	out := NewCLIOutput(*jsonOutput, quietMode)
+	// quietMode / out are established before the registration decision above,
+	// which is the first place `add` can refuse.
 
 	// --attach: create → start → attach, so `add --attach` "instantly opens"
 	// the new session in one step. Refused loudly (never silently) under
@@ -1971,6 +2192,7 @@ func handleList(profile string, args []string) {
 		handleListAllProfiles(*jsonOutput)
 		return
 	}
+	ensureTmuxInPathOrExit()
 
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
@@ -2232,6 +2454,12 @@ func handleRemove(profile string, args []string) {
 	removedID := inst.ID
 	removedTitle := inst.Title
 
+	// Snapshot service-unit ownership BEFORE teardown (issue #1721): the
+	// pid of the tmux server generation this session belongs to is only
+	// observable while the session is still live, and it is what proves
+	// the unit we may stop later is the one we actually retired.
+	serviceUnitOwnership := inst.ServiceUnitOwnership()
+
 	// Always attempt to kill the tmux session, even if Exists() returns false.
 	// The saved status may be stale (e.g., "error" in DB but tmux session still alive).
 	// KillAndWait is safe to call on non-existent sessions (returns error which we handle).
@@ -2252,7 +2480,12 @@ func handleRemove(profile string, args []string) {
 	// stop + reset-failed the unit here so `agent-deck remove` is truly
 	// terminal. No-op on non-service-mode sessions and on non-systemd
 	// hosts.
-	_ = inst.StopServiceUnit()
+	//
+	// Gated on proven exclusive ownership (issue #1721): the unit
+	// supervises a tmux SERVER, which on the default socket is shared by
+	// every sibling session, so an unconditional stop could kill sessions
+	// this removal was never allowed to touch.
+	_ = inst.RetireServiceUnit(serviceUnitOwnership)
 
 	// Clean up worktree directory if this is a worktree session
 	if inst.IsWorktree() {
@@ -2349,7 +2582,22 @@ func handleRename(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	storage, instances, groups, err := loadSessionData(profile)
+	storage, _, _, err := loadSessionData(profile)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	// A rename takes a (title, location) pair, exactly as `add` does, so it runs
+	// under the same lock and reads the instance list INSIDE it — otherwise two
+	// concurrent renames onto one title both see it free.
+	regLock, regLockErr := session.AcquireRegistrationLock(profile)
+	if regLockErr != nil {
+		out.Error(fmt.Sprintf("failed to acquire session registration lock: %v", regLockErr), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	defer regLock.Release()
+	instances, groups, err := reloadForRegistration(storage)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
@@ -2366,15 +2614,14 @@ func handleRename(profile string, args []string) {
 
 	oldTitle := inst.Title
 
-	// Check for duplicate title at the same path (but allow renaming to same title)
-	if newTitle != oldTitle {
-		if isDup, existing := isDuplicateSession(instances, newTitle, inst.ProjectPath); isDup {
-			out.Error(
-				fmt.Sprintf("session with title %q already exists at path %q (id: %s)", newTitle, inst.ProjectPath, existing.ID),
-				ErrCodeInvalidOperation,
-			)
-			os.Exit(1)
-		}
+	// Refuse a title another session already holds at the SAME LOCATION (but
+	// allow renaming to the title this session already has). checkTitleConflict
+	// is shared with `add` and `session set <id> title` so all three answer
+	// ALREADY_EXISTS; this call site used to answer INVALID_OPERATION for the
+	// identical condition, forcing --json consumers to special-case `rename`.
+	if msg, code := checkTitleConflict(instances, inst, newTitle); msg != "" {
+		out.Error(msg, code)
+		os.Exit(1)
 	}
 
 	// Route through SetField so the rename also sets TitleLocked — a direct
@@ -2446,6 +2693,12 @@ func handleStatus(profile string, args []string) {
 	quiet := fs.Bool("quiet", false, "Only output waiting count (for scripts)")
 	quietShort := fs.Bool("q", false, "Only output waiting count (short)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	// --stale (#1704): read-only lifecycle candidate view. See status_stale.go
+	// for the heuristics (never-started / bash-idle / last-activity) and the
+	// hard suggest-only constraint — this flag branches out before any of the
+	// counting/printing logic below and never mutates a session.
+	stale := fs.Bool("stale", false, "Show read-only stale-session candidates (never stops or removes anything)")
+	staleThreshold := fs.String("threshold", defaultStaleThreshold.String(), "Staleness age threshold for --stale, e.g. 24h, 48h, 168h (Go duration syntax)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck status [options]")
@@ -2460,11 +2713,38 @@ func handleStatus(profile string, args []string) {
 		fmt.Println("  agent-deck status -v           # Detailed list")
 		fmt.Println("  agent-deck status -q           # Just waiting count")
 		fmt.Println("  agent-deck -p work status      # Status for 'work' profile")
+		fmt.Println("  agent-deck status --stale                  # Read-only stale-candidate view (never-started/bash-idle/last-activity)")
+		fmt.Println("  agent-deck status --stale --threshold 48h  # Widen the staleness window")
+		fmt.Println("  agent-deck status --stale --json           # Machine-readable candidates, for agents")
+		fmt.Println()
+		fmt.Println("--stale --json shape:")
+		fmt.Println(`  {"threshold_seconds":86400,"total":5,"stale_count":2,"note":"...",`)
+		fmt.Println(`   "candidates":[{"id":"...","title":"...","tool":"...","status":"idle",`)
+		fmt.Println(`     "substate":"...","path":"...","group_path":"...","parent_session_id":"...",`)
+		fmt.Println(`     "reasons":["never-started"],"never_started":true,"created_at":"...",`)
+		fmt.Println(`     "last_started_at":"...","last_activity_at":"...","last_activity_age_seconds":90000}]}`)
+		fmt.Println("  --stale is READ-ONLY: it never stops or removes a session. Review candidates,")
+		fmt.Println("  then act yourself via `session stop`/`session remove`.")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
+	if *stale {
+		threshold, err := time.ParseDuration(*staleThreshold)
+		if err != nil {
+			fmt.Printf("Error: invalid --threshold %q: %v\n", *staleThreshold, err)
+			os.Exit(1)
+		}
+		if threshold < 0 {
+			fmt.Printf("Error: --threshold must not be negative, got %q\n", *staleThreshold)
+			os.Exit(1)
+		}
+		ensureTmuxInPathOrExit()
+		runStatusStale(profile, threshold, *jsonOutput)
+		return
+	}
+	ensureTmuxInPathOrExit()
 
 	// Load sessions
 	storage, err := session.NewStorageWithProfile(profile)
@@ -2732,6 +3012,10 @@ func handleProfileList(out *CLIOutput, jsonMode bool) {
 			profileList = append(profileList, map[string]interface{}{
 				"name":       p,
 				"is_default": p == defaultProfile,
+				// #1926: let tooling filter the underscore-prefixed profiles
+				// (test fixtures, scratch) without re-deriving the convention.
+				// Additive — nothing is removed from the payload.
+				"internal": isInternalProfileName(p),
 			})
 		}
 		out.Success("", map[string]interface{}{
@@ -2749,15 +3033,53 @@ func handleProfileList(out *CLIOutput, jsonMode bool) {
 		return
 	}
 
-	fmt.Println("Profiles:")
+	// #1926: underscore-prefixed profiles are test fixtures and scratch state.
+	// Listed flat they bury the real ones — the report had seven of them ahead
+	// of the profiles the user actually cared about. Separated, not hidden:
+	// hiding by default would make a profile someone deliberately named with a
+	// leading underscore vanish with no way to notice.
+	var normal, internal []string
 	for _, p := range profiles {
+		if isInternalProfileName(p) {
+			internal = append(internal, p)
+			continue
+		}
+		normal = append(normal, p)
+	}
+
+	printProfile := func(p string) {
 		if p == defaultProfile {
 			fmt.Printf("  * %s (default)\n", p)
-		} else {
-			fmt.Printf("    %s\n", p)
+			return
+		}
+		fmt.Printf("    %s\n", p)
+	}
+
+	fmt.Println("Profiles:")
+	for _, p := range normal {
+		printProfile(p)
+	}
+	if len(normal) == 0 {
+		fmt.Println("    (none)")
+	}
+
+	if len(internal) > 0 {
+		fmt.Printf("\nInternal (test fixtures and scratch, '_' prefix): %d\n", len(internal))
+		for _, p := range internal {
+			printProfile(p)
 		}
 	}
+
 	fmt.Printf("\nTotal: %d profiles\n", len(profiles))
+}
+
+// isInternalProfileName reports whether a profile name follows the project's
+// underscore convention for test fixtures and scratch state (_test, _baseline,
+// …). Purely a display concern: nothing about the profile behaves differently,
+// and the listing separates rather than hides so an unexpected one is still
+// visible (#1926).
+func isInternalProfileName(name string) bool {
+	return strings.HasPrefix(name, "_")
 }
 
 func handleProfileCreate(out *CLIOutput, name string) {
@@ -2848,6 +3170,15 @@ func handleUpdate(args []string) {
 	if err != nil {
 		fmt.Printf("Error checking for updates: %v\n", err)
 		os.Exit(1)
+	}
+
+	// #1759: a release is visible on GitHub before its binaries finish
+	// uploading. CheckForUpdate degrades to the newest installable release and
+	// reports the in-flight one here, so say that plainly instead of either
+	// erroring out or implying the user is already current.
+	if info.PublishingVersion != "" {
+		fmt.Printf("\nℹ v%s was just released but its binaries are not attached yet.\n", info.PublishingVersion)
+		fmt.Println("  Re-run `agent-deck update` in a few minutes to get it.")
 	}
 
 	if !info.Available {
@@ -3158,12 +3489,14 @@ func printHelp() {
 	fmt.Println("  rename, mv       Rename a session")
 	fmt.Println("  status           Show session status summary")
 	fmt.Println("  session          Manage session lifecycle")
+	fmt.Println("  fleet            Detect and recover from a fleet-wide session death")
 	fmt.Println("  mcp              Manage MCP servers")
 	fmt.Println("  skill            Manage project skills")
 	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
 	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
 	fmt.Println("  hermes-hooks     Manage Hermes Agent hook integration")
 	fmt.Println("  cursor-hooks     Manage Cursor Agent CLI hook integration")
+	fmt.Println("  deepseek         Inspect the DeepSeek Harness (dsh) integration")
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
@@ -3185,6 +3518,10 @@ func printHelp() {
 	fmt.Println("  session fork <id>         Fork Claude or Pi session with context")
 	fmt.Println("  session attach <id>       Attach to session interactively")
 	fmt.Println("  session show [id]         Show session details")
+	fmt.Println()
+	fmt.Println("Fleet Recovery Commands:")
+	fmt.Println("  fleet status              Report sessions whose panes are gone (read-only)")
+	fmt.Println("  fleet recover             Plan a sequential recovery sweep (add --yes to run it)")
 	fmt.Println()
 	fmt.Println("MCP Commands:")
 	fmt.Println("  mcp list                  List available MCPs from config.toml")
@@ -3212,6 +3549,9 @@ func printHelp() {
 	fmt.Println("  cursor-hooks install      Install Cursor hooks")
 	fmt.Println("  cursor-hooks uninstall    Remove Cursor hooks")
 	fmt.Println("  cursor-hooks status       Show Cursor hooks install status")
+	fmt.Println("  deepseek status           Show resolved dsh binary, DSH_HOME, profile")
+	fmt.Println("  deepseek profiles         List profiles under $DSH_HOME/profiles")
+	fmt.Println("  deepseek sessions [path]  List dsh sessions recorded for a workspace")
 	fmt.Println()
 	fmt.Println("Group Commands:")
 	fmt.Println("  group list                List all groups")
@@ -3267,6 +3607,15 @@ func printHelp() {
 	fmt.Println("Environment Variables:")
 	fmt.Println("  AGENTDECK_PROFILE    Default profile to use")
 	fmt.Println("  AGENTDECK_COLOR      Color mode: truecolor, 256, 16, none")
+	fmt.Println()
+	fmt.Println("Configuration:")
+	if configPath, err := session.GetUserConfigPath(); err == nil {
+		fmt.Printf("  Config file: %s\n", configPath)
+	} else {
+		fmt.Println("  Config file: $XDG_CONFIG_HOME/agent-deck/config.toml (default ~/.config/agent-deck/config.toml)")
+	}
+	fmt.Println("  Since v1.9.49 config lives under the XDG base dirs, not ~/.agent-deck.")
+	fmt.Println("  Run 'agent-deck migrate-paths' to copy legacy ~/.agent-deck files across.")
 	fmt.Println()
 	fmt.Println("Keyboard shortcuts (in TUI):")
 	fmt.Println("  n          New session")
@@ -3760,39 +4109,39 @@ func isOuterTmuxWithoutOptIn() bool {
 	return true
 }
 
+func ensureTmuxInPathOrExit() {
+	if err := ensureTmuxInPath(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: tmux not found")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Agent Deck requires tmux. Install with:")
+		switch runtime.GOOS {
+		case "darwin":
+			fmt.Fprintln(os.Stderr, "  brew install tmux")
+		case "linux":
+			fmt.Fprintln(os.Stderr, "  sudo apt install tmux    # Debian/Ubuntu")
+			fmt.Fprintln(os.Stderr, "  sudo dnf install tmux    # Fedora/RHEL")
+			fmt.Fprintln(os.Stderr, "  sudo pacman -S tmux      # Arch")
+		default:
+			fmt.Fprintln(os.Stderr, "  See: https://github.com/tmux/tmux/wiki/Installing")
+		}
+		fmt.Fprintf(os.Stderr, "\nSearched PATH: %s\n", os.Getenv("PATH"))
+		os.Exit(1)
+	}
+}
+
 // ensureTmuxInPath checks that tmux is reachable. If exec.LookPath fails
 // (common when the Go binary inherits a minimal PATH from a desktop launcher,
 // systemd unit, or non-login shell), it probes well-known installation
 // directories. When tmux is found via fallback, the containing directory is
-// prepended to PATH so every subsequent exec.Command("tmux", …) succeeds.
+// appended to PATH so every subsequent exec.Command("tmux", …) succeeds
+// without reordering resolution for anything that already resolved — see
+// resolveTmuxPATH for why the direction matters.
 func ensureTmuxInPath() error {
-	if _, err := exec.LookPath("tmux"); err == nil {
-		return nil
+	ensureTmuxOnPath()
+	if _, err := exec.LookPath("tmux"); err != nil {
+		return fmt.Errorf("tmux not found in PATH or common locations")
 	}
-
-	// Well-known paths where tmux is commonly installed.
-	fallbacks := []string{
-		"/usr/bin/tmux",
-		"/usr/local/bin/tmux",
-		"/opt/homebrew/bin/tmux",
-		"/home/linuxbrew/.linuxbrew/bin/tmux",
-		"/snap/bin/tmux",
-	}
-
-	for _, p := range fallbacks {
-		info, err := os.Stat(p)
-		if err != nil {
-			continue
-		}
-		// Must be a regular file (or symlink target) with at least one execute bit.
-		if info.Mode().IsRegular() && info.Mode()&0111 != 0 {
-			dir := filepath.Dir(p)
-			_ = os.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			return nil
-		}
-	}
-
-	return fmt.Errorf("tmux not found in PATH or common locations")
+	return nil
 }
 
 // formatSize formats bytes into human-readable size

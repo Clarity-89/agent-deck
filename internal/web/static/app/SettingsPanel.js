@@ -3,6 +3,7 @@
 import { html } from 'htm/preact'
 import { useState, useEffect } from 'preact/hooks'
 import { settingsSignal } from './state.js'
+import { authHeaders } from './api.js'
 
 export function SettingsPanel() {
   const [error, setError] = useState(null)
@@ -10,7 +11,7 @@ export function SettingsPanel() {
 
   useEffect(() => {
     if (settings) return
-    fetch('/api/settings')
+    fetch('/api/settings', { headers: authHeaders() })
       .then(r => { if (!r.ok) throw new Error('Settings request failed: ' + r.status); return r.json() })
       .then(data => { settingsSignal.value = data })
       .catch(err => setError(err.message || 'Failed to load settings'))
@@ -30,8 +31,10 @@ export function SettingsPanel() {
       <div class="kv" data-testid="settings-web-mutations"><span class="k">web mutations</span><span class=${`v ${settings.webMutations ? 'ok' : 'warn'}`}>${settings.webMutations ? 'enabled' : 'disabled'}</span></div>
       <div class="kv" data-testid="settings-hidden-tools"><span class="k">hidden tools</span><span class="v">${(settings.hiddenTools || []).join(', ') || 'none'}</span></div>
       <div class="kv" data-testid="settings-picker-tools"><span class="k">picker tools</span><span class="v">${(settings.pickerTools || []).join(', ') || 'loading…'}</span></div>
+      <div class="kv" data-testid="settings-trusted-domains"><span class="k">trusted domains</span><span class="v">${(settings.trustedDomains || []).join(', ') || 'none'}</span></div>
+      <div class="kv" data-testid="settings-confirm-link-open"><span class="k">link confirm</span><span class=${`v ${settings.confirmLinkOpen === false ? 'warn' : 'ok'}`}>${settings.confirmLinkOpen === false ? 'off' : 'on'}</span></div>
       <div style="font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px;">
-        Edit <code>~/.agent-deck/config.toml</code> (<code>[ui] hidden_tools</code>) or use TUI Settings → Visible tools…
+        Edit <code>~/.config/agent-deck/config.toml</code> (<code>[ui] hidden_tools</code>, <code>[web] trusted_domains</code>) or use TUI Settings → Visible tools…
       </div>
     </div>
   `

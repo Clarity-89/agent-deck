@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -38,6 +39,15 @@ var wsUpgrader = websocket.Upgrader{
 	CheckOrigin:     allowWSOrigin,
 }
 
+// WebSocket keepalive tunables. The terminal socket sends protocol-level pings
+// every wsPingPeriod and tears the connection down if no pong (or any message)
+// arrives within wsPongWait, so a vanished peer can't leave the read loop — and
+// its tmux attach bridge — blocked forever. Overridable in tests.
+var (
+	wsPongWait   = 60 * time.Second
+	wsPingPeriod = (wsPongWait * 9) / 10
+)
+
 func allowWSOrigin(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
@@ -69,6 +79,10 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", "session id is required")
 		return
 	}
+	// sessionID is attacker-controlled (raw URL path segment); every log call
+	// below must use this sanitized copy, never sessionID itself, so a crafted
+	// CRLF/control-char id can't forge fake log lines (go/log-injection).
+	logSessionID := logging.SanitizeValue(sessionID)
 
 	snapshot, err := s.menuData.LoadMenuSnapshot()
 	if err != nil {
@@ -87,6 +101,42 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+
+	// Keepalive so dead peers are detected and the deferred bridge teardown
+	// actually runs. Without this, an idle session whose client vanished
+	// (network drop, mobile app killed) leaves the read loop below blocked
+	// forever in ReadMessage, so `defer bridge.Close()` never fires and the
+	// tmux attach client leaks. Under `window-size largest` a single leaked
+	// wide client then pins the shared window geometry for every other viewer
+	// — the symptom being a phone terminal that stops wrapping to its screen.
+	// We send protocol-level pings and require a pong within pongWait; both
+	// browsers and URLSessionWebSocketTask answer pings automatically.
+	pongWait, pingPeriod := wsPongWait, wsPingPeriod
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPing:
+				return
+			case <-ticker.C:
+				// WriteControl may be called concurrently with the writer. A
+				// transient send failure (e.g. brief writer-lock contention)
+				// must not permanently stop pings and strand a healthy peer —
+				// the read deadline is the sole liveness arbiter, so just retry
+				// on the next tick. A genuinely dead conn is reaped read-side,
+				// after which close(stopPing) ends this goroutine.
+				_ = conn.WriteControl(websocket.PingMessage, nil,
+					time.Now().Add(10*time.Second))
+			}
+		}
+	}()
 
 	writer := newWSConnWriter(conn)
 
@@ -110,7 +160,7 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 		bridge, err = newTmuxPTYBridge(menuSession.TmuxSession, menuSession.TmuxSocketName, sessionID, writer)
 		if err != nil {
 			logging.ForComponent(logging.CompWeb).Error("terminal_attach_failed",
-				slog.String("session_id", sessionID),
+				slog.String("session_id", logSessionID),
 				slog.String("tmux_session", menuSession.TmuxSession),
 				slog.String("error", err.Error()))
 			code := "TERMINAL_ATTACH_FAILED"
@@ -146,18 +196,32 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(
+			// A keepalive read-deadline reap surfaces as a net.Error timeout,
+			// which IsUnexpectedCloseError treats as expected — so log it
+			// explicitly, otherwise a dead-peer teardown leaves no trace and is
+			// indistinguishable from a normal close in production logs.
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				logging.ForComponent(logging.CompWeb).Warn("websocket_keepalive_timeout",
+					slog.String("session_id", logSessionID),
+					slog.String("error", logging.SanitizeValue(err.Error())))
+			} else if websocket.IsUnexpectedCloseError(
 				err,
 				websocket.CloseNormalClosure,
 				websocket.CloseGoingAway,
 				websocket.CloseNoStatusReceived,
 			) {
+				// err may be a *websocket.CloseError whose Text is the
+				// peer-supplied close reason (attacker-controlled) — sanitize
+				// it same as logSessionID above (go/log-injection).
 				logging.ForComponent(logging.CompWeb).Warn("websocket_closed_unexpectedly",
-					slog.String("session_id", sessionID),
-					slog.String("error", err.Error()))
+					slog.String("session_id", logSessionID),
+					slog.String("error", logging.SanitizeValue(err.Error())))
 			}
 			return
 		}
+		// A real message is also liveness — extend the deadline alongside pongs.
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		var msg wsClientMessage
 		if err := json.Unmarshal(payload, &msg); err != nil {
