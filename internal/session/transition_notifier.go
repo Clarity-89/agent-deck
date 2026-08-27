@@ -89,6 +89,16 @@ type TransitionNotificationEvent struct {
 	// the old dropped_no_target ~1/sec runaway to a terminal state.
 	Attempts int `json:"attempts,omitempty"`
 
+	// SourceRemote names the configured remote a record was PULLED from by
+	// `agent-deck remote drain` (issue #1948). Empty for every locally produced
+	// record, so a conductor draining two hosts can still tell which machine a
+	// child ran on.
+	//
+	// SourceRemote is part of every inbox identity rule. The visible
+	// `<remote>:<child>` spelling alone is not disjoint from caller-chosen local
+	// IDs, so structured provenance is the authoritative collision boundary.
+	SourceRemote string `json:"source_remote,omitempty"`
+
 	// DeadLetterReason records WHY a record was terminally undeliverable (audit
 	// B5): orphan, child_removed, parent_removed (incl. cross-profile),
 	// no_notify, self_conductor, or unresolvable. Empty for delivered records.
@@ -224,8 +234,12 @@ func (n *TransitionNotifier) terminalDrop(event TransitionNotificationEvent, rea
 
 	event.DeadLetterReason = reason
 	event.Attempts = MaxUnresolvedAttempts // terminal: not a transient retry
-	n.logMissed(event, reason)
-	_ = writeDeadLetter(event)
+	// The durable dead-letter file, not terminalSeen, is the cross-process
+	// source of truth. Only the process that appends the stable fingerprint may
+	// append the corresponding missed-log line.
+	if appended, err := writeDeadLetter(event); err == nil && appended {
+		n.logMissed(event, reason)
+	}
 }
 
 // Close is retained for API compatibility with callers that defer cleanup of a

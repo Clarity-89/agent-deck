@@ -224,6 +224,104 @@ type NewDialog struct {
 	enterAdvances bool
 }
 
+// viewportDialogContent keeps the dialog's identity and primary action pinned
+// while scrolling the form body around the focused control.  Lip Gloss Place
+// does not clip oversized content, so without this an ordinary 100x30 terminal
+// loses both ends of the form (#896).
+func viewportDialogContent(content string, width, height, focusLogicalLine int) string {
+	if width < 1 || height < 1 {
+		return content
+	}
+	wrapped := lipgloss.NewStyle().Width(width).Render(content)
+	lines := strings.Split(wrapped, "\n")
+	for len(lines) > 0 && strings.TrimSpace(stripAnsi(lines[len(lines)-1])) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) <= height {
+		return content
+	}
+	if len(lines) < 4 {
+		return strings.Join(lines, "\n")
+	}
+
+	// The title/group pair and the final logical action/help line are stable
+	// chrome. The footer can occupy multiple visual rows after wrapping, and all
+	// of them must remain pinned so the primary action cannot scroll away.
+	logicalLines := strings.Split(content, "\n")
+	for len(logicalLines) > 0 && strings.TrimSpace(stripAnsi(logicalLines[len(logicalLines)-1])) == "" {
+		logicalLines = logicalLines[:len(logicalLines)-1]
+	}
+	footerHeight := 1
+	if len(logicalLines) > 0 {
+		footerHeight = lipgloss.Height(lipgloss.NewStyle().Width(width).Render(logicalLines[len(logicalLines)-1]))
+	}
+	footerHeight = min(footerHeight, len(lines)-1)
+	// The first two logical rows are the dialog identity and group context, but
+	// either may wrap. Measure their actual rendered height instead of assuming
+	// they consume two terminal rows.
+	headerLogicalEnd := min(2, len(logicalLines))
+	headerEnd := lipgloss.Height(lipgloss.NewStyle().Width(width).Render(
+		strings.Join(logicalLines[:headerLogicalEnd], "\n"),
+	))
+	headerEnd = min(headerEnd, len(lines)-footerHeight)
+	bodyStart, bodyEnd := headerEnd, len(lines)-footerHeight
+	footer := lines[bodyEnd:]
+	focus := bodyStart
+	if focusLogicalLine >= headerLogicalEnd && focusLogicalLine < len(logicalLines)-1 {
+		// Resolve the selected logical row to its visual row before slicing. This
+		// preserves row identity when picker entries and controls reuse ▶.
+		throughFocus := lipgloss.NewStyle().Width(width).Render(
+			strings.Join(logicalLines[:focusLogicalLine+1], "\n"),
+		)
+		focusLine := lipgloss.NewStyle().Width(width).Render(logicalLines[focusLogicalLine])
+		focus = lipgloss.Height(throughFocus) - lipgloss.Height(focusLine)
+		focus = max(bodyStart, min(focus, bodyEnd-1))
+	}
+
+	// Reserve both indicator rows initially. Unused indicators are returned to
+	// the body below, maximizing useful content near either edge.
+	budget := max(1, height-headerEnd-footerHeight-2)
+	start := focus - budget/2
+	if start < bodyStart {
+		start = bodyStart
+	}
+	end := start + budget
+	if end > bodyEnd {
+		end = bodyEnd
+		start = max(bodyStart, end-budget)
+	}
+	showUp, showDown := start > bodyStart, end < bodyEnd
+	used := headerEnd + (end - start) + footerHeight
+	if showUp {
+		used++
+	}
+	if showDown {
+		used++
+	}
+	for used < height && start > bodyStart {
+		start--
+		used++
+		showUp = start > bodyStart
+	}
+	for used < height && end < bodyEnd {
+		end++
+		used++
+		showDown = end < bodyEnd
+	}
+
+	dim := lipgloss.NewStyle().Foreground(ColorComment)
+	visible := append([]string(nil), lines[:headerEnd]...)
+	if showUp {
+		visible = append(visible, dim.Render("  ↑ more fields"))
+	}
+	visible = append(visible, lines[start:end]...)
+	if showDown {
+		visible = append(visible, dim.Render("  ↓ more fields"))
+	}
+	visible = append(visible, footer...)
+	return strings.Join(visible, "\n")
+}
+
 // dialogSnapshot captures form state so the recent picker can restore on cancel.
 type dialogSnapshot struct {
 	name             string
@@ -1115,7 +1213,25 @@ func (d *NewDialog) autoBranchFromName() {
 	if name == "" {
 		return
 	}
-	branch := d.branchPrefix + name
+	// Run the name through the git sanitizer (same as the fork dialog) so a
+	// title with spaces or ':' doesn't prefill a branch the dialog's own
+	// ValidateBranchName then refuses. The prefix is user config and may
+	// legitimately contain '/', so only the name part is sanitized.
+	//
+	// The sanitizer can still leave a leading/trailing '.' or '/' (e.g. "*.foo"
+	// -> ".foo", "~/x" -> "/x"); git rejects a ref component starting with '.'
+	// and an empty one, so trim those before they reach `worktree add`.
+	slug := strings.Trim(git.SanitizeBranchName(name), "./")
+	branch := d.branchPrefix + slug
+	if slug == "" || git.ValidateBranchName(branch) != nil {
+		// Nothing usable came out. Clear rather than return, so the field can't
+		// keep a branch derived from an earlier name; an empty branch surfaces
+		// as "Branch name required for worktree" on submit instead of silently
+		// creating the worktree on the wrong branch.
+		d.branchInput.SetValue("")
+		d.branchAutoSet = true
+		return
+	}
 	d.branchInput.SetValue(branch)
 	d.branchAutoSet = true
 }
@@ -2628,6 +2744,16 @@ func (d *NewDialog) View() string {
 
 	// Build content
 	var content strings.Builder
+	focusLogicalLine := -1
+	writeActiveLabel := func(label string) {
+		focusLogicalLine = strings.Count(content.String(), "\n")
+		content.WriteString(activeLabelStyle.Render(label))
+	}
+	markFocusedRow := func(target focusTarget) {
+		if cur == target {
+			focusLogicalLine = strings.Count(content.String(), "\n")
+		}
+	}
 
 	// Title with parent group info
 	content.WriteString(titleStyle.Render("New Session"))
@@ -2699,7 +2825,7 @@ func (d *NewDialog) View() string {
 
 	// Name input
 	if cur == focusName {
-		content.WriteString(activeLabelStyle.Render("▶ Name:"))
+		writeActiveLabel("▶ Name:")
 	} else {
 		content.WriteString(labelStyle.Render("  Name:"))
 	}
@@ -2712,10 +2838,14 @@ func (d *NewDialog) View() string {
 	// The Multi-repo toggle and its path list move below the common fields
 	// (see renderMultiRepoSection, called after the Branch input). In multi-repo
 	// mode the single Path field is hidden — its list renders below the fold.
+	markFocusedRow(focusCommand)
 	d.renderCommandSection(&content, cur)
+	markFocusedRow(focusModel)
 	d.renderModelSection(&content, cur, dialogWidth)
+	markFocusedRow(focusReasoningEffort)
 	d.renderReasoningEffortSection(&content, cur)
 	if !d.multiRepoEnabled {
+		markFocusedRow(focusPath)
 		d.renderSinglePathSection(&content, cur, dialogWidth)
 	}
 
@@ -2727,6 +2857,7 @@ func (d *NewDialog) View() string {
 	if cur == focusCommand {
 		worktreeLabel = "Create in worktree (w)"
 	}
+	markFocusedRow(focusWorktree)
 	content.WriteString(renderCheckboxLine(worktreeLabel, d.worktreeEnabled, cur == focusWorktree))
 
 	// Docker sandbox checkbox — individually focusable.
@@ -2734,6 +2865,7 @@ func (d *NewDialog) View() string {
 	if cur == focusCommand {
 		sandboxLabel = "Run in Docker sandbox (s)"
 	}
+	markFocusedRow(focusSandbox)
 	content.WriteString(renderCheckboxLine(sandboxLabel, d.sandboxEnabled, cur == focusSandbox))
 
 	// Inherited Docker settings (only visible when sandbox is enabled).
@@ -2750,7 +2882,7 @@ func (d *NewDialog) View() string {
 		summary := fmt.Sprintf("%d active", len(d.inheritedSettings))
 		toggleLine := fmt.Sprintf("%s Docker Settings (%s)", arrow, summary)
 		if focused {
-			content.WriteString(activeLabelStyle.Render("▶ " + toggleLine))
+			writeActiveLabel("▶ " + toggleLine)
 		} else {
 			content.WriteString("  " + dimStyle.Render(toggleLine))
 		}
@@ -2774,7 +2906,7 @@ func (d *NewDialog) View() string {
 	if len(d.conductorSessions) > 0 {
 		focused := cur == focusConductor
 		if focused {
-			content.WriteString(activeLabelStyle.Render("▶ Conducting parent:"))
+			writeActiveLabel("▶ Conducting parent:")
 		} else {
 			content.WriteString(labelStyle.Render("  Conducting parent:"))
 		}
@@ -2817,7 +2949,7 @@ func (d *NewDialog) View() string {
 	if d.worktreeEnabled {
 		content.WriteString("\n")
 		if cur == focusBranch {
-			content.WriteString(activeLabelStyle.Render("▶ Branch:"))
+			writeActiveLabel("▶ Branch:")
 		} else {
 			content.WriteString(labelStyle.Render("  Branch:"))
 		}
@@ -2835,11 +2967,16 @@ func (d *NewDialog) View() string {
 	// Multi-repo toggle (below the fold, UX top-3 #3). Its path list renders
 	// here when enabled; in the common single-repo case it's just a checkbox.
 	content.WriteString("\n")
+	markFocusedRow(focusMultiRepo)
 	d.renderMultiRepoSection(&content, cur)
 
 	// Tool options panel
 	if d.toolOptions != nil {
 		content.WriteString("\n")
+		panelStart := strings.Count(content.String(), "\n")
+		if cur == focusOptions {
+			focusLogicalLine = panelStart + d.toolOptions.FocusedLine()
+		}
 		content.WriteString(d.toolOptions.View())
 	}
 
@@ -2896,9 +3033,11 @@ func (d *NewDialog) View() string {
 		}
 	} else if cur == focusModel {
 		if d.modelSuggestionActive {
-			helpText = "↑/↓ navigate │ Space/Enter select │ Esc back │ Tab next"
+			helpText = "↑/↓ navigate │ Space/Enter select │ Esc back │ ^S create"
+		} else if d.IsModelPickerOpen() {
+			helpText = "Type custom model ID │ Enter browse IDs │ Tab next │ Esc back │ ^S create"
 		} else {
-			helpText = "Type custom model ID │ Enter browse known IDs │ Tab next"
+			helpText = "Type custom model ID │ Enter browse IDs │ Tab next │ Esc cancel │ ^S create"
 		}
 	} else if cur == focusReasoningEffort {
 		helpText = "←→/Space choose effort │ Tab next │ Enter/^S create │ Esc cancel"
@@ -2913,8 +3052,30 @@ func (d *NewDialog) View() string {
 	}
 	content.WriteString(helpStyle.Render(helpText))
 
+	// Border plus Padding(2, 4) consume six terminal rows. At constrained
+	// heights, viewport only the form body; wide/tall dialogs remain byte-for-
+	// byte on the original rendering path.
+	innerWidth := max(1, dialogWidth-8)
+	maxContentHeight := d.height - 6
+	fullContent := content.String()
+	viewported := viewportDialogContent(fullContent, innerWidth, maxContentHeight, focusLogicalLine)
+
+	// Dropdown anchors are based on visual lines. Recompute them after the
+	// viewport has wrapped/scrolled so a picker follows its focused input.
+	if viewported != fullContent {
+		for i, line := range strings.Split(viewported, "\n") {
+			plain := stripAnsi(line)
+			if strings.Contains(plain, "▶ Model ID:") {
+				d.modelLineOffset = i + 3 // title margin + label + input
+			}
+			if strings.Contains(plain, "▶ Path:") {
+				d.suggestionsLineOffset = i + 3 // title margin + label + input
+			}
+		}
+	}
+
 	// Wrap in dialog box
-	dialog := dialogStyle.Render(content.String())
+	dialog := dialogStyle.Render(viewported)
 
 	// Center the dialog
 	placed := lipgloss.Place(
@@ -3000,6 +3161,9 @@ func (d *NewDialog) renderSuggestionsDropdown() string {
 
 	// Real suggestions below, with paginated scrolling around the selected one.
 	maxShow := 5
+	if d.height > 0 && d.height <= 30 {
+		maxShow = 3
+	}
 	total := len(d.pathSuggestions)
 	if total > 0 {
 		// Cursor 1..N maps to suggestions 0..N-1; -1 means "Type custom" is selected.
@@ -3098,6 +3262,11 @@ func (d *NewDialog) renderModelSuggestionsDropdown() string {
 	b.WriteString(style.Render(prefix + label))
 
 	maxShow := 6
+	if d.height > 0 && d.height <= 30 {
+		// Leave room for both the dropdown footer and the dialog's pinned
+		// create action; a six-row menu overwrote that action at 100x30.
+		maxShow = 3
+	}
 	total := len(d.modelSuggestions)
 	if total > 0 {
 		suggCursor := d.modelSuggestionCursor - 1
@@ -3144,7 +3313,7 @@ func (d *NewDialog) renderModelSuggestionsDropdown() string {
 		}
 	}
 
-	footerText := " ↑/↓ navigate │ Space select │ Type custom "
+	footerText := " ↑/↓ navigate │ Space select │ Esc back "
 	if d.modelSuggestionActive {
 		footerText = " ↑/↓ navigate │ Space/Enter select │ Esc back "
 	}

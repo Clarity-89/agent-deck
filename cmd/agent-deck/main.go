@@ -39,7 +39,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.13.0" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.15.0" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -52,10 +52,15 @@ const (
 // init sets up color profile for consistent terminal colors across environments
 func init() {
 	initColorProfile()
-	initUpdateSettings()
 }
 
-// initUpdateSettings configures update checking from user config
+// initUpdateSettings configures update checking from user config.
+//
+// Called from main(), NOT from package init(): it loads the user config,
+// which resolves an agent-deck path. Under `go test`, package init runs
+// before TestMain gets to call testutil.IsolateHome(), so an init-time load
+// resolved the developer's REAL config and tripped the agentpaths
+// unsandboxed-test warning on every run of this package (issue #2012).
 func initUpdateSettings() {
 	settings := session.GetUpdateSettings()
 	update.SetCheckInterval(settings.CheckIntervalHours)
@@ -216,6 +221,10 @@ func main() {
 	// tmux probe below. No-op when tmux is already on PATH.
 	ensureTmuxOnPath()
 
+	// Configure update checking before any command path can reach an update
+	// check (printUpdateNotice, `update`, `version`). See the doc comment.
+	initUpdateSettings()
+
 	// Extract global -p/--profile flag before subcommand dispatch
 	profile, args := extractProfileFlag(os.Args[1:])
 	if profile != "" {
@@ -325,8 +334,17 @@ func main() {
 		case "launch":
 			handleLaunch(profile, args[1:])
 			return
+		case "accounts":
+			handleAccounts(args[1:])
+			return
 		case "conductor":
 			handleConductor(profile, args[1:])
+			return
+		case "agents":
+			handleAgents(profile, args[1:])
+			return
+		case "agent":
+			handleAgent(profile, args[1:])
 			return
 		case "telegram-doctor":
 			handleTelegramDoctor(profile, args[1:])
@@ -397,7 +415,7 @@ func main() {
 			handleRunTask(args[1:])
 			return
 		case "inbox":
-			handleInbox(args[1:])
+			handleInbox(profile, args[1:])
 			return
 		case "feedback":
 			handleFeedback(args[1:])
@@ -1200,10 +1218,21 @@ func isWorktreeAlreadyExistsError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
 
-func resolveAutoParentInstance(instances []*session.Instance) *session.Instance {
+// resolveAutoParentInstanceChecked distinguishes a top-level invocation (no
+// managed caller identity) from a child creation whose authoritative injected
+// identity is stale. The latter must fail at creation instead of silently
+// producing an orphan that can only be discovered in delivery dead-letter.
+func resolveAutoParentInstanceChecked(instances []*session.Instance) (*session.Instance, string) {
 	candidates := []string{
 		strings.TrimSpace(os.Getenv("AGENT_DECK_SESSION_ID")),
 		strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")),
+	}
+	authoritative := ""
+	for _, candidate := range candidates {
+		if candidate != "" {
+			authoritative = candidate
+			break
+		}
 	}
 
 	if tmuxCurrent := strings.TrimSpace(GetCurrentSessionID()); tmuxCurrent != "" {
@@ -1217,10 +1246,10 @@ func resolveAutoParentInstance(instances []*session.Instance) *session.Instance 
 		}
 		seen[candidate] = true
 		if inst, _, _ := ResolveSession(candidate, instances); inst != nil {
-			return inst
+			return inst, ""
 		}
 	}
-	return nil
+	return nil, authoritative
 }
 
 // resolveGroupPathForAdd resolves a user-provided group selector to a stored group path.
@@ -1523,7 +1552,12 @@ func handleAdd(profile string, args []string) {
 		// is wired into `launch` where path is already known at this point.
 		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
 	} else if !*noParent {
-		parentInstance = resolveAutoParentInstance(instances)
+		var unresolvedParent string
+		parentInstance, unresolvedParent = resolveAutoParentInstanceChecked(instances)
+		if parentInstance == nil && unresolvedParent != "" {
+			fmt.Printf("Error: automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session\n", unresolvedParent)
+			os.Exit(1)
+		}
 		if parentInstance != nil && !parentInstance.IsSubSession() {
 			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
 		} else {
@@ -2214,27 +2248,29 @@ func handleList(profile string, args []string) {
 	if *jsonOutput {
 		// JSON output for scripting
 		type sessionJSON struct {
-			ID            string    `json:"id"`
-			Title         string    `json:"title"`
-			Path          string    `json:"path"`
-			Group         string    `json:"group"`
-			Tool          string    `json:"tool"`
-			Command       string    `json:"command,omitempty"`
-			ModelID       string    `json:"model_id,omitempty"`
-			Model         string    `json:"model,omitempty"`
-			ModelVersion  string    `json:"model_version,omitempty"`
-			Status        string    `json:"status"`
-			Substate      string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
-			TmuxSession   string    `json:"tmux_session,omitempty"`
-			Profile       string    `json:"profile"`
-			CreatedAt     time.Time `json:"created_at"`
-			SSHHost       string    `json:"ssh_host,omitempty"`
-			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
-			Channels      []string  `json:"channels,omitempty"`
-			ExtraArgs     []string  `json:"extra_args,omitempty"`
-			Color         string    `json:"color,omitempty"` // issue #391
-			Archived      bool      `json:"archived"`
-			ArchivedAt    time.Time `json:"archived_at,omitempty"`
+			ID                string    `json:"id"`
+			ParentSessionID   string    `json:"parent_session_id,omitempty"`
+			ParentProjectPath string    `json:"parent_project_path,omitempty"`
+			Title             string    `json:"title"`
+			Path              string    `json:"path"`
+			Group             string    `json:"group"`
+			Tool              string    `json:"tool"`
+			Command           string    `json:"command,omitempty"`
+			ModelID           string    `json:"model_id,omitempty"`
+			Model             string    `json:"model,omitempty"`
+			ModelVersion      string    `json:"model_version,omitempty"`
+			Status            string    `json:"status"`
+			Substate          string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
+			TmuxSession       string    `json:"tmux_session,omitempty"`
+			Profile           string    `json:"profile"`
+			CreatedAt         time.Time `json:"created_at"`
+			SSHHost           string    `json:"ssh_host,omitempty"`
+			SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
+			Channels          []string  `json:"channels,omitempty"`
+			ExtraArgs         []string  `json:"extra_args,omitempty"`
+			Color             string    `json:"color,omitempty"` // issue #391
+			Archived          bool      `json:"archived"`
+			ArchivedAt        time.Time `json:"archived_at,omitempty"`
 		}
 		// Warm tmux pane-title cache + load hook statuses so the CLI
 		// reports the same Status the TUI and /api/menu do (issue #610).
@@ -2242,31 +2278,34 @@ func handleList(profile string, args []string) {
 		sessions := make([]sessionJSON, len(instances))
 		for i, inst := range instances {
 			_ = inst.UpdateStatus()
+			parentProjectPath := listParentProjectPath(inst, instances)
 			sj := sessionJSON{
-				ID:            inst.ID,
-				Title:         inst.Title,
-				Path:          inst.ProjectPath,
-				Group:         inst.GroupPath,
-				Tool:          inst.Tool,
-				Command:       inst.Command,
-				Status:        StatusString(inst.Status),
-				Substate:      string(inst.Substate()),
-				Profile:       storage.Profile(),
-				CreatedAt:     inst.CreatedAt,
-				SSHHost:       inst.SSHHost,
-				SSHRemotePath: inst.SSHRemotePath,
-				Channels:      inst.Channels,
-				ExtraArgs:     inst.ExtraArgs,
-				Color:         inst.Color,
-				Archived:      inst.IsArchived(),
-				ArchivedAt:    inst.ArchivedAt,
+				ID:                inst.ID,
+				ParentSessionID:   inst.ParentSessionID,
+				ParentProjectPath: parentProjectPath,
+				Title:             inst.Title,
+				Path:              inst.ProjectPath,
+				Group:             inst.GroupPath,
+				Tool:              inst.Tool,
+				Command:           inst.Command,
+				Status:            StatusString(inst.Status),
+				Substate:          string(inst.Substate()),
+				Profile:           storage.Profile(),
+				CreatedAt:         inst.CreatedAt,
+				SSHHost:           inst.SSHHost,
+				SSHRemotePath:     inst.SSHRemotePath,
+				Channels:          inst.Channels,
+				ExtraArgs:         inst.ExtraArgs,
+				Color:             inst.Color,
+				Archived:          inst.IsArchived(),
+				ArchivedAt:        inst.ArchivedAt,
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
 			}
 			if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
 				sj.ModelID = modelInfo.ModelID
-				sj.Model = modelInfo.Model
+				sj.Model = modelInfo.ModelID
 				sj.ModelVersion = modelInfo.Version
 			}
 			sessions[i] = sj
@@ -2316,16 +2355,18 @@ func handleListAllProfiles(jsonOutput bool) {
 
 	if jsonOutput {
 		type sessionJSON struct {
-			ID            string    `json:"id"`
-			Title         string    `json:"title"`
-			Path          string    `json:"path"`
-			Group         string    `json:"group"`
-			Tool          string    `json:"tool"`
-			Command       string    `json:"command,omitempty"`
-			Profile       string    `json:"profile"`
-			CreatedAt     time.Time `json:"created_at"`
-			SSHHost       string    `json:"ssh_host,omitempty"`
-			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
+			ID                string    `json:"id"`
+			ParentSessionID   string    `json:"parent_session_id,omitempty"`
+			ParentProjectPath string    `json:"parent_project_path,omitempty"`
+			Title             string    `json:"title"`
+			Path              string    `json:"path"`
+			Group             string    `json:"group"`
+			Tool              string    `json:"tool"`
+			Command           string    `json:"command,omitempty"`
+			Profile           string    `json:"profile"`
+			CreatedAt         time.Time `json:"created_at"`
+			SSHHost           string    `json:"ssh_host,omitempty"`
+			SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
 		}
 		var allSessions []sessionJSON
 
@@ -2340,16 +2381,18 @@ func handleListAllProfiles(jsonOutput bool) {
 			}
 			for _, inst := range instances {
 				allSessions = append(allSessions, sessionJSON{
-					ID:            inst.ID,
-					Title:         inst.Title,
-					Path:          inst.ProjectPath,
-					Group:         inst.GroupPath,
-					Tool:          inst.Tool,
-					Command:       inst.Command,
-					Profile:       profileName,
-					CreatedAt:     inst.CreatedAt,
-					SSHHost:       inst.SSHHost,
-					SSHRemotePath: inst.SSHRemotePath,
+					ID:                inst.ID,
+					ParentSessionID:   inst.ParentSessionID,
+					ParentProjectPath: listParentProjectPath(inst, instances),
+					Title:             inst.Title,
+					Path:              inst.ProjectPath,
+					Group:             inst.GroupPath,
+					Tool:              inst.Tool,
+					Command:           inst.Command,
+					Profile:           profileName,
+					CreatedAt:         inst.CreatedAt,
+					SSHHost:           inst.SSHHost,
+					SSHRemotePath:     inst.SSHRemotePath,
 				})
 			}
 		}
@@ -2399,6 +2442,24 @@ func handleListAllProfiles(jsonOutput bool) {
 
 	fmt.Printf("\n═══════════════════════════════════════\n")
 	fmt.Printf("Total: %d sessions across %d profiles\n", totalSessions, len(profiles))
+}
+
+// listParentProjectPath reports the parent path represented by the stored
+// parent id. Older SQLite rows did not persist the denormalized path field, so
+// recover it from the parent row instead of falsely reporting no relationship.
+func listParentProjectPath(inst *session.Instance, instances []*session.Instance) string {
+	if inst == nil || inst.ParentSessionID == "" {
+		return ""
+	}
+	if inst.ParentProjectPath != "" {
+		return inst.ParentProjectPath
+	}
+	for _, candidate := range instances {
+		if candidate.ID == inst.ParentSessionID {
+			return candidate.ProjectPath
+		}
+	}
+	return ""
 }
 
 // handleRemove removes a session by ID or title
@@ -2822,7 +2883,7 @@ func handleStatus(profile string, args []string) {
 				}
 				if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
 					sj.ModelID = modelInfo.ModelID
-					sj.Model = modelInfo.Model
+					sj.Model = modelInfo.ModelID
 					sj.ModelVersion = modelInfo.Version
 				}
 				resp.Sessions = append(resp.Sessions, sj)
@@ -3483,6 +3544,7 @@ func printHelp() {
 	fmt.Println("  (none)           Start the TUI")
 	fmt.Println("  add <path>       Add a new session")
 	fmt.Println("  launch [path]    Add, start, and optionally send a message in one step")
+	fmt.Println("  accounts         List configured named account slots")
 	fmt.Println("  try <name>       Quick experiment (create/find dated folder + session)")
 	fmt.Println("  list, ls         List all sessions")
 	fmt.Println("  remove, rm       Remove a session")
@@ -3502,6 +3564,8 @@ func printHelp() {
 	fmt.Println("  web              Start TUI with web UI server running alongside")
 	fmt.Println("  remote           Manage remote agent-deck instances")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
+	fmt.Println("  agents           List adopted agents, grouped by machine")
+	fmt.Println("  agent            Adopt and inspect agent definitions")
 	fmt.Println("  telegram-doctor  Audit channel-owning sessions for telegram drops (#1138)")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")

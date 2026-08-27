@@ -30,6 +30,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/agents"
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/docker"
@@ -152,6 +153,16 @@ const (
 // (shows all sessions except error/stopped). Change this constant to rebind.
 const FilterKeyActive = "%"
 
+// FilterKeyError is the keyboard shortcut for the error-only status filter.
+// Keep it distinct from CostDashboardKey: advertised keys must have exactly
+// one meaning in the overview context, regardless of whether cost tracking is
+// available.
+const FilterKeyError = "&"
+
+// CostDashboardKey opens the cost dashboard. It is deliberately not reused as
+// a conditional fallback for another action.
+const CostDashboardKey = "$"
+
 // FilterKeyArchived toggles the archived-sessions list view.
 const FilterKeyArchived = "^"
 
@@ -270,8 +281,19 @@ type Home struct {
 	feedbackState        *feedback.State       // Loaded at first show, avoids repeated disk I/O
 	feedbackSender       *feedback.Sender      // Sender constructed once in NewHome (Phase 3, per D-05)
 	watcherPanel         *WatcherPanel         // For showing watcher status and events
-	toolVisibilityPanel  *ToolVisibilityPanel  // Edits [ui].hidden_tools
-	watcherEngine        *watcher.Engine       // nil until Init (D-07: lifecycle tied to TUI startup)
+	agentsPanel          *AgentsPanel          // Agents tab: adopted agents, grouped by machine
+	// agentsView is the last built fleet view; agentBySession indexes its
+	// rows by adopted session id so the session list can mark agent-owned
+	// rows and the preview pane can render their card. Both are empty for a
+	// user who has adopted nothing, which is what keeps those surfaces
+	// invisible by default.
+	agentsView          agents.View
+	agentBySession      map[string]agents.AgentRow
+	agentsLastRefresh   time.Time
+	agentsLoaded        bool
+	agentsLoadError     string
+	toolVisibilityPanel *ToolVisibilityPanel // Edits [ui].hidden_tools
+	watcherEngine       *watcher.Engine      // nil until Init (D-07: lifecycle tied to TUI startup)
 
 	// Configurable hotkeys
 	hotkeys        map[string]string // action -> configured key
@@ -393,8 +415,9 @@ type Home struct {
 	lastCachePrune time.Time
 
 	// Hook-based status detection (Claude Code lifecycle hooks)
-	hookWatcher        *session.StatusFileWatcher
-	pendingHooksPrompt bool // True if user should be prompted to install hooks
+	hookWatcher              *session.StatusFileWatcher
+	pendingHooksPrompt       bool // True if user should be prompted to install Claude hooks
+	pendingHermesHooksPrompt bool // True if user should be prompted to install Hermes hooks
 
 	// SSE-based status detection for OpenCode sessions (issue #1614)
 	sseWatcher *session.OpenCodeSSEWatcher
@@ -433,6 +456,7 @@ type Home struct {
 	// Launching animation state (for newly created sessions)
 	launchingSessions    map[string]time.Time        // sessionID -> creation time
 	resumingSessions     map[string]time.Time        // sessionID -> resume time (for restart/resume)
+	remoteRestarting     map[string]struct{}         // remote restart operation ID -> in flight
 	mcpLoadingSessions   map[string]time.Time        // sessionID -> MCP reload time
 	forkingSessions      map[string]time.Time        // sessionID -> fork start time (fork in progress)
 	setupRunningSessions map[string]time.Time        // sessionID -> setup script start time
@@ -1417,6 +1441,10 @@ func shouldAutoInstallCursorHooks(userConfig *session.UserConfig, cursorCmd stri
 	return homeBackgroundWorkersEnabled && cursorHooksEnabled && cursorCmd != ""
 }
 
+func shouldPromptHermesHooks(installed bool, decision string) bool {
+	return !installed && decision == ""
+}
+
 // NewHomeWithProfileAndMode creates a new Home with the specified profile.
 // All instances manage the notification bar equally via shared SQLite state.
 func NewHomeWithProfileAndMode(profile string) *Home {
@@ -1481,6 +1509,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		zoxidePicker:              NewZoxidePicker(),
 		feedbackSender:            feedback.NewSender(),
 		watcherPanel:              NewWatcherPanel(),
+		agentsPanel:               NewAgentsPanel(),
 		toolVisibilityPanel:       NewToolVisibilityPanel(),
 		insertBatchDuration:       defaultInsertBatchDuration,
 		insertOpenKeySender:       defaultInsertOpenKeySender,
@@ -1500,6 +1529,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		clearOnCompactSent:        make(map[string]time.Time),
 		launchingSessions:         make(map[string]time.Time),
 		resumingSessions:          make(map[string]time.Time),
+		remoteRestarting:          make(map[string]struct{}),
 		mcpLoadingSessions:        make(map[string]time.Time),
 		forkingSessions:           make(map[string]time.Time),
 		setupRunningSessions:      make(map[string]time.Time),
@@ -1740,10 +1770,11 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		}
 	}
 
-	// Hermes shell hooks: auto-inject silently if the hermes binary is available.
-	// No user prompt needed — config.yaml is Hermes's own config file, not a
-	// shared settings file. The shared hook watcher (h.hookWatcher) covers all
-	// tools, so start it here if Claude hooks didn't already start it.
+	// Hermes shell hooks require their own consent because they mutate Hermes's
+	// config.yaml. An installed hook set predates (or embodies) consent and does
+	// not prompt. Any recorded decision suppresses future prompts; in particular,
+	// accepted hooks that are later removed stay removed because removal revokes
+	// consent rather than triggering a silent reinstall.
 	if hermesCmd := strings.TrimSpace(session.GetToolCommand("hermes")); homeBackgroundWorkersEnabled && hermesCmd != "" {
 		// GetToolCommand may return a full command string with arguments
 		// (e.g. "hermes --gateway-url=..."). LookPath needs the binary name only.
@@ -1753,14 +1784,15 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 			hermesBin := hermesFields[0]
 			if _, err := exec.LookPath(hermesBin); err == nil {
 				hermesConfigDir := session.GetHermesConfigDir()
-				if !session.CheckHermesHooksInstalled(hermesConfigDir) {
-					if _, err := session.InjectHermesHooks(hermesConfigDir); err != nil {
-						uiLog.Warn("hermes_hooks_inject_failed", slog.String("error", err.Error()))
-					} else {
-						uiLog.Info("hermes_hooks_installed", slog.String("config_dir", hermesConfigDir))
-					}
+				installed := session.CheckHermesHooksInstalled(hermesConfigDir)
+				decision := ""
+				if db := statedb.GetGlobal(); db != nil {
+					decision, _ = db.GetMeta("hermes_hooks_prompted")
 				}
-				if h.hookWatcher == nil {
+				if shouldPromptHermesHooks(installed, decision) {
+					h.pendingHermesHooksPrompt = true
+				}
+				if installed && h.hookWatcher == nil {
 					if hookWatcher, err := session.NewStatusFileWatcher(nil); err == nil {
 						h.hookWatcher = hookWatcher
 						go hookWatcher.Start()
@@ -5356,6 +5388,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.setupWizard.SetSize(msg.Width, msg.Height)
 		h.settingsPanel.SetSize(msg.Width, msg.Height)
 		h.watcherPanel.SetSize(msg.Width, msg.Height)
+		h.agentsPanel.SetSize(msg.Width, msg.Height)
 		if h.toolVisibilityPanel != nil {
 			h.toolVisibilityPanel.SetSize(msg.Width, msg.Height)
 		}
@@ -5519,9 +5552,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.reloadHotkeysFromConfig()
 
 		// Show hooks installation prompt (after splash screen is gone)
-		if h.pendingHooksPrompt && !h.setupWizard.IsVisible() {
-			h.confirmDialog.ShowInstallHooks()
-			h.confirmDialog.SetSize(h.width, h.height)
+		if !h.setupWizard.IsVisible() {
+			h.showPendingHooksPrompt()
 		}
 
 		// Show feedback popup if user has a new version and hasn't rated yet (D-11/D-12).
@@ -6295,6 +6327,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, h.fetchRemoteSessions
 
 	case remoteSessionRestartedMsg:
+		delete(h.remoteRestarting, remoteRestartAnimationID(msg.remoteName, msg.sessionID))
+		delete(h.resumingSessions, remoteRestartAnimationID(msg.remoteName, msg.sessionID))
 		if msg.err != nil {
 			h.setError(fmt.Errorf("failed to restart remote session: %w", msg.err))
 			return h, nil
@@ -7021,6 +7055,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h, tea.Batch(focusCmd, h.tick())
 		}
 
+		// Keep the agents index current so the ⚙ marker and the preview
+		// card reflect live state without the panel being open. Internally
+		// rate-limited, and a no-op when nothing has been adopted.
+		h.refreshAgentsPanel()
+
 		var remoteFetchCmd tea.Cmd
 		var remoteLatencyCmd tea.Cmd
 
@@ -7292,6 +7331,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Handle watcher panel (before settings panel)
+		if h.agentsPanel.IsVisible() {
+			var cmd tea.Cmd
+			h.agentsPanel, cmd = h.agentsPanel.Update(msg)
+			return h, cmd
+		}
 		if h.watcherPanel.IsVisible() {
 			var cmd tea.Cmd
 			h.watcherPanel, cmd = h.watcherPanel.Update(msg)
@@ -8204,6 +8248,7 @@ func (h *Home) hasModalVisible() bool {
 		h.setupWizard.IsVisible() || h.settingsPanel.IsVisible() ||
 		(h.toolVisibilityPanel != nil && h.toolVisibilityPanel.IsVisible()) ||
 		h.watcherPanel.IsVisible() || // hotkeyWatcherPanel overlay
+		h.agentsPanel.IsVisible() || // hotkeyAgentsPanel overlay
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
 		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
@@ -8453,16 +8498,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return h.tryQuit()
 
-	case "U":
+	case "esc":
 		// Dismiss the >5-releases-behind update nudge for this session.
-		// Only meaningful when the nudge is actually showing — otherwise
-		// fall through so other "U"-bound paths can handle it.
 		if h.shouldRenderUpdateNudge() {
 			h.handleUpdateNudgeDismiss(msg)
 			return h, nil
 		}
-
-	case "esc":
 		// Dismiss maintenance banner if visible
 		if h.maintenanceMsg != "" {
 			h.maintenanceMsg = ""
@@ -9240,6 +9281,18 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.watcherPanel.SetSize(h.width, h.height)
 		return h, nil
 
+	case defaultHotkeyBindings[hotkeyAgentsPanel]:
+		// Open the Agents tab. Opt-in by presence: with nothing adopted there
+		// is no panel to open and the key stays inert, so a zero-config deck
+		// is unchanged.
+		h.refreshAgentsPanel()
+		if !h.agentsPanel.HasAgents() && h.agentsLoadError == "" {
+			return h, nil
+		}
+		h.agentsPanel.Show()
+		h.agentsPanel.SetSize(h.width, h.height)
+		return h, nil
+
 	case "E":
 		// Exec an interactive shell inside the sandbox container.
 		if selected := h.getSelectedSession(); selected != nil && selected.IsSandboxed() &&
@@ -9683,6 +9736,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return h, h.restartSession(item.Session)
 				}
 			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
+				restartID := remoteRestartAnimationID(item.RemoteName, item.RemoteSession.ID)
+				if _, restarting := h.remoteRestarting[restartID]; restarting {
+					h.setError(fmt.Errorf("remote session is restarting, please wait..."))
+					return h, nil
+				}
+				h.remoteRestarting[restartID] = struct{}{}
+				h.resumingSessions[restartID] = time.Now()
 				return h, h.restartRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
 			}
 		}
@@ -9912,14 +9972,18 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.rebuildFlatItems()
 		return h, nil
 
-	case "$", "shift+4":
-		// Cost dashboard (when cost tracking is active), otherwise filter to error sessions
-		if h.costStore != nil {
-			h.showCostDashboard = true
-			h.costDashboard = newCostDashboard(h.costStore, h.width, h.height)
+	case CostDashboardKey, "shift+4":
+		// Cost dashboard (when cost tracking is active).
+		if h.costStore == nil {
+			h.setError(fmt.Errorf("Cost Dashboard unavailable: state database is missing; restart agent-deck with a writable config directory to enable it"))
 			return h, nil
 		}
-		// Fallback: filter to error sessions only
+		h.showCostDashboard = true
+		h.costDashboard = newCostDashboard(h.costStore, h.width, h.height)
+		return h, nil
+
+	case FilterKeyError, "shift+7":
+		// Filter to error sessions only.
 		if h.statusFilter == session.StatusError {
 			h.statusFilter = "" // Toggle off
 		} else {
@@ -10005,16 +10069,28 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case ConfirmInstallHooks:
+	case ConfirmInstallHooks, ConfirmInstallHermesHooks:
 		switch msg.String() {
 		case "y", "Y":
+			if h.confirmDialog.GetConfirmType() == ConfirmInstallHermesHooks {
+				return h, h.confirmInstallHermesHooks()
+			}
 			return h, h.confirmInstallHooks()
 		case "enter":
 			if h.confirmDialog.GetFocusedButton() == 0 {
+				if h.confirmDialog.GetConfirmType() == ConfirmInstallHermesHooks {
+					return h, h.confirmInstallHermesHooks()
+				}
 				return h, h.confirmInstallHooks()
+			}
+			if h.confirmDialog.GetConfirmType() == ConfirmInstallHermesHooks {
+				return h, h.declineInstallHermesHooks()
 			}
 			return h, h.declineInstallHooks()
 		case "n", "N", "esc":
+			if h.confirmDialog.GetConfirmType() == ConfirmInstallHermesHooks {
+				return h, h.declineInstallHermesHooks()
+			}
 			return h, h.declineInstallHooks()
 		}
 		return h, nil
@@ -10156,6 +10232,7 @@ func (h *Home) confirmInstallHooks() tea.Cmd {
 	if db := statedb.GetGlobal(); db != nil {
 		_ = db.SetMeta("hooks_prompted", "accepted")
 	}
+	h.showPendingHooksPrompt()
 	return nil
 }
 
@@ -10167,6 +10244,51 @@ func (h *Home) declineInstallHooks() tea.Cmd {
 	if db := statedb.GetGlobal(); db != nil {
 		_ = db.SetMeta("hooks_prompted", "declined")
 	}
+	h.showPendingHooksPrompt()
+	return nil
+}
+
+func (h *Home) showPendingHooksPrompt() {
+	if h.pendingHooksPrompt {
+		h.confirmDialog.ShowInstallHooks()
+	} else if h.pendingHermesHooksPrompt {
+		h.confirmDialog.ShowInstallHermesHooks(filepath.Join(session.GetHermesConfigDir(), "config.yaml"), session.HermesHookEventsForInstall())
+	} else {
+		return
+	}
+	h.confirmDialog.SetSize(h.width, h.height)
+}
+
+func (h *Home) confirmInstallHermesHooks() tea.Cmd {
+	h.confirmDialog.Hide()
+	h.pendingHermesHooksPrompt = false
+	configDir := session.GetHermesConfigDir()
+	if _, err := session.InjectHermesHooks(configDir); err != nil {
+		uiLog.Warn("hermes_hooks_install_failed", slog.String("error", err.Error()))
+		return nil
+	}
+	if db := statedb.GetGlobal(); db != nil {
+		_ = db.SetMeta("hermes_hooks_prompted", "accepted")
+	}
+	if h.hookWatcher == nil {
+		if hookWatcher, err := session.NewStatusFileWatcher(nil); err != nil {
+			uiLog.Warn("hook_watcher_init_failed", slog.String("error", err.Error()))
+		} else {
+			h.hookWatcher = hookWatcher
+			go hookWatcher.Start()
+		}
+	}
+	h.showPendingHooksPrompt()
+	return nil
+}
+
+func (h *Home) declineInstallHermesHooks() tea.Cmd {
+	h.confirmDialog.Hide()
+	h.pendingHermesHooksPrompt = false
+	if db := statedb.GetGlobal(); db != nil {
+		_ = db.SetMeta("hermes_hooks_prompted", "declined")
+	}
+	h.showPendingHooksPrompt()
 	return nil
 }
 
@@ -13468,6 +13590,10 @@ type remoteSessionRestartedMsg struct {
 	err        error
 }
 
+func remoteRestartAnimationID(remoteName, sessionID string) string {
+	return "remote:" + remoteName + ":" + sessionID
+}
+
 type remoteSessionCreatedMsg struct {
 	err error
 }
@@ -14418,6 +14544,9 @@ func (h *Home) renderFrame() string {
 	}
 
 	// Watcher panel is modal (before settings panel)
+	if h.agentsPanel.IsVisible() {
+		return h.agentsPanel.View()
+	}
 	if h.watcherPanel.IsVisible() {
 		return h.watcherPanel.View()
 	}
@@ -15616,7 +15745,7 @@ func (h *Home) renderHelpBarWidthAdaptive() string {
 	switch {
 	case h.width < 70:
 		return h.renderHelpBarMinimal()
-	case h.width < 100:
+	case h.width <= 100:
 		return h.renderHelpBarCompact()
 	default:
 		return h.renderHelpBarFull()
@@ -15807,6 +15936,13 @@ func (h *Home) renderHelpBarCompact() string {
 			if key := h.actionKey(hotkeyRestart); key != "" {
 				contextHints = append(contextHints, h.helpKeyShort(key, "Restart"))
 			}
+			// Skills is a primary selected-session action. Keep it ahead of the
+			// rarer optional actions so the width fitter retains it at 100 cols.
+			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
+				if key := h.actionKey(hotkeySkillsManager); key != "" {
+					contextHints = append(contextHints, h.helpKeyShort(key, "Skills"))
+				}
+			}
 			if item.Session != nil && item.Session.CanRestartFresh() && restartFreshKey != "" {
 				contextHints = append(contextHints, h.helpKeyShort(restartFreshKey, "Fresh"))
 			}
@@ -15821,11 +15957,6 @@ func (h *Home) renderHelpBarCompact() string {
 				}
 				if key := h.actionKey(hotkeyTogglePreview); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, h.previewModeShort()))
-				}
-			}
-			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
-				if key := h.actionKey(hotkeySkillsManager); key != "" {
-					contextHints = append(contextHints, h.helpKeyShort(key, "Skills"))
 				}
 			}
 			if key := h.actionKey(hotkeyCopyOutput); key != "" {
@@ -15881,12 +16012,13 @@ func (h *Home) renderHelpBarCompact() string {
 
 	leftPart := strings.Join(contextHints, " ")
 	rightPart := globalHints
-	padding := h.width - lipgloss.Width(leftPart) - lipgloss.Width(rightPart) - 4
-	if padding < 2 {
-		// Content too wide for one line — drop right part to avoid overflow
-		padding = 2
-		rightPart = ""
+	// Drop lowest-priority context hints as whole units. MaxWidth alone can
+	// truncate a label (notably "Skills") halfway through at exactly 100 cols.
+	for len(contextHints) > 0 && lipgloss.Width(leftPart)+lipgloss.Width(rightPart)+6 > h.width {
+		contextHints = contextHints[:len(contextHints)-1]
+		leftPart = strings.Join(contextHints, " ")
 	}
+	padding := max(2, h.width-lipgloss.Width(leftPart)-lipgloss.Width(rightPart)-4)
 
 	content := leftPart + sep + strings.Repeat(" ", padding) + rightPart
 
@@ -16540,15 +16672,34 @@ func (h *Home) buildGroupRenderStats(snapshot map[string]sessionRenderState) map
 		return stats
 	}
 
+	// #1987: count the partition being rendered, not the whole slice. A group's
+	// Sessions holds active and archived rows together while the deck renders
+	// exactly one partition at a time (rebuildFlatItems keeps only the rows whose
+	// IsArchived matches the current view), so a raw len() reports sessions the
+	// header is not heading — `demo (5)` above two rows, or `My Sessions (180)`
+	// above 19. The running/waiting tallies are wrong for a second reason that
+	// the same filter fixes: archiving does not reset Status and the status
+	// updater skips archived sessions (see shouldPollStatusInLoop), so an archived
+	// session contributes whatever it was doing when it was archived, forever.
+	//
+	// The rule is partition-aware rather than archive-excluding: in the archived
+	// view (^) the header must count archived rows, because those are the rows
+	// underneath it. Same shape as SameArchivePartition in the reorder path.
+	viewArchived := h.statusFilter == FilterModeArchived
+
 	for path, g := range h.groupTree.Groups {
 		if g == nil {
 			continue
 		}
 
-		directSessions := len(g.Sessions)
+		directSessions := 0
 		directRunning := 0
 		directWaiting := 0
 		for _, sess := range g.Sessions {
+			if sess.IsArchived() != viewArchived {
+				continue
+			}
+			directSessions++
 			state, ok := snapshot[sess.ID]
 			status := sess.Status
 			if ok {
@@ -17022,6 +17173,22 @@ func (h *Home) renderSessionItem(
 		sshBadge = sshStyle.Render(" [ssh:" + host + "]")
 	}
 
+	// Agent marker for a session owned by an adopted agent.
+	//
+	// Deliberately one glyph and nothing more. The role, its version, its
+	// triggers and its connector health belong in the preview panel's agent
+	// card, where there is room to be honest about them; crowding them onto
+	// the row would cost the scannability the list depends on. A deck with
+	// nothing adopted has an empty index, so no marker renders at all.
+	agentBadge := ""
+	if _, owned := h.agentRowForSession(inst.ID); owned {
+		agStyle := lipgloss.NewStyle().Foreground(ColorCyan)
+		if selected {
+			agStyle = SessionStatusSelStyle
+		}
+		agentBadge = agStyle.Render(" ⚙")
+	}
+
 	// Last-update timestamp badge — see pickBadgeTime for the formula.
 	// Selected rows reuse the selection-bar style instead of dim, so the
 	// badge stays legible inside the highlight.
@@ -17084,7 +17251,7 @@ func (h *Home) renderSessionItem(
 			cellWidth(status) + 1 /* space before title */ + cellWidth(tool) +
 			cellWidth(maestroBadge) + cellWidth(yoloBadge) + cellWidth(worktreeBadge) +
 			cellWidth(sandboxBadge) + cellWidth(multiRepoBadge) + cellWidth(sshBadge) +
-			cellWidth(timestampBadge)
+			cellWidth(agentBadge) + cellWidth(timestampBadge)
 		budget := listWidth - reserved - 1 // -1 trailing margin
 		if budget > 0 && cellWidth(displayTitle) > budget {
 			displayTitle = cellTruncate(displayTitle, budget, "…")
@@ -17096,7 +17263,7 @@ func (h *Home) renderSessionItem(
 	// The leading gutter (leftGutterWidth) keeps sessions aligned with group
 	// rows, which reserve the same gutter for root hotkey numbers.
 	row := fmt.Sprintf(
-		"%s%s%s%s%s%s %s%s%s%s%s%s%s%s%s",
+		"%s%s%s%s%s%s %s%s%s%s%s%s%s%s%s%s",
 		strings.Repeat(" ", leftGutterWidth),
 		baseIndent,
 		selectionPrefix,
@@ -17111,6 +17278,7 @@ func (h *Home) renderSessionItem(
 		sandboxBadge,
 		multiRepoBadge,
 		sshBadge,
+		agentBadge,
 		timestampBadge,
 	)
 
@@ -18022,6 +18190,15 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	b.WriteString(groupBadge)
 	b.WriteString("\n")
 
+	// Agent card. When the selected session belongs to an adopted agent, its
+	// role, triggers, connector health and recent ledger entries render here
+	// — high in the preview, where there is room to be accurate — instead of
+	// being crushed into the session row, which carries only the ⚙ marker.
+	// Sessions with no agent, and decks with nothing adopted, render nothing.
+	if agentRow, owned := h.agentRowForSession(selected.ID); owned {
+		b.WriteString(h.renderAgentCard(agentRow, width))
+	}
+
 	// Worktree info section (for sessions running in git worktrees)
 	if selected.IsWorktree() {
 		wtHeader := renderSectionDivider("Worktree", width-4)
@@ -18598,6 +18775,11 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
 
 		b.WriteString(warnStyle.Render("✕ No tmux session running"))
+		if restartKey := h.actionKey(hotkeyRestart); restartKey != "" {
+			b.WriteString("   ")
+			b.WriteString(keyStyle.Render(restartKey))
+			b.WriteString(dimStyle.Render(" Restart"))
+		}
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("This can happen if:"))
 		b.WriteString("\n")
@@ -18609,12 +18791,6 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("Actions:"))
 		b.WriteString("\n")
-		if restartKey := h.actionKey(hotkeyRestart); restartKey != "" {
-			b.WriteString("  ")
-			b.WriteString(keyStyle.Render(restartKey))
-			b.WriteString(dimStyle.Render(" Start   - create and start tmux session"))
-			b.WriteString("\n")
-		}
 		if selected.CanRestartFresh() {
 			if restartFreshKey := h.actionKey(hotkeyRestartFresh); restartFreshKey != "" {
 				b.WriteString("  ")
@@ -20226,7 +20402,7 @@ func (h *Home) renderFilterBarHint() string {
 		mark("!", h.statusFilter == session.StatusRunning) +
 		mark("@", h.statusFilter == session.StatusWaiting) +
 		mark("#", h.statusFilter == session.StatusIdle) +
-		mark("$", h.statusFilter == session.StatusError) +
+		mark(FilterKeyError, h.statusFilter == session.StatusError) +
 		dim.Render(" filter • ") +
 		mark("0", h.statusFilter == "") +
 		dim.Render(" all • ") +

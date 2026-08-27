@@ -99,6 +99,7 @@ agent-deck web                    # Start web UI on http://127.0.0.1:8420
 | Key | Action |
 |-----|--------|
 | `Enter` | Attach to session |
+| `Ctrl+Q` | Detach from session |
 | `n` | New session |
 | `f` / `F` | Fork (quick / dialog) |
 | `A` / `Shift+U` | Archive / unarchive session |
@@ -228,6 +229,10 @@ Closes [issue #602](https://github.com/asheshgoplani/agent-deck/issues/602).
 
 #### Switch a session's account on the fly
 
+For a new one-shot session, use `agent-deck launch . -c claude --account <name>`.
+Run `agent-deck accounts` (or `agent-deck accounts --json`) to list named slots
+configured under `[profiles.<name>.claude].config_dir`.
+
 `agent-deck session switch-account <session> <account>` moves an existing session to another Claude account — **conversation included**. The session stops, its conversation file is migrated into the target account's config dir (copy-only, with a destination backup and size verification), the account is set, and the session restarts with `--resume`. `session set <session> account <name>` auto-migrates too.
 
 ### Session naming
@@ -262,7 +267,7 @@ Running many sessions? Socket pooling shares MCP processes across all sessions v
 
 ### Search
 
-Press `/` to fuzzy-search across all sessions. Filter by status with `!` (running), `@` (waiting), `#` (idle), `$` (error). Press `G` for global search across all Claude conversations.
+Press `/` to fuzzy-search across all sessions. Filter by status with `!` (running), `@` (waiting), `#` (idle), `&` (error). Press `$` for the Cost Dashboard and `G` for global search across all Claude conversations.
 
 ### Keyboard navigation (v1.7.60)
 
@@ -879,12 +884,17 @@ agent-deck remote sessions dev
 # Attach to a remote session
 agent-deck remote attach dev my-session
 
+# Pull finished/stalled reports from a remote into this machine's inbox
+agent-deck remote drain dev
+
 # Keep remote binaries up to date
 agent-deck remote update          # all remotes
 agent-deck remote update dev      # specific remote
 ```
 
-Remote configuration is stored under `[remotes]` in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`). `remote list` and `remote sessions` support `--json` output for scripting. See the [Remote Commands reference](skills/agent-deck/references/cli-reference.md#remote-commands) for flags, security behavior, and examples.
+A conductor that launches workers on another host does not get their completions for free: transition notifications are parent-linked, and a `parent_session_id` cannot point across machines. `remote drain <name>` closes that gap by pulling — it reads the remote's records over the same SSH path (consuming nothing there) and writes them into the local inbox, safe to run on every heartbeat and safe to repeat.
+
+Remote configuration is stored under `[remotes]` in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`). `remote list`, `remote sessions` and `remote drain` support `--json` output for scripting. See the [Remote Commands reference](skills/agent-deck/references/cli-reference.md#remote-commands) for flags, security behavior, and examples.
 
 Pressing `n` on a remote group or session opens the full new-session dialog in **remote mode**: path suggestions come from the remote host, the remote session's group is pre-filled, and the create routes over SSH with your chosen tool — sessions are never accidentally created on localhost.
 

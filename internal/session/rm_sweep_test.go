@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -30,6 +31,9 @@ func TestRm_SweepsConductorInboxes(t *testing.T) {
 	keepChild := "child-survivor"
 	conductors := []string{"conductor-alpha", "conductor-bravo", "conductor-charlie"}
 
+	// idx also drives the turn signal: since #1948 the event fingerprint keys
+	// on the turn rather than the emit instant, so distinct events must differ
+	// by something real for the sweep to have four lines to remove.
 	mkEvent := func(child string, idx int) TransitionNotificationEvent {
 		return TransitionNotificationEvent{
 			ChildSessionID:  child,
@@ -37,6 +41,7 @@ func TestRm_SweepsConductorInboxes(t *testing.T) {
 			Profile:         "_test",
 			FromStatus:      "running",
 			ToStatus:        "waiting",
+			LastOutputHash:  fmt.Sprintf("turn-%d", idx),
 			Timestamp:       time.Now().Add(time.Duration(idx) * time.Second),
 			TargetSessionID: conductors[idx%len(conductors)],
 			TargetKind:      "conductor",

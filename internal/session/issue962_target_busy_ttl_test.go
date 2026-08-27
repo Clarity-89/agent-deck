@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -98,12 +99,17 @@ func TestTransitionNotifier_SweepInboxByTuple_DropsMatching(t *testing.T) {
 	})
 
 	parent := "parent-962-tuple"
+	// LastOutputHash carries the turn identity: since #1948 the event
+	// fingerprint keys on it rather than on the emit instant, so two entries
+	// that share a (child, from, to) tuple need distinct turns to be two
+	// records. The sweep under test still matches on the tuple alone.
 	mk := func(child, from, to string, ago time.Duration) TransitionNotificationEvent {
 		return TransitionNotificationEvent{
 			ChildSessionID:  child,
 			Profile:         "_test",
 			FromStatus:      from,
 			ToStatus:        to,
+			LastOutputHash:  fmt.Sprintf("%s-%s-%s-%s", child, from, to, ago),
 			Timestamp:       time.Now().Add(-ago),
 			TargetSessionID: parent,
 			TargetKind:      "parent",
@@ -112,7 +118,7 @@ func TestTransitionNotifier_SweepInboxByTuple_DropsMatching(t *testing.T) {
 	}
 	rows := []TransitionNotificationEvent{
 		mk("pepper", "running", "waiting", 3*time.Hour),
-		mk("pepper", "running", "waiting", 2*time.Hour), // duplicate tuple, different ts
+		mk("pepper", "running", "waiting", 2*time.Hour), // duplicate tuple, different turn
 		mk("pepper", "waiting", "running", 1*time.Hour), // SAME child, different tuple
 		mk("garlic", "running", "waiting", 1*time.Hour), // different child
 	}
