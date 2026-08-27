@@ -1366,6 +1366,16 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	cols, rows := InitialWindowSize()
 	tmuxArgs := buildInnerTmuxArgs(s.SocketName, "new-session", "-d", "-s", s.Name, "-c", workDir,
 		"-x", strconv.Itoa(cols), "-y", strconv.Itoa(rows))
+	// Per-launch kill-scope marker (see kill_scope.go). `-e` puts it in
+	// every pane descendant's environment and in the tmux session
+	// environment, where killInternal reads it back to sweep daemonized
+	// survivors that left the pane tree. Gated on tmux >= 3.2 (`-e`
+	// support); older tmux gets no marker and no sweep.
+	if supportsNewSessionEnvFlag() {
+		if scope := newKillScopeValue(s.InstanceID); scope != "" {
+			tmuxArgs = append(tmuxArgs, "-e", KillScopeEnvKey+"="+scope)
+		}
+	}
 	if startWithInitialProcess {
 		// Deliver the pane command as SEPARATE argv tokens (bash, -c, command)
 		// rather than a single shell-quoted string. This is the crux of the

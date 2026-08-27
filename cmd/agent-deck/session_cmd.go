@@ -398,8 +398,10 @@ func handleSessionStop(profile string, args []string) {
 	// Must happen before Kill() because tmux show-environment fails on dead sessions.
 	inst.SyncSessionIDsFromTmux()
 
-	// Stop the session by killing the tmux session
-	if err := inst.Kill(); err != nil {
+	// Stop the session by killing the tmux session. Synchronous variant:
+	// the CLI exits right after, and an async Kill's background reaping
+	// (process tree + kill-scope sweep) would die with it (issue #59).
+	if err := inst.KillAndWait(); err != nil {
 		out.Error(fmt.Sprintf("failed to stop session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -500,7 +502,8 @@ func handleSessionArchive(profile string, args []string) {
 	// session's normal lifecycle already persists its tool ids.
 	killed := false
 	if inst.Exists() {
-		if err := inst.Kill(); err != nil {
+		// KillAndWait: short-lived CLI, async reaping would be aborted on exit.
+		if err := inst.KillAndWait(); err != nil {
 			out.Error(fmt.Sprintf("failed to stop session: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}

@@ -552,9 +552,10 @@ func handleWorktreeCleanup(profile string, args []string) {
 	// Remove orphaned sessions
 	removedSessions := 0
 	for _, inst := range orphanedSessions {
-		// Kill tmux session if it exists
+		// Kill tmux session if it exists. KillAndWait: short-lived CLI,
+		// async reaping would be aborted on exit.
 		if inst.Exists() {
-			if err := inst.Kill(); err != nil {
+			if err := inst.KillAndWait(); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to kill tmux session %s: %v\n", inst.Title, err)
 			}
 		}
@@ -782,9 +783,10 @@ func handleWorktreeFinish(profile string, args []string) {
 		}
 	}
 
-	// Step 4: Kill tmux session
+	// Step 4: Kill tmux session. KillAndWait: short-lived CLI, async
+	// reaping would be aborted on exit.
 	if inst.Exists() {
-		if err := inst.Kill(); err != nil {
+		if err := inst.KillAndWait(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to kill tmux session: %v\n", err)
 		}
 	}

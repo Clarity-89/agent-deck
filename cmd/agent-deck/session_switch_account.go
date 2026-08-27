@@ -144,7 +144,8 @@ func handleSessionSwitchAccount(profile string, args []string) {
 	// Stop a running session so its conversation file is final before the
 	// copy, now that the ambiguity preflight above has passed.
 	if wasRunning {
-		if err := inst.Kill(); err != nil {
+		// KillAndWait: short-lived CLI, async reaping would be aborted on exit.
+		if err := inst.KillAndWait(); err != nil {
 			out.Error(fmt.Sprintf("failed to stop session before switch: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}

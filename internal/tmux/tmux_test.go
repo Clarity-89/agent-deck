@@ -3035,7 +3035,7 @@ func TestStartCommandSpec_Default(t *testing.T) {
 	launcher, args := s.startCommandSpec("/tmp/project", "")
 	assert.Equal(t, "tmux", launcher)
 	assert.Equal(t, []string{"-u", "new-session", "-d", "-s", "agentdeck_test-session_1234abcd", "-c", "/tmp/project",
-		"-x", "173", "-y", "41"}, args)
+		"-x", "173", "-y", "41"}, stripKillScopeArgs(t, args))
 }
 
 func TestStartCommandSpec_UserScope(t *testing.T) {
@@ -3053,7 +3053,7 @@ func TestStartCommandSpec_UserScope(t *testing.T) {
 	assert.Equal(t, []string{"--user", "--scope", "--quiet", "--collect", "--unit"}, args[:5])
 	assert.Equal(t, "agentdeck-tmux-agentdeck-test-session-1234abcd", args[5])
 	assert.Equal(t, []string{"tmux", "-u", "new-session", "-d", "-s", "agentdeck_test-session_1234abcd", "-c", "/tmp/project",
-		"-x", "173", "-y", "41"}, args[6:])
+		"-x", "173", "-y", "41"}, stripKillScopeArgs(t, args[6:]))
 }
 
 // TestStartCommandSpec_InitialProcess_WrapsBashRegardlessOfContent is the
@@ -3069,6 +3069,22 @@ func TestStartCommandSpec_UserScope(t *testing.T) {
 // matched neither trigger, so the command was passed directly to tmux,
 // which invoked the user's default-shell (fish) — and fish could not
 // parse the bash syntax, causing the pane to exit immediately.
+// stripKillScopeArgs removes the `-e AGENTDECK_KILL_SCOPE=…` pair from
+// new-session args so tests asserting the exact remaining argv shape
+// are independent of the per-launch marker (kill_scope.go).
+func stripKillScopeArgs(t *testing.T, args []string) []string {
+	t.Helper()
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-e" && i+1 < len(args) && strings.HasPrefix(args[i+1], KillScopeEnvKey+"=") {
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
+}
+
 func TestStartCommandSpec_InitialProcess_WrapsBashRegardlessOfContent(t *testing.T) {
 	cases := []struct {
 		name string
@@ -3106,6 +3122,10 @@ func TestStartCommandSpec_InitialProcess_WrapsBashRegardlessOfContent(t *testing
 
 			launcher, args := s.startCommandSpec("/tmp/project", tc.cmd)
 			require.Equal(t, "tmux", launcher)
+			// The kill-scope marker (-e AGENTDECK_KILL_SCOPE=…) is
+			// per-launch random and version-gated; strip it so the argv
+			// contract below stays exact.
+			args = stripKillScopeArgs(t, args)
 			// #1567/#1580: the command is delivered as SEPARATE argv tokens
 			// (bash, -c, COMMAND) so tmux execvp()s bash directly instead of
 			// wrapping the string through the server default-shell. With the

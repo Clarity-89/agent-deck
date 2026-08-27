@@ -840,7 +840,8 @@ func handleConductorTeardown(_ string, args []string) {
 				for _, inst := range instances {
 					if inst.Title == sessionTitle {
 						if inst.Exists() {
-							_ = inst.Kill()
+							// KillAndWait: short-lived CLI, async reaping would be aborted on exit.
+							_ = inst.KillAndWait()
 						}
 						if !*jsonOutput {
 							fmt.Printf("  [ok] %s stopped\n", sessionTitle)

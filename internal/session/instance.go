@@ -8172,6 +8172,23 @@ func (i *Instance) KillAndWait() error {
 	return i.killInternal(true)
 }
 
+// logKillScopeSweep reports env-sweep outcomes; scan failure must be
+// visible, not read as "no survivors".
+func logKillScopeSweep(instanceID string, res tmux.SweepResult, err error) {
+	if err != nil {
+		sessionLog.Warn("kill_scope_sweep_failed",
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()))
+		return
+	}
+	if len(res.Matched) > 0 {
+		sessionLog.Info("kill_scope_sweep_reaped",
+			slog.String("instance", instanceID),
+			slog.Any("killed", res.Killed),
+			slog.Any("survivors", res.Survivors))
+	}
+}
+
 func (i *Instance) killInternal(sync bool) error {
 	// #1580/#1775: supersede any in-flight fast-death watcher BEFORE the tmux
 	// kill (not after). watchForFastDeath only writes a SpawnFailureRecord /
@@ -8197,6 +8214,19 @@ func (i *Instance) killInternal(sync bool) error {
 	// PID 1 and accumulate. SIGTERM with a short grace period, then
 	// SIGKILL anything still alive.
 	i.reapTrackedMCPChildren()
+
+	// Read the per-launch kill-scope marker BEFORE the tmux session dies —
+	// show-environment needs a live session, and the marker is the only
+	// handle on children that daemonized out of the pane tree (nx daemons,
+	// dev servers) and so are invisible to every pane-walk above. Sandbox
+	// sessions are excluded (container removal is the authoritative
+	// teardown; a host scan could reach into a kept container); SSH
+	// sessions are excluded (their processes are remote — a local sweep
+	// cannot reach them).
+	var killScope string
+	if i.tmuxSession != nil && !i.IsSandboxed() && !i.IsSSH() {
+		killScope, _ = i.tmuxSession.GetEnvironment(tmux.KillScopeEnvKey)
+	}
 
 	// Issue #953: kill the tmux session AND publish StatusStopped
 	// atomically under i.mu so concurrent UpdateStatus() callers (most
@@ -8237,6 +8267,26 @@ func (i *Instance) killInternal(sync bool) error {
 	// see the comment there for why it must happen first, not here.)
 	if i.Tool == "hermes" {
 		i.clearHermesHookArtifacts()
+	}
+
+	// Sweep daemonized survivors by their inherited kill-scope marker.
+	// Synchronous on the KillAndWait path so short-lived CLI processes
+	// finish the reap before exiting (issue #59's lesson); a goroutine on
+	// the TUI path, matching tmux.Kill's background ensureProcessesDead.
+	// Scope values are unique per launch, so a late async sweep can never
+	// touch a restarted session's new process tree. Best-effort: failures
+	// are logged, never fail the delete.
+	if killScope != "" {
+		instanceID, scope := i.ID, killScope
+		sweep := func() {
+			res, err := tmux.SweepProcessesWithEnvValue(tmux.KillScopeEnvKey, scope, 3*time.Second)
+			logKillScopeSweep(instanceID, res, err)
+		}
+		if sync {
+			sweep()
+		} else {
+			go sweep()
+		}
 	}
 
 	// Clean up sandbox container (only if name matches our prefix convention).
