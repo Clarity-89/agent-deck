@@ -26,6 +26,7 @@ const (
 	hotkeySkillsManager    = "skills_manager"
 	hotkeyTogglePreview    = "toggle_preview"
 	hotkeyCycleGroupView   = "cycle_group_view"
+	hotkeyCycleTimeFilter  = "cycle_time_filter"
 	hotkeyMarkUnread       = "mark_unread"
 	hotkeyQuickApprove     = "quick_approve"
 	hotkeyPromptSession    = "prompt_session" // #1410: prompt the highlighted session without attaching
@@ -48,6 +49,8 @@ const (
 	hotkeySettings         = "settings"
 	hotkeyImport           = "import"
 	hotkeyReload           = "reload"
+	hotkeyRestartDeck      = "restart_deck"   // in-place TUI restart after an update landed on disk (restart.go)
+	hotkeyInstallUpdate    = "install_update" // run `agent-deck update` from the TUI (update_install.go)
 	hotkeyDetach           = "detach"
 	hotkeyWatcherPanel     = "watcher_panel"
 	// hotkeyAgentsPanel opens the Agents tab.
@@ -103,6 +106,7 @@ var hotkeyActionOrder = []string{
 	hotkeySkillsManager,
 	hotkeyTogglePreview,
 	hotkeyCycleGroupView,
+	hotkeyCycleTimeFilter,
 	hotkeyMarkUnread,
 	hotkeyQuickApprove,
 	hotkeyPromptSession,
@@ -125,6 +129,8 @@ var hotkeyActionOrder = []string{
 	hotkeySettings,
 	hotkeyImport,
 	hotkeyReload,
+	hotkeyRestartDeck,
+	hotkeyInstallUpdate,
 	hotkeyDetach,
 	hotkeyWatcherPanel,
 	hotkeyAgentsPanel,
@@ -150,6 +156,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeySkillsManager:    "s",
 	hotkeyTogglePreview:    "v",
 	hotkeyCycleGroupView:   "t",
+	hotkeyCycleTimeFilter:  "*",
 	hotkeyMarkUnread:       "u",
 	hotkeyQuickApprove:     "a",
 	hotkeyPromptSession:    "o",
@@ -172,6 +179,8 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeySettings:         "S",
 	hotkeyImport:           "i",
 	hotkeyReload:           "ctrl+r",
+	hotkeyRestartDeck:      "ctrl+t",
+	hotkeyInstallUpdate:    "ctrl+y",
 	hotkeyDetach:           "ctrl+q",
 	hotkeyWatcherPanel:     "w",
 	hotkeyAgentsPanel:      "alt+a",
