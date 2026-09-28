@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/events"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
@@ -29,7 +30,10 @@ func handleNotifyDaemon(args []string) {
 		fmt.Println()
 		fmt.Println("Run status-driven transition notification daemon.")
 	}
-	if helpRequested(args) {
+	// notify-daemon takes no positional operands (only --once), so a bare
+	// "help" can never collide with a legitimate data value; treat it the
+	// same as --help/-h (issue #2025).
+	if hooksHelpRequested(args) {
 		fs.Usage()
 		return
 	}
@@ -56,6 +60,11 @@ func handleNotifyDaemon(args []string) {
 		"debug", os.Getenv("AGENTDECK_DEBUG") != "",
 	)
 
+	// Review round 2 (P1-A/P1-B): the hook half of the spine must not stay
+	// broken until an operator runs `hooks install`. Repair a dangling,
+	// stale-version or marker-less install before the first sync pass.
+	healClaudeHooksAtDaemonStart()
+
 	daemon := session.NewTransitionDaemon()
 	if *once {
 		daemon.SyncOnce(context.Background())
@@ -67,6 +76,8 @@ func handleNotifyDaemon(args []string) {
 		return
 	}
 
+	defer startRuntimeHealth("", "notify-daemon")()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -77,8 +88,16 @@ func handleNotifyDaemon(args []string) {
 	// belt-and-suspenders backstop for environments without this watcher.
 	go watchBinaryVersion(ctx, cancel)
 
+	// A headless machine running only notify-daemon (no `web --no-tui`, no
+	// open TUI) previously had nothing polling GitHub between runs of the
+	// daily update timer: near-event-driven updates need every long-running
+	// process to poll, not just the ones with a UI. Same installer, same
+	// gates (auto_install, suppression, Homebrew) as `web --no-tui` uses.
+	startHeadlessAutoInstall(ctx)
+
 	if err := daemon.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "notify-daemon error: %v\n", err)
+		_ = events.CloseDefault()
 		os.Exit(1)
 	}
 }
@@ -133,6 +152,7 @@ func initDaemonLogging() func() {
 		logCfg.Compress = ls.GetDebugCompress()
 	}
 	logging.Init(logCfg)
+	session.LogStoreRootSelection()
 	return logging.Shutdown
 }
 
@@ -194,4 +214,38 @@ func parseAgentDeckVersion(s string) string {
 		}
 	}
 	return strings.TrimSpace(rest[:end])
+}
+
+// healClaudeHooksAtDaemonStart runs session.HealClaudeHooks for the daemon's
+// Claude config dir when hooks are enabled. Best-effort: a failure is logged
+// and the daemon still runs.
+func healClaudeHooksAtDaemonStart() {
+	cfg, _ := session.LoadUserConfig()
+	if cfg != nil && !cfg.Claude.GetHooksEnabled() {
+		return
+	}
+	configDir := getClaudeConfigDirForHooks()
+	res, err := session.HealClaudeHooks(configDir, Version)
+	log := logging.ForComponent(logging.CompNotif)
+	// The accounts usage feed exists by construction: every configured slot's
+	// statusLine is wrapped with the ingester here too, so a remote whose
+	// binary was just updated starts feeding without an operator visit.
+	for _, r := range session.HealUsageFeeds(cfg) {
+		switch {
+		case r.Err != nil:
+			log.Warn("claude_usage_feed_heal_failed", "slot", r.Slot, "error", r.Err.Error())
+		case r.Changed:
+			log.Info("claude_usage_feed_wired", "slot", r.Slot, "command", r.Feed.Command)
+		}
+	}
+	switch {
+	case err != nil:
+		log.Warn("claude_hooks_heal_failed", "config_dir", configDir, "error", err.Error())
+	case res.Healed:
+		log.Info("claude_hooks_healed", "config_dir", configDir, "reasons", strings.Join(res.Reasons, "; "))
+	case res.Skipped != "":
+		// An unpinnable dev build, or a hook binary newer than this one:
+		// reported, never written (review round 3, finding 2).
+		log.Info("claude_hooks_heal_skipped", "config_dir", configDir, "reason", res.Skipped)
+	}
 }

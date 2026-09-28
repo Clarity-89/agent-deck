@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,11 +44,28 @@ func TestMapCodexNotifyToStatus(t *testing.T) {
 	}
 }
 
+// seedCodexNotifyRollout gives threadID a rollout under ~/.codex, the Codex
+// home a notify resolves when CODEX_HOME is unset. A turn-end from a thread
+// with no rollout is Codex's title helper and is dropped by the writer.
+func seedCodexNotifyRollout(t *testing.T, home, threadID string) {
+	t.Helper()
+	t.Setenv("CODEX_HOME", "")
+	dir := filepath.Join(home, ".codex", "sessions", "2026", "09", "23")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"type":"session_meta","payload":{"id":"` + threadID + `","source":"cli"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "rollout-2026-09-23T05-13-42-"+threadID+".jsonl"), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHandleCodexNotify_WritesStatus(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 	t.Setenv("AGENTDECK_INSTANCE_ID", "inst-1")
 	t.Setenv("CODEX_SESSION_ID", "")
+	seedCodexNotifyRollout(t, tmpHome, "abc-123")
 
 	origArgs := os.Args
 	defer func() { os.Args = origArgs }()
@@ -86,6 +105,7 @@ func TestHandleCodexNotify_ArgPayload(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 	t.Setenv("AGENTDECK_INSTANCE_ID", "inst-arg")
 	t.Setenv("CODEX_SESSION_ID", "")
+	seedCodexNotifyRollout(t, tmpHome, "thr-1")
 
 	origArgs := os.Args
 	defer func() { os.Args = origArgs }()
@@ -115,6 +135,7 @@ func TestHandleCodexNotify_JSONRPCMethodPayload(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 	t.Setenv("AGENTDECK_INSTANCE_ID", "inst-method")
 	t.Setenv("CODEX_SESSION_ID", "")
+	seedCodexNotifyRollout(t, tmpHome, "thr-42")
 
 	origArgs := os.Args
 	defer func() { os.Args = origArgs }()
@@ -252,6 +273,44 @@ func TestWriteCodexHookStatus_IdentityLessCompletionFailsClosed(t *testing.T) {
 	}
 	if got.CodexCompletedGeneration != "" {
 		t.Fatalf("identity-less completion converged: %#v", got)
+	}
+	if got.CodexStartedSequence == 0 || got.CodexCompletedSequence != got.CodexStartedSequence {
+		t.Fatalf("completion did not bind retained start sequence: %#v", got)
+	}
+	// A repeat completion is the same turn, not a fresh sequence.
+	seq := got.CodexCompletedSequence
+	writeCodexHookStatus("no-turn", "waiting", "thread-1", "agent-turn-complete", "")
+	data, err = os.ReadFile(filepath.Join(getHooksDir(), "no-turn.json"))
+	if err != nil || json.Unmarshal(data, &got) != nil || got.CodexCompletedSequence != seq {
+		t.Fatalf("completion retry changed sequence: %#v err=%v", got, err)
+	}
+	// A new proven start/completion pair advances exactly once.
+	writeCodexHookStatus("no-turn", "running", "thread-1", "turn.started", "")
+	writeCodexHookStatus("no-turn", "waiting", "thread-1", "agent-turn-complete", "")
+	data, err = os.ReadFile(filepath.Join(getHooksDir(), "no-turn.json"))
+	if err != nil || json.Unmarshal(data, &got) != nil || got.CodexCompletedSequence <= seq {
+		t.Fatalf("distinct fallback turn did not advance: %#v err=%v", got, err)
+	}
+}
+
+func TestWriteCodexHookStatus_PartialPriorFailsClosed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("AGENTDECK_HOOKS_DIR", filepath.Join(t.TempDir(), "hooks"))
+	if err := os.MkdirAll(getHooksDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(getHooksDir(), "partial.json")
+	partial := []byte(`{"status":`)
+	if err := os.WriteFile(path, partial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeCodexHookStatus("partial", "running", "", "turn.started", "")
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(partial) {
+		t.Fatalf("ambiguous prior was overwritten: %q", got)
 	}
 }
 
@@ -465,5 +524,125 @@ func TestCodexSharedStatusWriteNeverMutatesAnchor(t *testing.T) {
 	}
 	if got := session.ReadHookSessionAnchor(id); got != "thread-current" {
 		t.Fatalf("shared writer mutated Codex anchor: %q", got)
+	}
+}
+
+// A zero-length status file carries no durable counter to protect, so failing
+// closed on it only freezes the session in "running" forever. atomicHookWrite
+// renames without fsync, so a crash can leave exactly this file.
+func TestWriteCodexHookStatus_EmptyPriorFileRecovers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(getHooksDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(getHooksDir(), "inst-empty.json")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writeCodexHookStatus("inst-empty", "running", "thread-1", "turn.started", "turn-1")
+	writeCodexHookStatus("inst-empty", "waiting", "thread-1", "turn.completed", "turn-1")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hook hookStatusFile
+	if err := json.Unmarshal(data, &hook); err != nil {
+		t.Fatalf("status file still unusable after an empty prior: %v", err)
+	}
+	if hook.Status != "waiting" {
+		t.Fatalf("status = %q, want waiting", hook.Status)
+	}
+	if hook.CodexCompletedGeneration == "" {
+		t.Fatalf("turn identity did not advance past an empty prior: %#v", hook)
+	}
+}
+
+// A non-empty prior that cannot be parsed must still fail closed — resetting a
+// live counter would hand two different turns the same identity — but the
+// refusal has to be visible instead of silently freezing the session.
+func TestWriteCodexHookStatus_CorruptPriorFailsClosedAndWarns(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(getHooksDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(getHooksDir(), "inst-corrupt.json")
+	if err := os.WriteFile(path, []byte(`{"status":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	buf := &bytes.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	writeCodexHookStatus("inst-corrupt", "waiting", "thread-1", "turn.completed", "turn-1")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"status":` {
+		t.Fatalf("corrupt prior was overwritten: %q", string(data))
+	}
+	if !strings.Contains(buf.String(), "codex_hook_status_unreadable") {
+		t.Fatalf("refusal was silent:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "inst-corrupt") {
+		t.Fatalf("warning does not name the instance:\n%s", buf.String())
+	}
+}
+
+// A Codex subagent (thread_source=subagent) fires agent-turn-complete when it
+// finishes, while the parent turn that spawned it keeps working. The writer
+// must leave the main thread's hook status and anchor alone: recording the
+// subagent's "waiting" flipped a working session to waiting on every finished
+// subagent (rc feedback 2026-09-23).
+func TestHandleCodexNotify_SubagentTurnCompleteKeepsMainStatus(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("AGENTDECK_INSTANCE_ID", "inst-subagent")
+	t.Setenv("CODEX_SESSION_ID", "")
+	mainSID, subSID := "main-thread-0155", "subagent-thread-0155"
+	seedCodexNotifyRollout(t, tmpHome, mainSID)
+	dir := filepath.Join(tmpHome, ".codex", "sessions", "2026", "09", "23")
+	subMeta := `{"type":"session_meta","payload":{"session_id":"` + mainSID + `","id":"` + subSID +
+		`","parent_thread_id":"` + mainSID + `","source":{"subagent":{"thread_spawn":{"parent_thread_id":"` + mainSID +
+		`","depth":1,"agent_path":"/root/coverage"}}},"thread_source":"subagent"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "rollout-2026-09-23T10-11-25-"+subSID+".jsonl"), []byte(subMeta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origArgs, origStdin := os.Args, os.Stdin
+	defer func() { os.Args, os.Stdin = origArgs, origStdin }()
+	notify := func(payload string) {
+		os.Args = []string{"agent-deck", "codex-notify", payload}
+		handleCodexNotify()
+	}
+	notify(`{"type":"agent-turn-start","thread-id":"` + mainSID + `","turn-id":"turn-main"}`)
+	hookPath := filepath.Join(getHooksDir(), "inst-subagent.json")
+	before, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("main turn start not written: %v", err)
+	}
+
+	notify(`{"type":"agent-turn-complete","thread-id":"` + subSID + `","turn-id":"turn-sub"}`)
+	after, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("subagent completion rewrote the main hook status:\nbefore %s\nafter  %s", before, after)
+	}
+	if got := session.ReadHookSessionAnchor("inst-subagent"); got != mainSID {
+		t.Fatalf("anchor = %q, want the main thread %q", got, mainSID)
+	}
+
+	// The main thread's own completion still lands.
+	notify(`{"type":"agent-turn-complete","thread-id":"` + mainSID + `","turn-id":"turn-main"}`)
+	var hook hookStatusFile
+	data, _ := os.ReadFile(hookPath)
+	if err := json.Unmarshal(data, &hook); err != nil || hook.Status != "waiting" || hook.SessionID != mainSID {
+		t.Fatalf("main completion = %+v (err %v), want waiting for %s", hook, err, mainSID)
 	}
 }

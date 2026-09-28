@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 )
 
 // SettingType identifies which setting is being edited
@@ -52,10 +53,13 @@ const (
 	SettingShowPaneTitles
 	SettingShowOnlyInstalledTools
 	SettingVisibleTools
+	SettingEmbeddedTerminal
+	SettingSidebarDensity
+	SettingPrivacy
 )
 
 // Total number of navigable settings.
-const settingsCount = 36
+const settingsCount = 39
 
 // SettingsPanel displays and edits user configuration
 type SettingsPanel struct {
@@ -108,7 +112,11 @@ type SettingsPanel struct {
 	showSessionTimestamps  bool
 	showPaneTitles         bool
 	showOnlyInstalledTools bool
+	embeddedLayout         bool
+	sidebarDensity         int // index into sidebarDensityValues
 	pendingToolVisibility  bool
+	pendingPrivacy         bool   // Enter/Space on the Privacy row: home opens consent or turns it off
+	privacyLabel           string // "on (full)" / "off", read from telemetry state on Show
 
 	// Text input state
 	editingText bool
@@ -124,8 +132,8 @@ type SettingsPanel struct {
 // builtinToolNames and builtinToolValues are the built-in tools. Custom tools
 // from config are appended dynamically in LoadConfig.
 var (
-	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Cursor", "Hermes", "DeepSeek"}
-	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek"}
+	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi"}
+	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp"}
 )
 
 // Search tier names for radio selection
@@ -139,6 +147,28 @@ var (
 	themeNames  = []string{"Dark", "Light", "System"}
 	themeValues = []string{"dark", "light", "system"}
 )
+
+// Embedded sidebar density names for radio selection. Index order must match
+// sidebarDensityValues.
+var (
+	sidebarDensityNames  = []string{"Full", "Compact", "Minimal", "Auto"}
+	sidebarDensityValues = []string{
+		session.SidebarDensityFull,
+		session.SidebarDensityCompact,
+		session.SidebarDensityMinimal,
+		session.SidebarDensityAuto,
+	}
+)
+
+// defaultSidebarDensityIndex is the radio index of session.DefaultSidebarDensity.
+func defaultSidebarDensityIndex() int {
+	for i, val := range sidebarDensityValues {
+		if val == session.DefaultSidebarDensity {
+			return i
+		}
+	}
+	return 0
+}
 
 // Stats format names for radio selection
 var (
@@ -169,6 +199,8 @@ func NewSettingsPanel() *SettingsPanel {
 		statsShowRAM:        true,
 		statsShowDisk:       true,
 		statsShowNetwork:    true,
+		embeddedLayout:      false,
+		sidebarDensity:      defaultSidebarDensityIndex(),
 	}
 }
 
@@ -179,6 +211,7 @@ func (s *SettingsPanel) Show() {
 	s.scrollOffset = 0
 	s.editingText = false
 	s.needsRestart = false
+	s.privacyLabel = telemetryPrivacyLabel()
 
 	// Load current config
 	config, _ := session.LoadUserConfig()
@@ -347,7 +380,15 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	s.showSessionTimestamps = config.Display.ShowSessionTimestamps
 	s.showPaneTitles = config.Display.ShowPaneTitles
 
-	// UI tool picker settings
+	// UI settings
+	s.embeddedLayout = config.UI.GetEmbeddedTerminal()
+	s.sidebarDensity = defaultSidebarDensityIndex()
+	for i, val := range sidebarDensityValues {
+		if val == config.UI.GetSidebarDensity() {
+			s.sidebarDensity = i
+			break
+		}
+	}
 	s.showOnlyInstalledTools = config.UI.ShowOnlyInstalledTools
 }
 
@@ -360,7 +401,7 @@ func (s *SettingsPanel) buildToolLists(config *session.UserConfig) {
 			"claude": true, "gemini": true, "opencode": true,
 			"codex": true, "pi": true, "crush": true, "copilot": true,
 			"shell": true, "cursor": true, "aider": true, "hermes": true,
-			"deepseek": true,
+			"deepseek": true, "muse": true, "omp": true,
 		}
 		var custom []string
 		for name := range config.Tools {
@@ -488,7 +529,12 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	config.Display.ShowSessionTimestamps = s.showSessionTimestamps
 	config.Display.ShowPaneTitles = s.showPaneTitles
 
-	// UI tool picker settings
+	// UI settings
+	embeddedLayout := s.embeddedLayout
+	config.UI.EmbeddedTerminal = &embeddedLayout
+	if s.sidebarDensity >= 0 && s.sidebarDensity < len(sidebarDensityValues) {
+		config.UI.SidebarDensity = sidebarDensityValues[s.sidebarDensity]
+	}
 	config.UI.ShowOnlyInstalledTools = s.showOnlyInstalledTools
 
 	// Preserve original MCPs, Tools, and Docker settings.
@@ -563,10 +609,18 @@ func (s *SettingsPanel) Update(msg tea.KeyMsg) (*SettingsPanel, tea.Cmd, bool) {
 		valueChanged = s.adjustValue(1)
 
 	case " ":
+		if SettingType(s.cursor) == SettingPrivacy {
+			s.pendingPrivacy = true
+			s.Hide()
+			break
+		}
 		valueChanged = s.toggleValue()
 
 	case "enter":
-		if s.isTextSetting() {
+		if SettingType(s.cursor) == SettingPrivacy {
+			s.pendingPrivacy = true
+			s.Hide()
+		} else if s.isTextSetting() {
 			s.startTextEdit()
 		} else if SettingType(s.cursor) == SettingVisibleTools {
 			s.pendingToolVisibility = true
@@ -585,6 +639,25 @@ func (s *SettingsPanel) ConsumeToolVisibilityRequest() bool {
 	}
 	s.pendingToolVisibility = false
 	return true
+}
+
+// ConsumePrivacyRequest reports whether the user activated the Privacy row
+// and clears the latch.
+func (s *SettingsPanel) ConsumePrivacyRequest() bool {
+	if !s.pendingPrivacy {
+		return false
+	}
+	s.pendingPrivacy = false
+	return true
+}
+
+// telemetryPrivacyLabel renders the Privacy row value from telemetry state.
+func telemetryPrivacyLabel() string {
+	st := telemetry.LoadState()
+	if ok, _ := telemetry.Enabled(st); ok {
+		return "on (" + string(telemetry.EffectiveLevel(st)) + ")"
+	}
+	return "off"
 }
 
 // adjustValue changes a radio or number value by delta
@@ -659,6 +732,13 @@ func (s *SettingsPanel) adjustValue(delta int) bool {
 		newVal := s.statsFormat + delta
 		if newVal >= 0 && newVal < len(statsFormatNames) {
 			s.statsFormat = newVal
+			changed = true
+		}
+
+	case SettingSidebarDensity:
+		newVal := s.sidebarDensity + delta
+		if newVal >= 0 && newVal < len(sidebarDensityNames) {
+			s.sidebarDensity = newVal
 			changed = true
 		}
 	}
@@ -770,6 +850,16 @@ func (s *SettingsPanel) toggleValue() bool {
 
 	case SettingShowOnlyInstalledTools:
 		s.showOnlyInstalledTools = !s.showOnlyInstalledTools
+		return true
+
+	case SettingEmbeddedTerminal:
+		s.embeddedLayout = !s.embeddedLayout
+		return true
+
+	case SettingSidebarDensity:
+		// Space cycles the radio group, so the density is reachable without
+		// remembering that h/l adjust multi-value settings.
+		s.sidebarDensity = (s.sidebarDensity + 1) % len(sidebarDensityNames)
 		return true
 	}
 
@@ -1181,6 +1271,33 @@ func (s *SettingsPanel) View() string {
 	}
 	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
 
+	// INTERFACE
+	content.WriteString(sectionStyle.Render("INTERFACE"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Embedded terminal", s.embeddedLayout) + " - Persistent sidebar with an interactive tmux pane (applies at next launch)"
+	if s.cursor == int(SettingEmbeddedTerminal) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = "Sidebar density: " + s.renderRadioGroup(sidebarDensityNames, s.sidebarDensity, s.cursor == int(SettingSidebarDensity))
+	if s.cursor == int(SettingSidebarDensity) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+	content.WriteString(dimStyle.Render("    Lines per session in the embedded sidebar: 3 / 2 / 1 (1 keeps the tool marker)") + "\n")
+	content.WriteString(dimStyle.Render("    Auto: the most lines that still fit every open session on screen") + "\n\n")
+
+	// PRIVACY
+	content.WriteString(sectionStyle.Render("PRIVACY"))
+	content.WriteString("\n")
+	line = "Usage data: " + s.privacyLabel + "  (Enter to change)"
+	if s.cursor == int(SettingPrivacy) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
 	// MCP & TOOLS
 	content.WriteString(sectionStyle.Render("MCP SERVERS & CUSTOM TOOLS"))
 	content.WriteString("\n")
@@ -1195,22 +1312,44 @@ func (s *SettingsPanel) View() string {
 	content.WriteString(dimStyle.Render(mcpHint))
 	content.WriteString("\n\n")
 
-	// Help bar
-	content.WriteString(dimStyle.Render("j/k Navigate  Space Toggle  h/l Adjust  Enter Edit  Esc Close"))
+	// Help bar, broken between hints (never mid-hint) when the box is
+	// narrower than the bar.
+	helpBar := dimStyle.Render(renderDialogFooterRows(dialogWidth-4, 2, "  ",
+		[]string{"j/k Navigate", "Space Toggle", "h/l Adjust", "Enter Edit", "Esc Close"}))
+	content.WriteString(helpBar)
 
 	// Apply scroll windowing if content overflows available terminal height.
 	// The dialog box adds 4 lines of chrome: border (top+bottom) + padding (top+bottom).
 	contentStr := content.String()
 	const dialogChrome = 4
 	availHeight := s.height - dialogChrome
-	if availHeight < 10 {
-		availHeight = 10
+	if availHeight < 5 {
+		availHeight = 5
 	}
 
-	contentLines := strings.Split(strings.TrimRight(contentStr, "\n"), "\n")
+	// Window the rows the box actually draws: a long line (the DEFAULT TOOL
+	// pills, the embedded-terminal hint) wraps inside the box, so counting
+	// source lines let the box grow past the screen and lose its top rows.
+	// rowOf maps a source line to its first drawn row.
+	sourceLines := strings.Split(strings.TrimRight(contentStr, "\n"), "\n")
+	wrapStyle := lipgloss.NewStyle().Width(dialogWidth - 4) // the box's Padding(1, 2)
+	rowOf := make([]int, len(sourceLines))
+	var contentLines []string
+	for i, line := range sourceLines {
+		rowOf[i] = len(contentLines)
+		contentLines = append(contentLines, strings.Split(wrapStyle.Render(line), "\n")...)
+	}
 	totalLines := len(contentLines)
 
 	if totalLines > availHeight && s.height > 0 {
+		// The help bar (the last source lines) is pinned below the window,
+		// so Esc stays on screen however far the settings scroll.
+		helpStart := rowOf[len(sourceLines)-lipgloss.Height(helpBar)]
+		helpRows := contentLines[helpStart:]
+		contentLines = contentLines[:helpStart]
+		totalLines = len(contentLines)
+		availHeight = max(availHeight-len(helpRows), 3)
+
 		// Map cursor index to content line number (based on the fixed layout above).
 		// Update this mapping if settings are added/removed/reordered.
 		cursorToLine := [settingsCount]int{
@@ -1250,8 +1389,11 @@ func (s *SettingsPanel) View() string {
 			60, // SettingShowPaneTitles (DISPLAY section, after timestamps)
 			63, // SettingShowOnlyInstalledTools (TOOL PICKER section)
 			64, // SettingVisibleTools
+			67, // SettingEmbeddedTerminal (INTERFACE section)
+			68, // SettingSidebarDensity
+			73, // SettingPrivacy (PRIVACY section)
 		}
-		cursorLine := cursorToLine[s.cursor]
+		cursorLine := rowOf[cursorToLine[s.cursor]]
 
 		// Ensure cursor is visible with 2 lines of context
 		if cursorLine-2 < s.scrollOffset {
@@ -1268,14 +1410,15 @@ func (s *SettingsPanel) View() string {
 			s.scrollOffset = maxOff
 		}
 		// When the cursor sits on the last navigable setting, scroll all the
-		// way to the bottom so the trailing info lines (MCP config-path hint +
-		// help bar) come into view and the "▼ more below" indicator clears.
+		// way to the bottom so the trailing info lines (MCP config-path hint)
+		// come into view and the "▼ more below" indicator clears.
 		// Scrolling is cursor-anchored, so without this the tail is
-		// unreachable (issue #1659). Never scroll past the cursor's context
-		// window, in case the tail ever grows taller than the viewport.
+		// unreachable (issue #1659). Never scroll the cursor's row out of
+		// view (it may sit right under "▲ more above"), in case the tail
+		// ever grows taller than the viewport.
 		if s.cursor == settingsCount-1 && s.scrollOffset < maxOff {
 			bottomOff := maxOff
-			if lim := cursorLine - 2; bottomOff > lim {
+			if lim := cursorLine - 1; bottomOff > lim {
 				bottomOff = lim
 			}
 			if s.scrollOffset < bottomOff {
@@ -1306,6 +1449,7 @@ func (s *SettingsPanel) View() string {
 		if showScrollDown {
 			scrolled.WriteString("\n" + dimStyle.Render("  ▼ more below"))
 		}
+		scrolled.WriteString("\n" + strings.Join(helpRows, "\n"))
 		contentStr = scrolled.String()
 	}
 

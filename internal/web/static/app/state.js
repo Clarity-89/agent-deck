@@ -13,6 +13,25 @@ export const archivedSessionsSignal = signal([])
 // Currently selected session ID
 export const selectedIdSignal = signal(null)
 
+// Currently selected group path, or null. MUTUALLY EXCLUSIVE with
+// selectedIdSignal: at most one of the two is non-null at any moment.
+//
+// Two signals rather than one { kind, id } union because selectedIdSignal is
+// referenced by 13 modules; a union rewrites all of them plus routing for no
+// user-visible gain. The invariant lives in the two setters below — always go
+// through them, never assign the raw signals from a component.
+export const selectedGroupSignal = signal(null)
+
+export function selectSession(id) {
+  selectedGroupSignal.value = null
+  selectedIdSignal.value = id
+}
+
+export function selectGroup(path) {
+  selectedIdSignal.value = null
+  selectedGroupSignal.value = path
+}
+
 // SSE connection state: 'connecting' | 'connected' | 'disconnected'
 export const connectionSignal = signal('connecting')
 
@@ -79,10 +98,22 @@ export { SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_DEFAULT, clampSideb
 export const focusedIdSignal = signal(null)
 
 // Dialog open/close signals (Phase 4: mutations)
-// createSessionDialogSignal: boolean (true = dialog open)
-export const createSessionDialogSignal = signal(false)
+// Create-session dialog. null = closed; otherwise the group context the
+// dialog seeds itself from:
+//   { groupPath, groupName, defaultPath, tool, modelId }
+// Open it through dataModel.openCreateSessionForGroup(), never by assigning
+// here — that helper is what fills the context.
+export const createSessionDialogSignal = signal(null)
 
-// confirmDialogSignal: null or { message: string, onConfirm: function }
+// confirmDialogSignal: null or
+//   { message: string, onConfirm: function,
+//     tone?: 'danger'|'warn', confirmLabel?: string, title?: string }
+// tone/confirmLabel/title are optional and default to the delete presentation
+// ('danger', "Delete", "Are you sure?"). Set them per action so the button
+// names what it does — the modal is shared by archive/close/worktree-finish,
+// and without them every action rendered as a red "Delete". Severity follows
+// the TUI (internal/ui/confirm_dialog.go): 'warn' for reversible actions
+// (archive, close), 'danger' for destructive ones (delete, worktree finish).
 export const confirmDialogSignal = signal(null)
 
 // groupNameDialogSignal: null or { mode: 'create'|'rename', groupPath: string, currentName: string, onSubmit: function }
@@ -105,6 +136,7 @@ export const pushConfigSignal = signal(null)        // null or { enabled, vapidP
 export const pushSubscribedSignal = signal(false)
 export const pushBusySignal = signal(false)
 export const pushEndpointSignal = signal('')
+export const pushPermissionSignal = signal('default') // Notification.permission
 
 // Info drawer open/close state (Phase 10: replaces showSettings local state in Topbar)
 export const infoDrawerOpenSignal = signal(false)
@@ -141,6 +173,9 @@ export const visibleToolsSignal = signal([])
 export const toolFilterFallbackSignal = signal(false)
 export const hiddenToolsSignal = signal([])
 export const pickerToolsSignal = signal([])
+// Per-tool model and effort lists from /api/settings `modelCatalog` (#2388).
+// Empty until hydrated; the dialog then uses its built-in tables.
+export const modelCatalogSignal = signal({})
 
 // Web terminal link-open policy (issue #1682), hydrated from /api/settings.
 // trustedDomainsSignal holds the `[web].trusted_domains` hosts whose links
@@ -177,11 +212,20 @@ export const systemStatsSignal = signal(null)
 // SSE snapshot lands; the pane handles the null case with a skeleton.
 export const commandCenterSignal = signal(null)
 
+// Monotonic request token. Six call sites now reach this, one of them driven
+// by the menu SSE stream, so overlapping requests are routine -- and without a
+// guard an older response completing last would overwrite a newer archived
+// snapshot, showing a stale set until something else refetched.
+let archivedRequestSeq = 0
+
 export async function loadArchivedSessions() {
+  const seq = ++archivedRequestSeq
   try {
     const data = await apiFetch('GET', '/api/sessions/archived')
+    if (seq !== archivedRequestSeq) return   // a newer request superseded this one
     archivedSessionsSignal.value = data.sessions || []
   } catch (_) {
+    if (seq !== archivedRequestSeq) return
     archivedSessionsSignal.value = []
   }
 }

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/events"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
 
@@ -38,9 +39,15 @@ type PipeManager struct {
 	// connected or auto-reconnected. nil = legacy behaviour (want everything).
 	wantPipe func(sessionName string) bool
 
+	// sharedViewOverrides, when non-nil, makes Connect apply the shared-view
+	// size policy (ApplySharedViewSize) with these [tmux.options] overrides.
+	sharedViewOverrides func() map[string]string
+
 	// Reconnection tracking
 	reconnectMu  sync.Mutex
 	reconnecting map[string]bool
+	// budget refuses attempts on a session that keeps failing to connect.
+	budget *connectBudget
 
 	// Lifecycle
 	ctx    context.Context
@@ -55,6 +62,7 @@ func NewPipeManager(ctx context.Context, onOutput func(sessionName string)) *Pip
 		pipes:        make(map[string]*ControlPipe),
 		onOutput:     onOutput,
 		reconnecting: make(map[string]bool),
+		budget:       newConnectBudget(nil, nil),
 		ctx:          childCtx,
 		cancel:       cancel,
 	}
@@ -89,6 +97,11 @@ func (pm *PipeManager) Connect(sessionName, socketName string) error {
 	}
 	pm.mu.Unlock()
 
+	// A session that keeps failing is left alone for a while (connectBudget).
+	if err := pm.budget.allow(sessionName); err != nil {
+		return err
+	}
+
 	// Prevent concurrent pipe creation for the same session (TOCTOU guard)
 	pm.reconnectMu.Lock()
 	if pm.reconnecting[sessionName] {
@@ -109,11 +122,20 @@ func (pm *PipeManager) Connect(sessionName, socketName string) error {
 	// processes that are never cleaned up (#595).
 	killStaleControlClients(sessionName, socketName)
 
+	pm.mu.RLock()
+	overrides := pm.sharedViewOverrides
+	pm.mu.RUnlock()
+	if overrides != nil {
+		ApplySharedViewSize(socketName, sessionName, overrides())
+	}
+
 	// Create new pipe (outside lock since it spawns a process)
 	pipe, err := NewControlPipe(sessionName, socketName)
 	if err != nil {
+		pm.budget.failed(sessionName, err)
 		return fmt.Errorf("connect pipe for %s: %w", sessionName, err)
 	}
+	pm.budget.succeeded(sessionName)
 
 	pm.mu.Lock()
 	// Double-check: another goroutine may have connected while we were creating
@@ -127,6 +149,9 @@ func (pm *PipeManager) Connect(sessionName, socketName string) error {
 
 	// Start output event forwarder
 	go pm.forwardOutputEvents(sessionName, pipe)
+
+	// Never leave the window following a control client (latest_viewer.go)
+	go pm.watchClientEvents(sessionName, pipe)
 
 	// Start reconnection watcher
 	go pm.watchPipe(sessionName, pipe)
@@ -242,7 +267,7 @@ func (pm *PipeManager) RefreshAllActivities() (map[string]int64, map[string][]Wi
 		// subprocess path). A control client negotiates UTF-8, so TAB would usually
 		// survive here, but the delimiter MUST still match what the parser splits on.
 		// tmux control mode requires the format string double-quoted.
-		output, err := pipe.SendCommand(`list-windows -a -F "` + tmuxFmt("#{session_name}", "#{window_activity}", "#{window_index}", "#{window_name}") + `"`)
+		output, err := pipe.SendCommand(`list-windows -a -F "` + tmuxFmt("#{session_name}", "#{window_activity}", "#{window_index}", "#{window_id}", "#{window_name}") + `"`)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -349,6 +374,17 @@ func (pm *PipeManager) SetWindowChangeCallback(cb func()) {
 	pm.onWindowChange = cb
 }
 
+// SetSharedViewOverrides makes every Connect install the shared-view size
+// policy on the session first (ApplySharedViewSize, with fn's [tmux.options]
+// overrides), so a session born under an older policy (`largest`, rc.6's
+// `smallest`) converges on the current one as soon as a deck follows it,
+// without a restart and whoever attaches.
+func (pm *PipeManager) SetSharedViewOverrides(fn func() map[string]string) {
+	pm.mu.Lock()
+	pm.sharedViewOverrides = fn
+	pm.mu.Unlock()
+}
+
 // SetWantPipe installs the predicate that decides which sessions hold a live
 // pipe. Call once at startup before Connect. nil-safe: an unset predicate means
 // every session is wanted (legacy behaviour).
@@ -390,6 +426,12 @@ func (pm *PipeManager) forwardOutputEvents(sessionName string, pipe *ControlPipe
 			if !ok {
 				return
 			}
+			// Slice 4 (CORE-PLAN): additive tap onto the event bus. This is
+			// the hottest producer in the tree (fires on every tmux %output),
+			// so it deliberately does NOT call Flush — Publish's bounded
+			// queue + drop-with-counter is what keeps this path non-blocking
+			// under pressure (see internal/events).
+			events.PublishDefault("tmux.output", sessionName, nil)
 			if pm.onOutput != nil {
 				pm.onOutput(sessionName)
 			}
@@ -403,6 +445,35 @@ func (pm *PipeManager) forwardOutputEvents(sessionName string, pipe *ControlPipe
 		case <-pipe.Done():
 			return
 		}
+	}
+}
+
+// watchClientEvents runs HandLatestToViewer after each client event of pipe
+// (its own attach included), once the event has settled: a person who just
+// attached takes the latest slot only when their resize arrives, a moment
+// after tmux announces the attach, and must not be pre-empted in between.
+// Events arriving while it waits are folded into the same run.
+func (pm *PipeManager) watchClientEvents(sessionName string, pipe *ControlPipe) {
+	for {
+		select {
+		case <-pm.ctx.Done():
+			return
+		case <-pipe.Done():
+			return
+		case <-pipe.ClientEvents():
+		}
+		select {
+		case <-pm.ctx.Done():
+			return
+		case <-pipe.Done():
+			return
+		case <-time.After(latestSettle):
+		}
+		select {
+		case <-pipe.ClientEvents():
+		default:
+		}
+		HandLatestToViewer(pipe.socketName, sessionName)
 	}
 }
 
@@ -615,10 +686,10 @@ func SweepStaleControlClients(socketName string) {
 	// client has been looked at.
 	queryCtx, cancelQuery := context.WithTimeout(budget, staleControlSweepTimeout)
 	defer cancelQuery()
-	out, err := tmuxExecContext(queryCtx, socketName,
+	out, err := commandOutput(tmuxExecContext(queryCtx, socketName,
 		"list-clients",
 		"-F", "#{client_control_mode} #{client_pid}",
-	).Output()
+	))
 	if err != nil {
 		return // no server running, no clients attached, or the probe timed out
 	}
@@ -1271,7 +1342,7 @@ func isLiveTmuxClientOrServer(budget context.Context, pid int, cmdlineFields []s
 
 	ctx, cancel := context.WithTimeout(budget, tmuxLiveQueryTimeout)
 	defer cancel()
-	serverPIDOut, err := tmuxExecContext(ctx, socketName, "display-message", "-p", "#{pid}").Output()
+	serverPIDOut, err := commandOutput(tmuxExecContext(ctx, socketName, "display-message", "-p", "#{pid}"))
 	if err != nil {
 		markSocketUnreachable(querySocket)
 		return false, false
@@ -1286,7 +1357,7 @@ func isLiveTmuxClientOrServer(budget context.Context, pid int, cmdlineFields []s
 
 	ctx2, cancel2 := context.WithTimeout(budget, tmuxLiveQueryTimeout)
 	defer cancel2()
-	clientsOut, err := tmuxExecContext(ctx2, socketName, "list-clients", "-F", "#{client_pid}").Output()
+	clientsOut, err := commandOutput(tmuxExecContext(ctx2, socketName, "list-clients", "-F", "#{client_pid}"))
 	if err != nil {
 		markSocketUnreachable(querySocket)
 		return false, false
@@ -2122,7 +2193,7 @@ func softKillProcessGroup(pgid int, grace time.Duration, stillOurs func() bool) 
 func tmuxSessionExistsOnSocket(socketName, name string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
-	err := tmuxExecContext(ctx, socketName, "has-session", "-t", name).Run()
+	err := commandRun(tmuxExecContext(ctx, socketName, "has-session", "-t", name))
 	if ctx.Err() == context.DeadlineExceeded {
 		return true // probe timed out: indeterminate, assume the session still exists
 	}

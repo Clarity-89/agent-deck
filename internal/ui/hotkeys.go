@@ -35,6 +35,15 @@ const (
 	hotkeyForkWithOptions  = "fork_with_options"
 	hotkeyCopyOutput       = "copy_output"
 	hotkeyCopyPane         = "copy_pane"
+	// hotkeyCopyInfo copies the preview pane's Repo / Path / Branch block
+	// (#791). It shipped hardcoded on "C"; that key now opens the context
+	// inspector, so this moved to "B" and became rebindable like everything
+	// else. Users who want the old key back set [hotkeys].copy_info = "C" and
+	// [hotkeys].context_inspector to something else.
+	hotkeyCopyInfo = "copy_info"
+	// hotkeyContextInspector opens the full-context overlay: everything the
+	// harness is being sent, ranked by what it costs, with a lever per item.
+	hotkeyContextInspector = "context_inspector"
 	hotkeySendOutput       = "send_output"
 	hotkeyExecShell        = "exec_shell"
 	hotkeyOpenShellHere    = "open_shell_here"
@@ -53,6 +62,7 @@ const (
 	hotkeyInstallUpdate    = "install_update" // run `agent-deck update` from the TUI (update_install.go)
 	hotkeyDetach           = "detach"
 	hotkeyWatcherPanel     = "watcher_panel"
+	hotkeyDeadLetters      = "dead_letters"
 	// hotkeyAgentsPanel opens the Agents tab.
 	//
 	// The design mockup asks for "a". Every plain letter that reads as
@@ -73,6 +83,17 @@ const (
 	// suggested Ctrl+S collides with Claude Code (stash prompt) and XOFF
 	// flow-control. Users opt in by binding [hotkeys].switch_session.
 	hotkeySwitchSession = "switch_session" // canonical "ctrl+s" (opt-in)
+	// hotkeyAltSession is the vim-style alternate-session toggle (#2058): one
+	// key that swaps between the current session and the one you were on
+	// immediately before, the way Ctrl+^ swaps vim's alternate buffer. Backed
+	// by MRUHistory.Alternate (internal/session/mru.go).
+	hotkeyAltSession = "alt_session"
+	// hotkeyMRUBack / hotkeyMRUForward walk back/forward through recently
+	// visited sessions (#2058), MRU-ordered via the persisted last_accessed
+	// column (MRUHistory.WalkBack/WalkForward). A burst of either key holds
+	// the walk order stable rather than reshuffling after each hop.
+	hotkeyMRUBack    = "mru_back"
+	hotkeyMRUForward = "mru_forward"
 	// Scrollback pager. While attached to a session from the deck (Enter), the
 	// deck owns the viewport so tmux's own copy-mode/scrollback is unreachable
 	// (#1491). This trigger, intercepted in the attach loop, opens an in-view
@@ -115,6 +136,8 @@ var hotkeyActionOrder = []string{
 	hotkeyForkWithOptions,
 	hotkeyCopyOutput,
 	hotkeyCopyPane,
+	hotkeyCopyInfo,
+	hotkeyContextInspector,
 	hotkeySendOutput,
 	hotkeyExecShell,
 	hotkeyOpenShellHere,
@@ -133,8 +156,12 @@ var hotkeyActionOrder = []string{
 	hotkeyInstallUpdate,
 	hotkeyDetach,
 	hotkeyWatcherPanel,
+	hotkeyDeadLetters,
 	hotkeyAgentsPanel,
 	hotkeySwitchSession,
+	hotkeyAltSession,
+	hotkeyMRUBack,
+	hotkeyMRUForward,
 }
 
 var defaultHotkeyBindings = map[string]string{
@@ -165,6 +192,8 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyForkWithOptions:  "F",
 	hotkeyCopyOutput:       "c",
 	hotkeyCopyPane:         "V",
+	hotkeyCopyInfo:         "B",
+	hotkeyContextInspector: "C",
 	hotkeySendOutput:       "x",
 	hotkeyExecShell:        "E",
 	hotkeyOpenShellHere:    "H",
@@ -183,8 +212,12 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyInstallUpdate:    "ctrl+y",
 	hotkeyDetach:           "ctrl+q",
 	hotkeyWatcherPanel:     "w",
+	hotkeyDeadLetters:      "alt+d",
 	hotkeyAgentsPanel:      "alt+a",
 	hotkeySwitchSession:    "ctrl+s",
+	hotkeyAltSession:       "`",
+	hotkeyMRUBack:          "alt+left",
+	hotkeyMRUForward:       "alt+right",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{
@@ -267,9 +300,18 @@ func resolveHotkeys(overrides map[string]string) map[string]string {
 	return bindings
 }
 
+// buildHotkeyLookup resolves in two passes so a key the user wrote into
+// [hotkeys] always belongs to that action. Pass one registers every action's
+// bound key with its shift/unshift spellings; pass two adds the layout twins,
+// but only onto keys nobody has claimed. A derived twin therefore never
+// shadows an explicit binding and never blocks a canonical key: quick_fork =
+// "т" keeps "т" even though it is also the ЙЦУКЕН twin of new_session's "n".
 func buildHotkeyLookup(bindings map[string]string) (map[string]string, map[string]bool) {
 	keyToCanonical := make(map[string]string, len(bindings))
 	blockedCanonical := make(map[string]bool)
+
+	// Actions that ended up with a binding, in hotkeyActionOrder, for pass two.
+	var active []string
 
 	for _, action := range hotkeyActionOrder {
 		canonical := defaultHotkeyBindings[action]
@@ -286,7 +328,17 @@ func buildHotkeyLookup(bindings map[string]string) (map[string]string, map[strin
 				blockedCanonical[trigger] = true
 			}
 		}
-		for _, alias := range hotkeyAliases(bound) {
+		for _, alias := range explicitHotkeyAliases(bound) {
+			if _, exists := keyToCanonical[alias]; !exists {
+				keyToCanonical[alias] = canonical
+			}
+		}
+		active = append(active, action)
+	}
+
+	for _, action := range active {
+		canonical := defaultHotkeyBindings[action]
+		for _, alias := range layoutHotkeyAliases(bindings[action]) {
 			if _, exists := keyToCanonical[alias]; !exists {
 				keyToCanonical[alias] = canonical
 			}
@@ -303,7 +355,17 @@ func defaultTriggersForAction(action string) []string {
 	return hotkeyAliases(defaultHotkeyBindings[action])
 }
 
+// hotkeyAliases lists every spelling that reaches a binding: the explicit
+// shift/unshift forms first, then the layout twins derived from them. Callers
+// that need the two tiers apart (buildHotkeyLookup) use the halves directly.
 func hotkeyAliases(key string) []string {
+	return append(explicitHotkeyAliases(key), layoutHotkeyAliases(key)...)
+}
+
+// explicitHotkeyAliases returns the binding itself plus its shifted and
+// unshifted spellings ("F" <-> "shift+f", "!" <-> "shift+1"). These are the
+// forms a user could have written, so they take part in first-wins resolution.
+func explicitHotkeyAliases(key string) []string {
 	trimmed := strings.TrimSpace(key)
 	if trimmed == "" {
 		return nil
@@ -328,6 +390,70 @@ func hotkeyAliases(key string) []string {
 	}
 
 	return aliases
+}
+
+// layoutHotkeyAliases returns the layout twins of a binding's explicit
+// spellings, so "shift+u" picks up the twin of its "U" form too. Twins are
+// derived, never written by the user, so they are registered only after every
+// explicit binding has claimed its key.
+func layoutHotkeyAliases(key string) []string {
+	explicit := explicitHotkeyAliases(key)
+	var twins []string
+	seen := make(map[string]bool, len(explicit))
+	for _, alias := range explicit {
+		seen[alias] = true
+	}
+	for _, alias := range explicit {
+		twin := layoutAliasFor(alias)
+		if twin == "" || seen[twin] {
+			continue
+		}
+		seen[twin] = true
+		twins = append(twins, twin)
+	}
+	return twins
+}
+
+// jcukenLetters maps each QWERTY letter key to the letter the same physical
+// key produces on the Russian ЙЦУКЕН layout (identical on macOS and Windows
+// for the 26 letter keys; the punctuation keys differ between the two and are
+// deliberately left out).
+var jcukenLetters = map[rune]rune{
+	'q': 'й', 'w': 'ц', 'e': 'у', 'r': 'к', 't': 'е', 'y': 'н',
+	'u': 'г', 'i': 'ш', 'o': 'щ', 'p': 'з', 'a': 'ф', 's': 'ы',
+	'd': 'в', 'f': 'а', 'g': 'п', 'h': 'р', 'j': 'о', 'k': 'л',
+	'l': 'д', 'z': 'я', 'x': 'ч', 'c': 'с', 'v': 'м', 'b': 'и',
+	'n': 'т', 'm': 'ь',
+}
+
+// layoutAliasFor returns the character a single-key binding produces under a
+// non-Latin keyboard layout, or "" when there is none.
+//
+// The overview dispatches on the rune the terminal delivers, and a terminal
+// never reports which layout produced it. So with a non-Latin layout selected
+// every letter hotkey is simply dead: pressing the "n" key sends "т", nothing
+// matches, and the deck ignores it. That is a real cost for anyone who writes
+// prompts in a non-Latin script, because the deck is the screen you come back
+// to between prompts, and every visit needs a layout switch first.
+//
+// Registering the twin as an alias fixes it in the one place that knows it is
+// the overview talking: "т" and "n" both reach new_session, while the attached
+// pane keeps receiving raw bytes exactly as before. Russian ЙЦУКЕН is the
+// first layout covered; the same table shape takes any other.
+func layoutAliasFor(key string) string {
+	runes := []rune(key)
+	if len(runes) != 1 {
+		return ""
+	}
+
+	twin, ok := jcukenLetters[unicode.ToLower(runes[0])]
+	if !ok {
+		return ""
+	}
+	if unicode.IsUpper(runes[0]) {
+		return string(unicode.ToUpper(twin))
+	}
+	return string(twin)
 }
 
 func shiftedAliasFor(key string) string {

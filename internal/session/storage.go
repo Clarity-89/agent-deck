@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -76,10 +77,13 @@ type InstanceData struct {
 	// last_activity_persist.go). Zero means unknown (old record or never
 	// active).
 	LastActivityAt time.Time `json:"last_activity_at,omitempty"`
-	ArchivedAt     time.Time `json:"archived_at,omitempty"`
-	SupersededBy   string    `json:"superseded_by,omitempty"`
-	Supersedes     string    `json:"supersedes,omitempty"`
-	TmuxSession    string    `json:"tmux_session"`
+	// HookLag mirrors Instance.hookLag (status-light audit defect B): the
+	// persisted completed-turn samples, extras zone (see hook_lag.go).
+	HookLag      hookLagRecord `json:"hook_lag,omitempty"`
+	ArchivedAt   time.Time     `json:"archived_at,omitempty"`
+	SupersededBy string        `json:"superseded_by,omitempty"`
+	Supersedes   string        `json:"supersedes,omitempty"`
+	TmuxSession  string        `json:"tmux_session"`
 	// TmuxSocketName is the tmux -L selector captured at Instance creation
 	// (issue #687, v1.7.50). Empty for pre-v1.7.50 rows — those keep hitting
 	// the default server after upgrade.
@@ -174,10 +178,16 @@ type InstanceData struct {
 
 	// IdleTimeoutSecs mirrors Instance.IdleTimeoutSecs (#1143). 0 = disabled.
 	IdleTimeoutSecs int64 `json:"idle_timeout_secs,omitempty"`
+	// Favorite mirrors Instance.Favorite (tool_data extras zone).
+	Favorite bool `json:"favorite,omitempty"`
 
 	// IdentityInjectionDisabled mirrors Instance.IdentityInjectionDisabled.
 	// Lives in the tool_data extras zone (identity_injection_persist.go).
 	IdentityInjectionDisabled bool `json:"identity_injection_disabled,omitempty"`
+
+	// ContextLevel mirrors Instance.ContextLevel (issue #2260). Lives in the
+	// tool_data extras zone (context_level_persist.go).
+	ContextLevel string `json:"context_level,omitempty"`
 
 	// DeepSeekTask mirrors Instance.DeepSeekTask (PR #1942 review, P1c).
 	// Persisted via the tool_data extras zone (see deepseek_task_persist.go).
@@ -242,6 +252,12 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 		return nil, err
 	}
 
+	// A brand-new store is only created when the profile has no store under
+	// the other data root (stray XDG store incidents, 2026-09-19/20).
+	if err := guardNewProfileStore(effectiveProfile, profileDir); err != nil {
+		return nil, err
+	}
+
 	// Ensure directory exists with secure permissions (0700 = owner only)
 	if err := os.MkdirAll(profileDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create storage directory: %w", err)
@@ -284,6 +300,10 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 		}
 	}
 
+	if err := pruneHookArtifactsOnStartup(); err != nil {
+		storageLog.Warn("hook_cleanup_failed", slog.String("error", err.Error()))
+	}
+
 	return &Storage{
 		db:      db,
 		dbPath:  dbPath,
@@ -295,6 +315,16 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 // creating directories/files, migrating schema, changing SQLite journal
 // state, or checkpointing WAL files.
 func NewReadOnlyStorageWithProfile(profile string) (*Storage, error) {
+	return newReadOnlyStorageWithProfile(profile, statedb.OpenReadOnly)
+}
+
+// NewLiveReadOnlyStorageWithProfile reads committed WAL state for authoritative
+// live catalogs and preflight. It does not initialize schema or write rows.
+func NewLiveReadOnlyStorageWithProfile(profile string) (*Storage, error) {
+	return newReadOnlyStorageWithProfile(profile, statedb.OpenReadOnlyLive)
+}
+
+func newReadOnlyStorageWithProfile(profile string, open func(string) (*statedb.StateDB, error)) (*Storage, error) {
 	effectiveProfile, err := ResolveProfileForStorage(profile)
 	if err != nil {
 		return nil, err
@@ -303,7 +333,7 @@ func NewReadOnlyStorageWithProfile(profile string) (*Storage, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := statedb.OpenReadOnly(dbPath)
+	db, err := open(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open state database read-only: %w", err)
 	}
@@ -439,6 +469,7 @@ type instanceStorageSnapshot struct {
 }
 
 func (s *Storage) rememberInstanceSnapshot(inst *Instance, original, stored *statedb.InstanceRow) {
+	inst.restartDB.Store(s.db)
 	inst.storageSnapshot = &instanceStorageSnapshot{
 		dbPath:   s.dbPath,
 		original: statedb.CloneInstanceRow(original),
@@ -563,19 +594,35 @@ func (s *Storage) UpdateTitleIfUnlocked(id, title string) (applied bool, err err
 // DeleteInstance removes a single instance from the database by ID.
 // This ensures the row is immediately removed, preventing resurrection on reload.
 func (s *Storage) DeleteInstance(id string) error {
+	cleanup, err := s.DeleteInstanceDeferredCleanup(id)
+	if err != nil {
+		return err
+	}
+	cleanup()
+	return nil
+}
+
+// DeleteInstanceDeferredCleanup commits the registry deletion and returns its
+// best-effort hook cleanup separately. UI callers must run cleanup in a command
+// so filesystem scans and registry contention cannot block the message handler.
+// On deletion failure no cleanup is returned. The cleanup does not use Storage
+// and can run after it closes.
+func (s *Storage) DeleteInstanceDeferredCleanup(id string) (func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.db == nil {
-		return fmt.Errorf("storage database not initialized")
+		return nil, fmt.Errorf("storage database not initialized")
 	}
-
 	if err := s.db.DeleteInstance(id); err != nil {
-		return fmt.Errorf("failed to delete instance %s: %w", id, err)
+		return nil, fmt.Errorf("failed to delete instance %s: %w", id, err)
 	}
-
 	_ = s.db.Touch()
-	return nil
+	return func() {
+		if err := pruneHookArtifacts(id); err != nil {
+			storageLog.Warn("hook_cleanup_failed", slog.String("id", id), slog.String("error", err.Error()))
+		}
+	}, nil
 }
 
 // DeleteGroupSubtree removes a group and all of its descendants from the groups
@@ -1021,6 +1068,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// the positional MarshalToolData signature so legacy binaries that don't
 	// know the key preserve it via MergeToolDataExtras.
 	toolData = WriteIdleTimeoutSecsToToolData(toolData, inst.IdleTimeoutSecs)
+	toolData = WriteFavoriteToToolData(toolData, inst.Favorite, inst.favoriteCleared)
 	// #1821: subcommand_passthrough lives in the same extras zone — see
 	// Instance.SubcommandPassthrough's doc for why losing it on reload must
 	// never silently re-enable claude/codex account-routing treatment for a
@@ -1029,6 +1077,9 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// Identity-injection opt-out lives in the same extras zone so a restart
 	// from any process honours `--no-identity`.
 	toolData = WriteIdentityInjectionDisabledToToolData(toolData, inst.IdentityInjectionDisabled)
+	// #2260: the per-session context-level override lives in the same extras
+	// zone so a restart from any process honours `session set ... context-level`.
+	toolData = WriteContextLevelToToolData(toolData, inst.ContextLevel)
 	// #1815: the resume-identity taint travels with the id it describes, so a
 	// writer that saves a discovered conversation id without ever passing
 	// through the resume builder (e.g. `switch-account --no-restart`) cannot
@@ -1148,7 +1199,9 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 	}
 
 	// Load from SQLite
+	queryStarted := time.Now()
 	snapshot, err := s.db.LoadRegistrySnapshot()
+	health.RecordDBQuery(time.Since(queryStarted))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1231,8 +1284,10 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			AutoLinkedChannels:        autoLinkedChannels2,
 			Color:                     color2,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
+			Favorite:                  ReadFavoriteFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
 			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
+			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
@@ -1241,6 +1296,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			GenericSessionCommand:     genericScopeCommand(r.ToolData),
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
+			HookLag:                   ReadHookLagFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
 			SupersededBy:              ReadCrossHarnessSupersededByFromToolData(r.ToolData),
 			Supersedes:                ReadCrossHarnessSupersedesFromToolData(r.ToolData),
@@ -1280,7 +1336,9 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 	}
 
 	// Load from SQLite
+	queryStarted := time.Now()
 	snapshot, err := s.db.LoadRegistrySnapshot()
+	health.RecordDBQuery(time.Since(queryStarted))
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1365,8 +1423,10 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			AutoLinkedChannels:        autoLinkedChannels,
 			Color:                     color,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
+			Favorite:                  ReadFavoriteFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
 			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
+			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
@@ -1375,6 +1435,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			GenericSessionCommand:     genericScopeCommand(r.ToolData),
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
+			HookLag:                   ReadHookLagFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
 			SupersededBy:              ReadCrossHarnessSupersededByFromToolData(r.ToolData),
 			Supersedes:                ReadCrossHarnessSupersedesFromToolData(r.ToolData),
@@ -1586,6 +1647,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			tmuxSess.InstanceID = instData.ID
 			tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
 			tmuxSess.SetMouse(GetTmuxSettings().GetMouse())
+			tmuxSess.SetIndicZeroWidthMarks(GetTmuxSettings().IndicZeroWidthMarks)
 			tmuxSess.SetClearOnRestart(GetTmuxSettings().ClearOnRestart)
 			tmuxSess.SetTerminalChromeEnabled(GetTerminalSettings().GetITermBadge())
 			// Note: EnableMouseMode and ConfigureStatusBar are deferred to EnsureConfigured()
@@ -1669,9 +1731,11 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			AutoLinkedChannels:           instData.AutoLinkedChannels,
 			Color:                        instData.Color,
 			IdleTimeoutSecs:              instData.IdleTimeoutSecs,
+			Favorite:                     instData.Favorite,
 			DeepSeekTask:                 instData.DeepSeekTask,
 			SubcommandPassthrough:        instData.SubcommandPassthrough,
 			IdentityInjectionDisabled:    instData.IdentityInjectionDisabled,
+			ContextLevel:                 instData.ContextLevel,
 			LastStartedAt:                instData.LastStartedAt,
 			GenericSessionID:             instData.GenericSessionID,
 			GenericDetectedAt:            instData.GenericDetectedAt,
@@ -1683,6 +1747,9 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			// throttle has an accurate baseline.
 			lastActivityAt:        instData.LastActivityAt,
 			lastActivityPersisted: instData.LastActivityAt,
+			hookLag:               instData.HookLag,
+			hookLagPersisted:      instData.HookLag,
+			hookLagDB:             s.db,
 			Sandbox:               instData.Sandbox,
 			SandboxContainer:      instData.SandboxContainer,
 			SSHHost:               instData.SSHHost,
@@ -1692,6 +1759,9 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			MultiRepoTempDir:      instData.MultiRepoTempDir,
 			tmuxSession:           tmuxSess,
 		}
+		// Restore configured detection without restarting the running harness.
+		inst.loadCustomPatternsFromConfig()
+
 		// Convert multi-repo worktree data
 		for _, wt := range instData.MultiRepoWorktrees {
 			inst.MultiRepoWorktrees = append(inst.MultiRepoWorktrees, MultiRepoWorktree{

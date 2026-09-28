@@ -11,21 +11,20 @@
        │      > demo                                                                        │       
        │                                                                                    │       
        │      Command:                                                                      │       
-       │                                                                                    │       
-       │      shell    claude    gemini    opencode    codex    pi    copilot    crush      │       
-       │      cursor agent    hermes    deepseek                                            │       
+       │        shell     claude     gemini     opencode     codex     pi     copilot       │       
+       │        crush     muse     cursor agent     hermes     deepseek     omp             │       
        │                                                                                    │       
        │    ▶ Model ID:                                                                     │       
        │      > tool default (↓ to browse)                                                  │       
-       │    ╭────────────────────────────────────────────────╮-haiku-4-5                    │       
+       │    ╭────────────────────────────────────────────────╮de-haiku-4-5                  │       
        │    │ ▶ ✎ Type custom model ID…                      │                              │       
+       │    │   claude-opus-5-5                              │                              │       
        │    │   claude-opus-5                                │                              │       
        │    │   claude-sonnet-5                              │                              │       
        │    │   claude-fable-5-1                             │                              │       
        │    │   claude-fable-5                               │                              │       
        │    │   claude-sonnet-4-6                            │                              │       
-       │    │   claude-opus-4-8                              │                              │       
-       │    │   ↓ 3 more below                               │                              │       
+       │    │   ↓ 4 more below                               │                              │       
        │    │  ↑/↓ navigate │ Space/Enter select │ Esc back  │                              │       
        │    ╰────────────────────────────────────────────────╯                              │       
        │                                                                                    │       
@@ -37,7 +36,8 @@
        │      [ ] Teammate mode                                                             │       
        │        Extra args: > e.g. --agent reviewer                                         │       
        │        Start query: > initial prompt (not split on spaces)                         │       
-       │        Account:   inherit    personal    work                                      │       
+       │        Account:                                                                    │       
+       │          inherit     personal     work                                             │       
        │                                                                                    │       
        │      [ Create session ]                                                            │       
        │                                                                                    │       

@@ -290,6 +290,24 @@ func workerScratchDirFor(instanceID string) string {
 	return filepath.Join(workerScratchDirRoot(), instanceID)
 }
 
+// WorkerScratchConfigDirFor returns the path a scratch config dir for this
+// instance id would occupy, whether or not one exists.
+//
+// It is exported for readers rather than writers. Instance.WorkerScratchConfigDir
+// is set by the process that prepared the scratch and is NOT a column in the
+// instances table, so a fresh CLI process that loads the same session from
+// state.db sees it empty and would conclude the session runs under its profile
+// dir — which is exactly wrong for every session agent-deck hands a scratch
+// home. The path is deterministic, so a reader can recover it and confirm it
+// against the filesystem. Callers must check that the directory exists before
+// claiming anything about it; a path is not evidence.
+func WorkerScratchConfigDirFor(instanceID string) string {
+	if strings.TrimSpace(instanceID) == "" {
+		return ""
+	}
+	return workerScratchDirFor(instanceID)
+}
+
 // pathUnderWorkerScratch reports whether p resolves inside the worker-scratch
 // root. Both p and the root are resolved through symlinks first so a /tmp →
 // /private/tmp style indirection (or a symlinked HOME) does not defeat the
@@ -684,15 +702,15 @@ func sweepForeignSymlinks(dest, source string) error {
 //     only token copy is not stranded behind a dangling symlink. The next
 //     start, once canonical exists, replaces it with the symlink.
 //
-// Why no mtime-promote (removed; see the OAuth root-cause memo and the
-// disassembly of Claude v2.1.159 in /tmp/oauth-fix/SUBSCRIPTION-FIX.md):
-// Anthropic OAuth uses single-use ROTATING refresh tokens, so a scratch copy's
-// mtime is NOT a "this token is newer/valid" signal. The previous code promoted
-// a strictly-newer scratch real-file to canonical, which could overwrite a good
-// canonical with a stale (or already-rotated-out) scratch token and fork a
-// second rotation chain — re-introducing the `invalid_grant` /login race for
-// every session sharing that profile. Claude re-reads .credentials.json on
-// expiry and serializes refreshes on a cross-process lock keyed by
+// Why no mtime-promote (removed; this matches Claude Code's own
+// realpath-keyed lock behavior): Anthropic OAuth uses single-use ROTATING
+// refresh tokens, so a scratch copy's mtime is NOT a "this token is
+// newer/valid" signal. The previous code promoted a strictly-newer scratch
+// real-file to canonical, which could overwrite a good canonical with a stale
+// (or already-rotated-out) scratch token and fork a second rotation chain —
+// re-introducing the `invalid_grant` /login race for every session sharing
+// that profile. Claude re-reads .credentials.json on expiry and serializes
+// refreshes on a cross-process lock keyed by
 // realpath(); collapsing every scratch to ONE canonical symlink is what makes
 // that lock actually serialize the workers. The load-bearing invariant is
 // therefore "the scratch credentials must always be a symlink to the one

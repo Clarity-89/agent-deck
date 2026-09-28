@@ -5,107 +5,19 @@ import { html } from 'htm/preact'
 import { useState } from 'preact/hooks'
 import {
   createSessionDialogSignal, mutationsEnabledSignal,
-  toolFilterFallbackSignal, pickerToolsSignal,
+  toolFilterFallbackSignal, pickerToolsSignal, modelCatalogSignal,
 } from './state.js'
 import { Icon, ICONS } from './icons.js'
 import { apiFetch } from './api.js'
 import { displayLabelForTool, resolveCreateSessionPickerTools } from './pickerTools.js'
-
-const CUSTOM_MODEL = '__custom__'
-
-const REASONING_EFFORT_CATALOG = {
-  claude: [
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'Extra high' },
-    { value: 'max', label: 'Max' },
-  ],
-  codex: [
-    { value: 'minimal', label: 'Minimal' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'Extra high' },
-  ],
-}
-
-const MODEL_ID_CATALOG = {
-  claude: [
-    { value: 'claude-opus-5', label: 'Claude Opus 5' },
-    { value: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
-    { value: 'claude-fable-5-1', label: 'Claude Fable 5.1' },
-    { value: 'claude-fable-5', label: 'Claude Fable 5' },
-    { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
-    { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
-    { value: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
-    { value: 'claude-haiku-4-5', label: 'Claude Haiku 4.5 alias' },
-    { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 pinned' },
-  ],
-  codex: [
-    { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
-    { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
-    { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
-    { value: 'gpt-5.5', label: 'GPT-5.5' },
-    { value: 'gpt-5.5-pro', label: 'GPT-5.5 Pro' },
-    { value: 'gpt-5.4', label: 'GPT-5.4' },
-    { value: 'gpt-5.4-pro', label: 'GPT-5.4 Pro' },
-    { value: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
-    { value: 'gpt-5.4-nano', label: 'GPT-5.4 Nano' },
-    { value: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' },
-    { value: 'gpt-5.2', label: 'GPT-5.2' },
-    { value: 'gpt-5.2-pro', label: 'GPT-5.2 Pro' },
-    { value: 'gpt-5.1', label: 'GPT-5.1' },
-    { value: 'gpt-5-pro', label: 'GPT-5 Pro' },
-    { value: 'gpt-5', label: 'GPT-5' },
-    { value: 'gpt-5-mini', label: 'GPT-5 Mini' },
-    { value: 'gpt-5-nano', label: 'GPT-5 Nano' },
-    { value: 'gpt-4.1', label: 'GPT-4.1' },
-    { value: 'gpt-4.1-mini', label: 'GPT-4.1 Mini' },
-    { value: 'gpt-4o', label: 'GPT-4o' },
-    { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
-    { value: 'o3-pro', label: 'o3 Pro' },
-    { value: 'o3', label: 'o3' },
-  ],
-  gemini: [
-    { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro preview' },
-    { value: 'gemini-3.1-pro-preview-customtools', label: 'Gemini 3.1 Pro custom tools' },
-    { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash preview' },
-    { value: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite' },
-    { value: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash Lite preview' },
-    { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
-    { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
-    { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite' },
-  ],
-  opencode: [
-    { value: 'openai/gpt-5.5', label: 'OpenAI GPT-5.5' },
-    { value: 'openai/gpt-5.5-pro', label: 'OpenAI GPT-5.5 Pro' },
-    { value: 'openai/gpt-5.4', label: 'OpenAI GPT-5.4' },
-    { value: 'openai/gpt-5.4-pro', label: 'OpenAI GPT-5.4 Pro' },
-    { value: 'openai/gpt-5.4-mini', label: 'OpenAI GPT-5.4 Mini' },
-    { value: 'openai/gpt-5.3-codex', label: 'OpenAI GPT-5.3 Codex' },
-    { value: 'openai/gpt-5', label: 'OpenAI GPT-5' },
-    { value: 'openai/o3', label: 'OpenAI o3' },
-    { value: 'anthropic/claude-opus-5', label: 'Anthropic Claude Opus 5' },
-    { value: 'anthropic/claude-sonnet-5', label: 'Anthropic Claude Sonnet 5' },
-    { value: 'anthropic/claude-fable-5-1', label: 'Anthropic Claude Fable 5.1' },
-    { value: 'anthropic/claude-fable-5', label: 'Anthropic Claude Fable 5' },
-    { value: 'anthropic/claude-sonnet-4-6', label: 'Anthropic Claude Sonnet 4.6' },
-    { value: 'anthropic/claude-opus-4-8', label: 'Anthropic Claude Opus 4.8' },
-    { value: 'anthropic/claude-opus-4-7', label: 'Anthropic Claude Opus 4.7' },
-    { value: 'anthropic/claude-haiku-4-5', label: 'Anthropic Claude Haiku 4.5' },
-  ],
-}
-
-function modelIDsForTool(tool) {
-  return MODEL_ID_CATALOG[tool] || []
-}
-
-function reasoningEffortsForTool(tool) {
-  return REASONING_EFFORT_CATALOG[tool] || []
-}
+import {
+  CUSTOM_MODEL, effortOptionsForTool, modelOptionsForTool, seedModelSelection,
+} from './modelCatalog.js'
 
 export function CreateSessionDialog() {
+  const open = createSessionDialogSignal.value
+  const ctx = open || { groupPath: '', groupName: '', defaultPath: '', tool: '', modelId: '' }
+
   const [title, setTitle] = useState('')
   const [tool, setTool] = useState('claude')
   const [modelId, setModelId] = useState('')
@@ -114,6 +26,34 @@ export function CreateSessionDialog() {
   const [path, setPath] = useState('')
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const [seededFor, setSeededFor] = useState(null)
+
+  // Tools actually offered by the picker (operator-filtered via hidden_tools /
+  // show_only_installed_tools). Computed before the seeding effect below so
+  // the seed can be checked against it — see next comment.
+  const shownTools = resolveCreateSessionPickerTools(pickerToolsSignal.value)
+
+  // Re-seed when the dialog opens for a different group. Keyed on groupPath so
+  // SSE-driven re-renders never stomp edits the user is in the middle of, and
+  // reopening on another group does not inherit the previous group's values.
+  if (open && seededFor !== ctx.groupPath) {
+    // Only seed a tool the picker actually shows: an operator-hidden tool
+    // (e.g. `claude` filtered via hidden_tools) must never seed a selection
+    // no button reflects, which used to submit an invisible/wrong tool on
+    // create (review finding #2). Fall back to the first shown tool.
+    const seedTool = shownTools.includes(ctx.tool) ? ctx.tool : shownTools[0]
+    setTool(seedTool)
+    setPath(ctx.defaultPath || '')
+    // A known id selects its option; an unknown one (newer than this build's
+    // list) is carried as a custom id instead of silently dropped (#2388).
+    const seeded = seedModelSelection(seedTool, ctx.modelId, modelCatalogSignal.value)
+    setModelId(seeded.modelId)
+    setCustomModel(seeded.customModel)
+    setReasoningEffort('')
+    setTitle('')
+    setError(null)
+    setSeededFor(ctx.groupPath)
+  }
 
   // WEB-P0-4 prevention layer: when mutations are disabled (server
   // webMutations=false), do not render the dialog at all. Hooks order is
@@ -126,11 +66,12 @@ export function CreateSessionDialog() {
     setSubmitting(true)
     try {
       const payload = { title, tool, projectPath: path }
+      if (ctx.groupPath) payload.groupPath = ctx.groupPath
       const modelId = selectedModelId()
       if (modelId) payload.modelId = modelId
-      if (reasoningEffort) payload.reasoningEffort = reasoningEffort
+      if (effectiveEffort) payload.reasoningEffort = effectiveEffort
       await apiFetch('POST', '/api/sessions', payload)
-      createSessionDialogSignal.value = false
+      createSessionDialogSignal.value = null
     } catch (err) {
       setError(err.message)
     } finally {
@@ -150,11 +91,13 @@ export function CreateSessionDialog() {
     return modelId || ''
   }
 
-  const close = () => (createSessionDialogSignal.value = false)
+  const close = () => (createSessionDialogSignal.value = null)
   const handleBackdropClick = (e) => { if (e.target === e.currentTarget) close() }
-  const modelIDs = modelIDsForTool(tool)
-  const reasoningEfforts = reasoningEffortsForTool(tool)
-  const shownTools = resolveCreateSessionPickerTools(pickerToolsSignal.value)
+  const modelIDs = modelOptionsForTool(tool, modelCatalogSignal.value)
+  const reasoningEfforts = effortOptionsForTool(tool, selectedModelId(), modelCatalogSignal.value)
+  // The options change with the model (select or custom id) and with the
+  // settings hydration; an effort they no longer offer is never submitted.
+  const effectiveEffort = reasoningEfforts.some(e => e.value === reasoningEffort) ? reasoningEffort : ''
   const needsCustomModel = modelId === CUSTOM_MODEL
   const submitDisabled = submitting || !title || !path || (needsCustomModel && !customModel.trim())
 
@@ -169,9 +112,15 @@ export function CreateSessionDialog() {
           </button>
         </div>
         <div class="db">
+          ${ctx.groupName && html`
+            <div class="field">
+              <label>GROUP</label>
+              <div class="ro-value" data-testid="create-session-group">${ctx.groupName}</div>
+            </div>
+          `}
           <div class="field">
-            <label>TITLE</label>
-            <input autofocus required value=${title} onInput=${e => setTitle(e.target.value)} placeholder="my-session"/>
+            <label>NAME</label>
+            <input autofocus required value=${title} onInput=${e => setTitle(e.target.value)} placeholder="session-name"/>
           </div>
           <div class="field">
             <label>WORKING DIR</label>
@@ -214,7 +163,7 @@ export function CreateSessionDialog() {
           ${reasoningEfforts.length > 0 && html`
             <div class="field">
               <label>REASONING EFFORT</label>
-              <select value=${reasoningEffort} onInput=${e => setReasoningEffort(e.target.value)}>
+              <select value=${effectiveEffort} onInput=${e => setReasoningEffort(e.target.value)}>
                 <option value="">Tool default</option>
                 ${reasoningEfforts.map(effort => html`
                   <option key=${effort.value} value=${effort.value}>${effort.label} — ${effort.value}</option>

@@ -90,8 +90,27 @@ func (h *Home) restartBlockReason() string {
 		return "close the open dialog first"
 	case h.sessionActionInFlight():
 		return "a session action is still running, try again in a moment"
+	case h.autoInstallInFlight != "":
+		return h.updateInFlightReason()
 	}
 	return h.restartTargetProblem()
+}
+
+// updateInFlightReason is the block reason while the unattended updater
+// this TUI spawned is still running. The child is a plain exec.Cmd whose
+// stdout is a pipe back to this process: a re-exec closes that pipe (the
+// child dies of SIGPIPE mid remote sweep) and the new image never waits
+// for it (zombie), which is how the v1.16.11 rollout left four remotes on
+// the old build behind a "sweep in progress" marker. So the restart waits
+// for the child; the wait is bounded by the child's own timeout
+// (autoInstallTimeout), after which its context kills it and the in-flight
+// flag clears.
+func (h *Home) updateInFlightReason() string {
+	if h.autoInstallInFlight == pendingDrainKey {
+		return "the updater is still re-registering launchd agents"
+	}
+	long, _ := h.updateRunPhase()
+	return "unattended update to v" + h.autoInstallInFlight + " is still running (" + long + ")"
 }
 
 // tryRestartDeck is the restart_deck key handler. It either refuses with a
@@ -100,9 +119,18 @@ func (h *Home) restartBlockReason() string {
 // reconnect to it instead of cold-starting every MCP.
 func (h *Home) tryRestartDeck() (tea.Model, tea.Cmd) {
 	if reason := h.restartBlockReason(); reason != "" {
+		if h.updateInFlightReason() == reason && h.autoInstallInFlight != "" {
+			// The updater child must finish first (a re-exec would cut its
+			// pipe), so the key is not refused: it queues the restart for
+			// the moment the run ends.
+			h.restartQueued = true
+			h.setError(errors.New(h.queuedRestartMessage()))
+			return h, nil
+		}
 		h.setError(fmt.Errorf("%w: %s", errRestartBlocked, reason))
 		return h, nil
 	}
+	h.restartQueued = false
 	h.restartRequested = true
 	h.isQuitting = true
 	uiLog.Info("tui_restart_requested",
@@ -110,6 +138,38 @@ func (h *Home) tryRestartDeck() (tea.Model, tea.Cmd) {
 		"installed", h.installedUpdateVersion(),
 		"exe", h.restartExecutable())
 	return h, h.performQuit(false)
+}
+
+// queuedRestartMessage is the footer line after the key was queued.
+func (h *Home) queuedRestartMessage() string {
+	_, short := h.updateRunPhase()
+	return "restart queued after " + short
+}
+
+// fireQueuedRestart runs the restart a key press queued while the updater
+// child was running. It is a no-op without a queued press; if something
+// else blocks the restart now the queue stays and the tick path retries.
+func (h *Home) fireQueuedRestart() tea.Cmd {
+	if !h.restartQueued || h.autoInstallInFlight != "" {
+		return nil
+	}
+	if h.installedUpdateVersion() == "" {
+		// Nothing to restart into (the run failed or found nothing).
+		h.restartQueued = false
+		return nil
+	}
+	if reason := h.restartBlockReason(); reason != "" {
+		h.noteRestartWait(reason)
+		if strings.HasPrefix(reason, "new binary") {
+			// A bad target will not fix itself: drop the queue and say so
+			// once instead of re-running the dry probe every tick.
+			h.restartQueued = false
+			h.setError(fmt.Errorf("%w: %s; still running v%s", errRestartBlocked, reason, Version))
+		}
+		return nil
+	}
+	_, cmd := h.tryRestartDeck()
+	return cmd
 }
 
 // autoRestartLogEvery rate-limits the "waiting for idle" log line.
@@ -130,16 +190,41 @@ const autoRestartRetryAfter = time.Minute
 // tmux sessions and servers are never touched by the hand-over.
 func (h *Home) maybeAutoRestart() tea.Cmd {
 	installed := h.installedUpdateVersion()
-	if installed == "" || h.restartRequested || !h.autoRestartEnabled() {
+	if installed == "" {
+		h.noteRestartWait("")
 		return nil
 	}
-	if time.Now().Before(h.autoRestartHoldUntil) {
+	switch {
+	case h.restartRequested:
+		h.noteRestartWait("restart already requested, the shutdown sequence has not finished")
+		return nil
+	case h.restartQueued && h.autoInstallInFlight == "":
+		// The key was pressed during the update run: that is the request,
+		// whether or not auto_restart is on.
+		if cmd := h.fireQueuedRestart(); cmd != nil {
+			return cmd
+		}
+		return nil
+	case !h.autoRestartEnabled():
+		h.noteRestartWait("auto_restart is off or suppressed for this process; press " + h.restartDeckKeyLabel())
+		return nil
+	case time.Now().Before(h.autoRestartHoldUntil):
+		h.noteRestartWait(h.autoRestartHoldReason)
 		return nil
 	}
 	if reason := h.restartBlockReason(); reason != "" {
+		h.noteRestartWait(reason)
 		if time.Since(h.autoRestartLoggedAt) >= autoRestartLogEvery {
 			h.autoRestartLoggedAt = time.Now()
-			uiLog.Info("tui_auto_restart_waiting", slog.String("installed", installed), slog.String("reason", reason))
+			if h.autoInstallInFlight != "" && reason == h.updateInFlightReason() {
+				uiLog.Info("tui_restart_deferred_for_update",
+					slog.String("installed", installed),
+					slog.String("updating_to", h.autoInstallInFlight),
+					slog.Duration("running_for", time.Since(h.autoInstallAttempts[h.autoInstallInFlight]).Round(time.Second)),
+					slog.Duration("bound", autoInstallTimeout))
+			} else {
+				uiLog.Info("tui_auto_restart_waiting", slog.String("installed", installed), slog.String("reason", reason))
+			}
 		}
 		if strings.HasPrefix(reason, "new binary") {
 			// The target itself is bad: say so once, keep running the old
@@ -147,12 +232,73 @@ func (h *Home) maybeAutoRestart() tea.Cmd {
 			// change of the file resets the watch and the hold.
 			h.setError(fmt.Errorf("%w: %s; still running v%s", errRestartBlocked, reason, Version))
 			h.autoRestartHoldUntil = time.Now().Add(autoRestartRetryAfter)
+			h.autoRestartHoldReason = reason
 		}
 		return nil
 	}
+	h.noteRestartWait("")
 	uiLog.Info("tui_auto_restart", slog.String("running", Version), slog.String("installed", installed))
 	_, cmd := h.tryRestartDeck()
 	return cmd
+}
+
+// restartOverdueAfter is how long a newer build may sit on disk without a
+// restart before the TUI calls it overdue: tui_restart_overdue in the log
+// (once an hour) with the blocking reason, the same reason in the banner,
+// and "overdue" in the heartbeat the fleet watch reads.
+const restartOverdueAfter = 2 * time.Hour
+
+// restartOverdueLogEvery rate-limits tui_restart_overdue.
+const restartOverdueLogEvery = time.Hour
+
+// noteRestartWait records why this tick did not restart ("" when nothing
+// is in the way, or nothing to restart into) and raises the overdue state
+// once the wait has lasted restartOverdueAfter.
+func (h *Home) noteRestartWait(reason string) {
+	h.restartWaitReason = reason
+	if reason == "" {
+		h.restartOverdueReason = ""
+		return
+	}
+	since := h.installedUpdateSince()
+	if since.IsZero() || time.Since(since) < restartOverdueAfter {
+		h.restartOverdueReason = ""
+		return
+	}
+	h.restartOverdueReason = reason
+	if time.Since(h.restartOverdueLoggedAt) < restartOverdueLogEvery {
+		return
+	}
+	h.restartOverdueLoggedAt = time.Now()
+	uiLog.Warn("tui_restart_overdue",
+		slog.String("running", Version),
+		slog.String("installed", h.installedUpdateVersion()),
+		slog.Duration("waiting_for", time.Since(since).Round(time.Minute)),
+		slog.String("reason", reason),
+		slog.Int("pid", os.Getpid()))
+}
+
+// installedUpdateSince is when the newer build on disk was first seen.
+func (h *Home) installedUpdateSince() time.Time {
+	if h.binaryWatch == nil {
+		return time.Time{}
+	}
+	return h.binaryWatch.installedSince
+}
+
+// restartStateForHeartbeat is the restart state the heartbeat reports.
+func (h *Home) restartStateForHeartbeat() (state, reason string) {
+	switch {
+	case h.installedUpdateVersion() == "":
+		return "idle", ""
+	case h.restartRequested:
+		return "requested", h.restartWaitReason
+	case h.restartOverdueReason != "":
+		return "overdue", h.restartOverdueReason
+	case h.restartWaitReason != "":
+		return "waiting", h.restartWaitReason
+	}
+	return "idle", ""
 }
 
 // autoRestartEnabled reads [updates].auto_restart (default true) and
@@ -194,9 +340,11 @@ func (h *Home) RestartTarget() (string, bool) {
 const (
 	// restartSelectEnv carries the id of the session the cursor was on.
 	restartSelectEnv = "AGENTDECK_RESTART_SELECT"
-	// restartedFromEnv carries the version that restarted, for the
-	// "restarted into vNEW (was vOLD)" notice.
-	restartedFromEnv = "AGENTDECK_RESTARTED_FROM"
+	// RestartedFromEnv carries the version that restarted, for the
+	// "restarted into vNEW (was vOLD)" notice. Exported because main()'s
+	// startup reviver reads it before Home consumes it: a process that was
+	// just re-exec'd pauses that sweep (see startupReviveDelay).
+	RestartedFromEnv = "AGENTDECK_RESTARTED_FROM"
 )
 
 // RestartHandoff is what the new process needs to pick up where this one
@@ -221,7 +369,7 @@ func (h *Home) RestartHandoff() RestartHandoff {
 func buildRestartEnv(env []string, hand RestartHandoff) []string {
 	out := make([]string, 0, len(env)+2)
 	for _, kv := range env {
-		if strings.HasPrefix(kv, restartSelectEnv+"=") || strings.HasPrefix(kv, restartedFromEnv+"=") {
+		if strings.HasPrefix(kv, restartSelectEnv+"=") || strings.HasPrefix(kv, RestartedFromEnv+"=") {
 			continue
 		}
 		out = append(out, kv)
@@ -230,7 +378,7 @@ func buildRestartEnv(env []string, hand RestartHandoff) []string {
 		out = append(out, restartSelectEnv+"="+hand.SelectedID)
 	}
 	if hand.OldVersion != "" {
-		out = append(out, restartedFromEnv+"="+hand.OldVersion)
+		out = append(out, RestartedFromEnv+"="+hand.OldVersion)
 	}
 	return out
 }
@@ -239,7 +387,7 @@ func buildRestartEnv(env []string, hand RestartHandoff) []string {
 func parseRestartEnv(getenv func(string) string) RestartHandoff {
 	return RestartHandoff{
 		SelectedID: strings.TrimSpace(getenv(restartSelectEnv)),
-		OldVersion: strings.TrimSpace(getenv(restartedFromEnv)),
+		OldVersion: strings.TrimSpace(getenv(RestartedFromEnv)),
 	}
 }
 
@@ -248,7 +396,7 @@ func parseRestartEnv(getenv func(string) string) RestartHandoff {
 func consumeRestartEnv() RestartHandoff {
 	hand := parseRestartEnv(os.Getenv)
 	_ = os.Unsetenv(restartSelectEnv)
-	_ = os.Unsetenv(restartedFromEnv)
+	_ = os.Unsetenv(RestartedFromEnv)
 	return hand
 }
 

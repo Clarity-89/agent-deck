@@ -162,7 +162,6 @@ func TestDefaultRawPatterns_PiSubagentSignals(t *testing.T) {
 		t.Fatal("package-update banner must not mark an idle Pi session busy")
 	}
 	for _, content := range []string{
-		"delegate_task agent=researcher",
 		"[subagent] researching",
 		"[running] subagent-1",
 	} {
@@ -177,6 +176,29 @@ func TestDefaultRawPatterns_PiSubagentSignals(t *testing.T) {
 	// "running" indefinitely. A line-leading arrow must NOT be busy.
 	if matchesBusy("Two committed files:\n1. migration.org\n    → renames the platform row\n2. help.org\n    → adds a paragraph") {
 		t.Fatal("assistant markdown arrow bullets must not mark an idle Pi session busy")
+	}
+
+	// Neither pi nor pi-subagents prints "delegate_task"; it only reaches
+	// the pane as prose (an answer about a function of that name), which
+	// stays visible after the turn ends.
+	if matchesBusy("The delegate_task function has been removed.\ndelegate_task agent=researcher is gone from the docs.") {
+		t.Fatal("assistant prose naming delegate_task must not mark an idle Pi session busy")
+	}
+}
+
+func TestDefaultRawPatterns_Omp(t *testing.T) {
+	raw := DefaultRawPatterns("omp")
+	if raw == nil {
+		t.Fatal("expected non-nil for omp")
+	}
+	if len(raw.BusyPatterns) == 0 {
+		t.Error("omp should have busy patterns")
+	}
+	if len(raw.PromptPatterns) == 0 {
+		t.Error("omp should have prompt patterns")
+	}
+	if len(raw.SpinnerChars) == 0 {
+		t.Error("omp should define spinner chars")
 	}
 }
 

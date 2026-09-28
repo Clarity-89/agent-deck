@@ -10,6 +10,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 	"github.com/asheshgoplani/agent-deck/internal/vcsbackend"
 	"github.com/asheshgoplani/agent-deck/internal/web"
@@ -91,8 +92,17 @@ func (m *WebMutator) beginHeadlessTx() (unlock func(), err error) {
 	return m.headlessTxMu.Unlock, nil
 }
 
+// suppressHookPromptForWeb keeps worktree hooks reached from a web request
+// fail-closed (skipped with a notice) instead of opening the TUI's hook
+// approval dialog for a request the local operator did not make. Work a
+// mutation defers past its return (a queued tea.Cmd) is not covered and may
+// still ask the local operator, which can only ever result in a local human
+// decision, never an unapproved run.
+func suppressHookPromptForWeb() (restore func()) { return git.SuppressScriptConsentPrompter() }
+
 // CreateSession creates and starts a new session, persisting it to storage.
 func (m *WebMutator) CreateSession(title, tool, projectPath, groupPath, modelID, reasoningEffort string) (string, error) {
+	defer suppressHookPromptForWeb()()
 	unlock, err := m.beginHeadlessTx()
 	if err != nil {
 		return "", err
@@ -129,6 +139,7 @@ func (m *WebMutator) CreateSession(title, tool, projectPath, groupPath, modelID,
 	if err := inst.Start(); err != nil {
 		return "", fmt.Errorf("start session: %w", err)
 	}
+	inst.RecordTelemetryCreate(telemetry.ViaWeb)
 
 	storage, err := session.NewStorageWithProfile(m.h.profile)
 	if err != nil {
@@ -200,6 +211,7 @@ func (m *WebMutator) RestartSession(id string) error {
 // Before removal, the instance is pushed onto the web undo stack so a
 // subsequent UndoDelete (POST /api/sessions/undelete) can restore it.
 func (m *WebMutator) DeleteSession(id string) error {
+	defer suppressHookPromptForWeb()()
 	unlock, err := m.beginHeadlessTx()
 	if err != nil {
 		return err
@@ -224,6 +236,7 @@ func (m *WebMutator) DeleteSession(id string) error {
 	if err := storage.DeleteInstance(id); err != nil {
 		return err
 	}
+	inst.RecordTelemetryEndFrom(telemetry.EndDelete, telemetry.SurfaceWeb)
 	m.pushUndo(inst)
 	return nil
 }
@@ -246,7 +259,11 @@ func (m *WebMutator) CloseSession(id string) error {
 	if inst == nil {
 		return fmt.Errorf("session not found: %s", id)
 	}
-	return inst.Kill()
+	if err := inst.Kill(); err != nil {
+		return err
+	}
+	inst.RecordTelemetryEndFrom(telemetry.EndStop, telemetry.SurfaceWeb)
+	return nil
 }
 
 // ArchiveSession stops the session process and marks it archived so it
@@ -387,6 +404,7 @@ func (m *WebMutator) pushUndo(inst *session.Instance) {
 
 // ForkSession forks an existing session using the proper tool-specific fork command.
 func (m *WebMutator) ForkSession(id string) (string, error) {
+	defer suppressHookPromptForWeb()()
 	unlock, err := m.beginHeadlessTx()
 	if err != nil {
 		return "", err
@@ -407,6 +425,7 @@ func (m *WebMutator) ForkSession(id string) (string, error) {
 	if err := forked.Start(); err != nil {
 		return "", fmt.Errorf("start forked session: %w", err)
 	}
+	forked.RecordTelemetryCreate(telemetry.ViaWeb)
 
 	storage, err := session.NewStorageWithProfile(m.h.profile)
 	if err != nil {
@@ -570,6 +589,117 @@ func (m *WebMutator) RenameGroup(groupPath, newName string) error {
 	return storage.SaveWithGroups(instances, m.h.groupTree)
 }
 
+// SetGroupExpanded persists a group's collapse state, so the web sidebar and
+// the TUI stop drifting apart.
+//
+// SCOPE: this reaches a TUI sharing this process immediately, because the flip
+// lands on the very GroupTree that TUI renders from. A SEPARATE TUI process on
+// the same profile (the `agent-deck web --no-tui` daemon deployment) is a
+// weaker story on two counts: SaveGroupsOnly deliberately skips Touch()
+// (storage.go:1152), so no StorageWatcher reload is scheduled; and when that
+// TUI does reload for any other reason it re-applies its own in-memory
+// Expanded over the freshly-loaded rows (home.go:7639-7656). Making the
+// cross-process direction reliable belongs in that reload branch, not here.
+//
+// Deliberately mirrors the TUI's own toggle path (home.go: ToggleGroup then
+// saveGroupState) rather than RenameGroup's: collapsing touches only group
+// metadata, so it uses SaveGroupsOnly and never rewrites the instance rows.
+// Expand/CollapseGroup do not cascade to children — visibility is derived by
+// walking the ancestor chain at render time (GroupTree.ancestorsExpanded) —
+// so a single-group write is the whole change.
+//
+// A derived group (one implied by a session's path but never stored) is
+// allowed here and becomes a real row on save: its storage snapshot carries
+// ensure:true, which is exactly what happens when the TUI collapses one.
+func (m *WebMutator) SetGroupExpanded(groupPath string, expanded bool) error {
+	unlock, err := m.beginHeadlessTx()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if m.h == nil {
+		return web.ErrGroupNotFound
+	}
+	// Resolve the tree ONCE. beginHeadlessTx's hydrate replaces h.groupTree
+	// wholesale (home.go:5153-5157), and in live-TUI mode the Tea loop can
+	// swap it on a reload, so re-reading the field between the lookup, the
+	// flip and the save could persist a tree that never saw the flip.
+	tree := m.h.groupTree
+	if tree == nil {
+		return web.ErrGroupNotFound
+	}
+	if _, ok := tree.Groups[groupPath]; !ok {
+		return web.ErrGroupNotFound
+	}
+	prior := tree.Groups[groupPath].Expanded
+	if expanded {
+		tree.ExpandGroup(groupPath)
+	} else {
+		tree.CollapseGroup(groupPath)
+	}
+
+	if m.h.storage == nil {
+		// Headless/no-persistence configuration: the in-memory flip above is
+		// all there is to do, and the next snapshot already reflects it.
+		return nil
+	}
+	if err := m.h.storage.SaveGroupsOnly(tree.ShallowCopyForSave()); err != nil {
+		// Roll the flip back. The handler turns this into a 500 and the client
+		// reverts its optimistic toggle, so leaving the tree flipped would have
+		// the very next snapshot publish a collapse state that was never
+		// stored — and a TUI sharing this process render it.
+		if g, ok := tree.Groups[groupPath]; ok {
+			g.Expanded = prior
+			tree.Expanded[groupPath] = prior
+		}
+		return err
+	}
+	return nil
+}
+
+// MoveSessionToGroup moves a session to another group with the same target
+// resolution as `agent-deck group move` (session.GroupTree.
+// ResolveMoveTargetGroup) and persists. Like the CLI and the TUI's M, nothing
+// is migrated: when the destination group resolves a different Claude config
+// dir, restartRequired reports that the session picks it up on its next
+// restart (#2368).
+func (m *WebMutator) MoveSessionToGroup(id, groupPath string) (string, bool, error) {
+	unlock, err := m.beginHeadlessTx()
+	if err != nil {
+		return "", false, err
+	}
+	defer unlock()
+
+	m.h.instancesMu.Lock()
+	inst := m.h.instanceByID[id]
+	if inst == nil {
+		m.h.instancesMu.Unlock()
+		return "", false, web.ErrSessionNotFound
+	}
+	// Seed the new-group default in case the target must be auto-created.
+	if cfg, _ := session.LoadUserConfig(); cfg != nil {
+		m.h.groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
+	}
+	target := m.h.groupTree.ResolveMoveTargetGroup(groupPath)
+	restartRequired := session.IsClaudeCompatible(inst.Tool) &&
+		session.GetClaudeConfigDirForInstanceInGroup(inst, target) != session.GetClaudeConfigDirForInstance(inst)
+	m.h.groupTree.MoveSessionToGroup(inst, target)
+	instances := make([]*session.Instance, len(m.h.instances))
+	copy(instances, m.h.instances)
+	m.h.instancesMu.Unlock()
+
+	storage, err := session.NewStorageWithProfile(m.h.profile)
+	if err != nil {
+		return "", false, fmt.Errorf("open storage: %w", err)
+	}
+	defer storage.Close()
+	if err := storage.SaveWithGroups(instances, m.h.groupTree); err != nil {
+		return "", false, fmt.Errorf("save session: %w", err)
+	}
+	return target, restartRequired, nil
+}
+
 // FinishWorktree merges (or skips), removes the worktree, optionally
 // deletes the source branch, kills the tmux session, and removes the
 // session from storage. Mirrors `agent-deck worktree finish` (see
@@ -577,6 +707,7 @@ func (m *WebMutator) RenameGroup(groupPath, newName string) error {
 // orchestration is duplicated rather than refactored to keep the
 // fix minimally invasive (issue #1126).
 func (m *WebMutator) FinishWorktree(id string, opts web.WorktreeFinishOptions) (web.WorktreeFinishResult, error) {
+	defer suppressHookPromptForWeb()()
 	unlock, err := m.beginHeadlessTx()
 	if err != nil {
 		return web.WorktreeFinishResult{}, err

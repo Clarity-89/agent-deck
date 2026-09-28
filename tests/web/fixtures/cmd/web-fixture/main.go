@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -95,14 +96,62 @@ func main() {
 	// Wrap the server's handler with the fixture admin endpoints so tests can
 	// reset and inspect state without going through the real Go test harness.
 	handler := server.Handler()
+	streams := newFixtureStreamConnections()
 	mux := http.NewServeMux()
+	mux.HandleFunc("/__fixture/stream-outage", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		enabled := r.URL.Query().Get("enabled") == "true"
+		status := 0
+		if enabled {
+			status = http.StatusServiceUnavailable
+			if r.URL.Query().Get("status") == "401" {
+				status = http.StatusUnauthorized
+			}
+		}
+		streams.setUnavailable(status)
+		disconnected := 0
+		if enabled {
+			disconnected = streams.disconnect()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":      enabled,
+			"disconnected": disconnected,
+		})
+	})
 	mux.Handle("/__fixture/", store.adminHandler())
+	mux.Handle("/events/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if status := streams.unavailableStatus(); status != 0 {
+			http.Error(w, "fixture stream outage", status)
+			return
+		}
+		conn, _ := r.Context().Value(fixtureConnKey{}).(net.Conn)
+		if conn == nil {
+			handler.ServeHTTP(w, r)
+			return
+		}
+		defer streams.track(conn)()
+		handler.ServeHTTP(w, r)
+	}))
+	mux.Handle("/api/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if status := streams.unavailableStatus(); status != 0 {
+			http.Error(w, "fixture stream outage", status)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
 	mux.Handle("/", handler)
 
 	httpSrv := &http.Server{
 		Addr:              boundAddr.String(),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			return context.WithValue(ctx, fixtureConnKey{}, conn)
+		},
 	}
 
 	errCh := make(chan error, 1)
@@ -183,6 +232,58 @@ type fixtureDeletedEntry struct {
 	deletedAt time.Time
 }
 
+type fixtureConnKey struct{}
+
+type fixtureStreamConnections struct {
+	mu          sync.Mutex
+	active      map[net.Conn]struct{}
+	unavailable int
+}
+
+func newFixtureStreamConnections() *fixtureStreamConnections {
+	return &fixtureStreamConnections{active: make(map[net.Conn]struct{})}
+}
+
+func (s *fixtureStreamConnections) track(conn net.Conn) func() {
+	s.mu.Lock()
+	s.active[conn] = struct{}{}
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		delete(s.active, conn)
+		s.mu.Unlock()
+	}
+}
+
+func (s *fixtureStreamConnections) setUnavailable(status int) {
+	s.mu.Lock()
+	s.unavailable = status
+	s.mu.Unlock()
+}
+
+func (s *fixtureStreamConnections) unavailableStatus() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unavailable
+}
+
+func (s *fixtureStreamConnections) disconnect() int {
+	s.mu.Lock()
+	connections := make([]net.Conn, 0, len(s.active))
+	for conn := range s.active {
+		connections = append(connections, conn)
+	}
+	s.mu.Unlock()
+
+	for _, conn := range connections {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetLinger(0)
+		}
+		_ = conn.Close()
+	}
+	return len(connections)
+}
+
 func newFixtureStore() *fixtureStore {
 	return &fixtureStore{
 		now:      time.Now,
@@ -201,8 +302,8 @@ func (s *fixtureStore) seed() {
 	defer s.mu.Unlock()
 	s.remotesEnabled = false
 	s.groups = map[string]*web.MenuGroup{
-		"work":           {Name: "work", Path: "work", Expanded: true, Order: 0, SessionCount: 2},
-		"work/innotrade": {Name: "innotrade", Path: "work/innotrade", Expanded: true, Order: 1, SessionCount: 1},
+		"work":           {Name: "work", Path: "work", Expanded: true, Order: 0, SessionCount: 2, DefaultPath: "/srv/work"},
+		"work/innotrade": {Name: "innotrade", Path: "work/innotrade", Expanded: true, Order: 1, SessionCount: 1, DefaultPath: "/srv/innotrade"},
 		"personal":       {Name: "personal", Path: "personal", Expanded: false, Order: 2, SessionCount: 1},
 	}
 	now := time.Date(2026, 4, 29, 10, 0, 0, 0, time.UTC)
@@ -297,12 +398,51 @@ func (s *fixtureStore) LoadMenuSnapshot() (*web.MenuSnapshot, error) {
 
 	items := make([]web.MenuItem, 0, len(s.groups)+len(s.sessions))
 	idx := 0
-	for _, g := range s.groups {
-		items = append(items, web.MenuItem{
-			Index: idx, Type: web.MenuItemTypeGroup, Path: g.Path, Group: g, Level: 0,
-		})
-		idx++
+	// Emit groups as a TREE WALK, the way the real server does
+	// (BuildMenuSnapshot over the hierarchically-sorted GroupTree.GroupList):
+	// every parent immediately ahead of its descendants, siblings ordered by
+	// Order with the path as tie-breaker.
+	//
+	// Ranging the map directly leaked Go's randomized iteration order into the
+	// payload. The client used to hide that by re-sorting on MenuGroup.Order,
+	// and no longer does — Order is only meaningful BETWEEN SIBLINGS, so a
+	// global sort by it interleaves unrelated subtrees. Sorting globally here
+	// would reproduce, in the fixture, exactly the bug the client just stopped
+	// committing.
+	childrenOf := make(map[string][]string, len(s.groups))
+	for path := range s.groups {
+		parent := ""
+		if i := strings.LastIndex(path, "/"); i != -1 {
+			parent = path[:i]
+		}
+		childrenOf[parent] = append(childrenOf[parent], path)
 	}
+	for parent := range childrenOf {
+		siblings := childrenOf[parent]
+		sort.Slice(siblings, func(i, j int) bool {
+			a, b := s.groups[siblings[i]], s.groups[siblings[j]]
+			if a.Order != b.Order {
+				return a.Order < b.Order
+			}
+			return siblings[i] < siblings[j]
+		})
+	}
+	var emitGroups func(parent string)
+	emitGroups = func(parent string) {
+		for _, path := range childrenOf[parent] {
+			g := s.groups[path]
+			items = append(items, web.MenuItem{
+				// Level is the path depth, as GetGroupLevel computes it
+				// server-side. It was hardcoded to 0, so a nested group
+				// claimed to be a root.
+				Index: idx, Type: web.MenuItemTypeGroup, Path: g.Path, Group: g,
+				Level: strings.Count(g.Path, "/"),
+			})
+			idx++
+			emitGroups(path)
+		}
+	}
+	emitGroups("")
 	active := 0
 	for _, id := range s.order {
 		sess, ok := s.sessions[id]
@@ -311,7 +451,11 @@ func (s *fixtureStore) LoadMenuSnapshot() (*web.MenuSnapshot, error) {
 		}
 		active++
 		items = append(items, web.MenuItem{
-			Index: idx, Type: web.MenuItemTypeSession, Session: sess, Level: 1,
+			// groupLevel + 1, matching GroupTree.Flatten. Hardcoding 1 meant a
+			// session in `work/innotrade` claimed the depth of a root-group
+			// session, so the fixture never exercised the nested payload.
+			Index: idx, Type: web.MenuItemTypeSession, Session: sess,
+			Level: strings.Count(sess.GroupPath, "/") + 1,
 		})
 		idx++
 	}
@@ -547,6 +691,17 @@ func (s *fixtureStore) RenameGroup(groupPath, newName string) error {
 	return nil
 }
 
+func (s *fixtureStore) SetGroupExpanded(groupPath string, expanded bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.groups[groupPath]
+	if !ok {
+		return web.ErrGroupNotFound
+	}
+	g.Expanded = expanded
+	return nil
+}
+
 func (s *fixtureStore) DeleteGroup(groupPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -555,6 +710,53 @@ func (s *fixtureStore) DeleteGroup(groupPath string) error {
 	}
 	delete(s.groups, groupPath)
 	return nil
+}
+
+// fixtureConfigDirGroup stands in for a group with its own
+// [groups."X".claude].config_dir: moving a claude session into or out of it
+// reports restartRequired, so e2e can cover the web UI's warning (#2368).
+const fixtureConfigDirGroup = "personal"
+
+// MoveSessionToGroup mirrors session.GroupTree.ResolveMoveTargetGroup on the
+// in-memory store (#2368): "" or "root" is the default group, then an exact
+// match, a case-insensitive match, and otherwise a new group.
+func (s *fixtureStore) MoveSessionToGroup(id, groupPath string) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return "", false, web.ErrSessionNotFound
+	}
+	target := groupPath
+	switch {
+	case target == "" || target == "root":
+		target = session.DefaultGroupPath
+		if s.groups[target] == nil {
+			s.groups[target] = &web.MenuGroup{Name: session.DefaultGroupName, Path: target, Expanded: true, Order: len(s.groups)}
+		}
+	case s.groups[target] != nil:
+	default:
+		matched := false
+		for path := range s.groups {
+			if strings.EqualFold(path, target) {
+				target, matched = path, true
+				break
+			}
+		}
+		if !matched {
+			s.groups[target] = &web.MenuGroup{Name: target, Path: target, Expanded: true, Order: len(s.groups)}
+		}
+	}
+	if old := s.groups[sess.GroupPath]; old != nil && old.SessionCount > 0 {
+		old.SessionCount--
+	}
+	if g := s.groups[target]; g != nil {
+		g.SessionCount++
+	}
+	restartRequired := session.IsClaudeCompatible(sess.Tool) &&
+		(sess.GroupPath == fixtureConfigDirGroup) != (target == fixtureConfigDirGroup)
+	sess.GroupPath = target
+	return target, restartRequired, nil
 }
 
 // FinishWorktree implements web.SessionMutator for issue #1126. Without a

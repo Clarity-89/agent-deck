@@ -68,10 +68,53 @@ func runAgentDeck(
 	args ...string,
 ) (stdout, stderr string, exitCode int) {
 	t.Helper()
+	return runAgentDeckStdin(t, home, "", args...)
+}
 
-	bin := channelsCLIBinary(t)
-	cmd := exec.Command(bin, args...)
+// runAgentDeckStdin is runAgentDeck with a stdin body (e.g. for --note-stdin).
+func runAgentDeckStdin(
+	t *testing.T,
+	home string,
+	stdin string,
+	args ...string,
+) (stdout, stderr string, exitCode int) {
+	t.Helper()
+	return runAgentDeckEnv(t, home, stdin, nil, args...)
+}
 
+// runAgentDeckEnv is runAgentDeckStdin with extra environment entries
+// appended after the isolation set (e.g. AGENTDECK_INSTANCE_ID for a hook).
+func runAgentDeckEnv(
+	t *testing.T,
+	home string,
+	stdin string,
+	extraEnv []string,
+	args ...string,
+) (stdout, stderr string, exitCode int) {
+	t.Helper()
+
+	cmd := exec.Command(channelsCLIBinary(t), args...)
+	cmd.Env = agentDeckTestEnv(home, extraEnv)
+
+	var outBuf, errBuf strings.Builder
+	cmd.Stdin = strings.NewReader(stdin)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			t.Fatalf("run binary: %v\nstdout: %s\nstderr: %s", err, outBuf.String(), errBuf.String())
+		}
+	}
+	return outBuf.String(), errBuf.String(), exitCode
+}
+
+// agentDeckTestEnv is the environment runAgentDeckEnv gives the binary: the
+// parent's environment with HOME, XDG and agent-deck variables pointed at
+// home, then extraEnv.
+func agentDeckTestEnv(home string, extraEnv []string) []string {
 	// Strip TMUX*/AGENTDECK_*/HOME from parent so the test isolation is
 	// total — same pattern used by TestLogCgroupIsolationDecision_*
 	// in cgroup_isolation_wiring_test.go:60-78.
@@ -115,20 +158,7 @@ func runAgentDeck(
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 	)
-	cmd.Env = env
-
-	var outBuf, errBuf strings.Builder
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			t.Fatalf("run binary: %v\nstdout: %s\nstderr: %s", err, outBuf.String(), errBuf.String())
-		}
-	}
-	return outBuf.String(), errBuf.String(), exitCode
+	return append(env, extraEnv...)
 }
 
 // readSessionsJSON reads the persisted sessions for the test profile.

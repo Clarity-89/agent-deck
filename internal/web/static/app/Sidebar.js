@@ -8,21 +8,30 @@
 import { html } from 'htm/preact'
 import { useState, useMemo } from 'preact/hooks'
 import { Icon, ICONS, Dot, kindSigil } from './icons.js'
-import { menuModelSignal } from './dataModel.js'
+import { menuModelSignal, sidebarRowsSignal, isGroupOpen, toggleGroupOpen, openCreateSessionForGroup, currentGroupPath } from './dataModel.js'
 import {
-  selectedIdSignal, mutationsEnabledSignal, confirmDialogSignal,
-  createSessionDialogSignal, editSessionDialogSignal,
+  selectedIdSignal, selectedGroupSignal, selectSession, selectGroup,
+  mutationsEnabledSignal, confirmDialogSignal,
+  editSessionDialogSignal,
 } from './state.js'
-import { statusFiltersSignal, showColsSignal, activeTabSignal } from './uiState.js'
+import {
+  statusFiltersSignal, showColsSignal, activeTabSignal,
+  sidebarFilterSignal, groupExpandedSignal,
+} from './uiState.js'
 import { apiFetch } from './api.js'
 import { addToast } from './Toast.js'
 import { formatRelativeTime } from './timeFmt.js'
 
+// One chip per status bucket, in the same fixed order and with the same
+// glyphs the group stats panel and the TUI use (GROUP_STATUS_BUCKETS /
+// internal/ui/home.go:19418-19444). `stopped` was missing entirely, so a
+// parked session could not be filtered for from the web at all.
 const STATUS_CHIPS = [
   { id: 'running', sym: '●' },
   { id: 'waiting', sym: '◐' },
-  { id: 'error',   sym: '✕' },
   { id: 'idle',    sym: '○' },
+  { id: 'stopped', sym: '■' },
+  { id: 'error',   sym: '✕' },
 ]
 
 const SHOW_COL_OPTIONS = [
@@ -46,11 +55,16 @@ function doAction(action, s) {
   if (action === 'fork')    return apiFetch('POST', `/api/sessions/${id}/fork`, { title: s.title + '-fork' }).catch(() => {})
   if (action === 'archive') {
     confirmDialogSignal.value = {
+      // Reversible (unarchive restores it), so yellow rather than red —
+      // matches TUI ConfirmArchiveSession.
+      tone: 'warn',
+      confirmLabel: 'Archive',
+      title: 'Archive session?',
       message: `Archive session "${s.title}"? The process will be stopped and hidden from the active list.`,
       onConfirm: () => apiFetch('POST', `/api/sessions/${id}/archive`)
         .then(() => {
           if (selectedIdSignal.value === id) {
-            selectedIdSignal.value = null
+            selectSession(null)
             if (window.location.pathname.startsWith('/s/')) {
               history.replaceState(null, '', '/')
             }
@@ -61,6 +75,9 @@ function doAction(action, s) {
   }
   if (action === 'delete') {
     confirmDialogSignal.value = {
+      tone: 'danger',
+      confirmLabel: 'Delete',
+      title: 'Delete session?',
       message: `Delete session "${s.title}"? This stops the tmux session and removes metadata.`,
       onConfirm: () => apiFetch('DELETE', `/api/sessions/${id}`).catch(() => {}),
     }
@@ -71,6 +88,11 @@ function doAction(action, s) {
     // branch and uses default flags (merge + delete branch).
     const branch = s.worktreeBranch || s.branch
     confirmDialogSignal.value = {
+      // Destructive and not undoable (branch + worktree are deleted), so it
+      // keeps the red tone; only the label stops claiming to be a delete.
+      tone: 'danger',
+      confirmLabel: 'Finish worktree',
+      title: 'Finish worktree?',
       message: `Finish worktree for "${s.title}"? Merges branch "${branch}" into default branch, removes worktree, deletes branch, and removes session.`,
       onConfirm: () => apiFetch('POST', `/api/sessions/${id}/worktree/finish`).catch(() => {}),
     }
@@ -80,8 +102,23 @@ function doAction(action, s) {
   }
 }
 
-function SessionItem({ s, sel, onSelect, showCols }) {
+// One indent step per level of GROUP nesting, consumed by the `--depth` var in
+// app.css. Sessions are indented to their own group's level, not one past it:
+// the step between a header and its sessions is already baked into .sess's
+// larger padding-left, so a deck with no subgroups renders exactly as it did
+// before and only real nesting shifts anything right. (The TUI spends a level
+// here instead — home.go:22273 indents a session by its Level — but it has no
+// per-row padding to lean on.)
+const indentVar = (levels) => `--depth:${Math.max(0, levels)}`
+
+function SessionItem({ s, sel, rowKey, onSelect, showCols, depth, groupDepth }) {
   const [exp, setExp] = useState(false)
+  // Nested UNDER ANOTHER SESSION, not merely inside a nested group — only that
+  // needs the continuation guide. s.isSubSession alone would be wrong: the
+  // server also flags orphans whose parent sits in a different group, and it
+  // emits those at top level (groups.go:749-773), where there is nothing above
+  // for a guide to connect to.
+  const indented = depth > groupDepth + 1
   const mcpCount = (s.mcps || []).length
   const skillCount = (s.skills || []).length
   const hasSubline =
@@ -90,7 +127,11 @@ function SessionItem({ s, sel, onSelect, showCols }) {
     (showCols.sandbox && (s.sandbox || s.worktree)) ||
     showCols.lastSeen
   return html`
-    <div class=${`sess ${sel ? 'sel' : ''} ${s.kind} ${exp ? 'exp' : ''}`} onClick=${() => onSelect(s.id)}>
+    <div class=${`sess ${sel ? 'sel' : ''} ${s.kind} ${exp ? 'exp' : ''} ${indented ? 'sub' : ''}`}
+         data-row-key=${rowKey}
+         style=${indentVar(depth - 1)}
+         aria-selected=${!!sel}
+         onClick=${() => onSelect(s.id)}>
       <span class="sig">${kindSigil(s.kind)}</span>
       <div class="titleline">
         <${Dot} status=${s.status}/>
@@ -128,8 +169,8 @@ function SessionItem({ s, sel, onSelect, showCols }) {
         <button class="mini good" title="Restart" data-testid="session-restart-btn" onClick=${() => doAction('restart', s)}><${Icon} d=${ICONS.restart} size=${12}/></button>
         <button class="mini" title="Edit" data-testid="edit-session-btn" onClick=${() => doAction('edit', s)}><${Icon} d=${ICONS.edit} size=${12}/></button>
         ${s.canFork && html`<button class="mini fork" title="Fork" data-testid="session-fork-btn" onClick=${() => doAction('fork', s)}><${Icon} d=${ICONS.fork} size=${12}/></button>`}
-        ${s.worktree && html`<button class="mini" title="Finish worktree (merge + cleanup)" onClick=${() => doAction('worktreeFinish', s)} data-action="worktree-finish" data-testid="session-worktree-finish-btn">⎇✓</button>`}
-        <button class="mini" title="Archive" onClick=${() => doAction('archive', s)}>⌂</button>
+        ${s.worktree && html`<button class="mini" title="Finish worktree (merge + cleanup)" onClick=${() => doAction('worktreeFinish', s)} data-action="worktree-finish" data-testid="session-worktree-finish-btn"><${Icon} d=${ICONS.merge} size=${12}/></button>`}
+        <button class="mini warn" title="Archive" data-testid="session-archive-btn" onClick=${() => doAction('archive', s)}><${Icon} d=${ICONS.archive} size=${12}/></button>
         <button class="mini danger" title="Delete" data-testid="session-delete-btn" onClick=${() => doAction('delete', s)}><${Icon} d=${ICONS.trash} size=${12}/></button>
       </div>
     </div>
@@ -137,34 +178,28 @@ function SessionItem({ s, sel, onSelect, showCols }) {
 }
 
 export function Sidebar() {
-  const { groups, byGroup, sessions } = menuModelSignal.value
+  const { sessions } = menuModelSignal.value
+  const rows = sidebarRowsSignal.value
   const selected = selectedIdSignal.value
+  const selectedGroup = selectedGroupSignal.value
   const statusFilters = statusFiltersSignal.value
   const showCols = showColsSignal.value
-  const [filter, setFilter] = useState('')
+  const filter = sidebarFilterSignal.value
+  const expandedMap = groupExpandedSignal.value
   const [showMenu, setShowMenu] = useState(false)
-  const [expanded, setExpanded] = useState(() => Object.fromEntries(groups.map(g => [g.path, g.expanded !== false])))
 
-  const matches = (s) => {
-    if (statusFilters.length && !statusFilters.includes(s.status)) return false
-    if (!filter) return true
-    const t = filter.toLowerCase()
-    return ((s.title || '') + ' ' + (s.group || '') + ' ' + (s.path || '') + ' ' + (s.tool || '') + ' ' + (s.branch || ''))
-      .toLowerCase().includes(t)
-  }
+  const totalVisible = useMemo(
+    () => rows.reduce((n, r) => n + (r.type === 'session' ? 1 : 0), 0),
+    [rows],
+  )
 
-  const totalVisible = useMemo(() => sessions.filter(matches).length, [sessions, filter, statusFilters])
   const toggleStatus = (id) => {
     const cur = statusFiltersSignal.value
     statusFiltersSignal.value = cur.includes(id) ? cur.filter(x => x !== id) : [...cur, id]
   }
-  // Open is defined as `expanded[p] !== false` (undefined counts as open: groups
-  // arrive after the initial render, so most paths are never seeded). The toggle
-  // must mirror that read — plain `!s[p]` maps undefined → true, which is still
-  // "open", making the first click on a never-toggled group a silent no-op.
-  const toggleGroup = (p) => setExpanded(s => ({ ...s, [p]: s[p] === false }))
+  const toggleGroup = (p) => toggleGroupOpen(p)
   const onSelect = (id) => {
-    selectedIdSignal.value = id
+    selectSession(id)
     activeTabSignal.value = 'terminal'
   }
   const setShowCol = (id) => {
@@ -198,7 +233,7 @@ export function Sidebar() {
         </div>
         ${mutationsEnabledSignal.value && html`
           <button class="icon-btn" title="New session (n)" aria-label="New session"
-                  onClick=${() => (createSessionDialogSignal.value = true)}>
+                  onClick=${() => openCreateSessionForGroup(currentGroupPath())}>
             <${Icon} d=${ICONS.plus}/>
           </button>
         `}
@@ -208,7 +243,7 @@ export function Sidebar() {
           placeholder="/ filter"
           data-testid="sidebar-filter-input"
           value=${filter}
-          onInput=${e => setFilter(e.target.value)}
+          onInput=${e => (sidebarFilterSignal.value = e.target.value)}
         />
         ${STATUS_CHIPS.map(s => html`
           <span key=${s.id}
@@ -221,23 +256,31 @@ export function Sidebar() {
         `)}
       </div>
       <div class="side-list">
-        ${groups.map(g => {
-          const members = (byGroup[g.path] || []).filter(matches)
-          if (filter && members.length === 0) return null
-          const open = expanded[g.path] !== false
-          return html`
-            <div key=${g.path}>
-              <div class=${`side-group-head ${g.kind || ''}`} data-testid=${`group-head-${g.path}`} onClick=${() => toggleGroup(g.path)}>
-                <span class="chev">${open ? '▾' : '▸'}</span>
-                <span class="name">${g.label}</span>
-                <span class="badge">(${members.length})</span>
-              </div>
-              ${open && members.map(s => html`
-                <${SessionItem} key=${s.id} s=${s} sel=${selected === s.id} onSelect=${onSelect} showCols=${showCols}/>
-              `)}
+        ${rows.map(r => r.type === 'group'
+          ? html`
+            <div key=${r.key}
+                 class=${`side-group-head ${r.group.kind || ''} ${selectedGroup === r.path ? 'sel' : ''}`}
+                 data-testid=${`group-head-${r.path}`}
+                 data-row-key=${r.key}
+                 style=${indentVar(r.depth)}
+                 aria-selected=${selectedGroup === r.path}
+                 onClick=${() => selectGroup(r.path)}>
+              <button type="button" class="chev"
+                      data-testid=${`group-chev-${r.path}`}
+                      title=${isGroupOpen(expandedMap, r.path) ? 'Collapse group' : 'Expand group'}
+                      onClick=${e => { e.stopPropagation(); toggleGroup(r.path) }}>
+                ${isGroupOpen(expandedMap, r.path) ? '▾' : '▸'}
+              </button>
+              <span class="name">${r.group.label}</span>
+              <span class="badge">(${r.memberCount})</span>
             </div>
           `
-        })}
+          : html`
+            <${SessionItem} key=${r.key} s=${r.session} sel=${selected === r.id}
+                            rowKey=${r.key} depth=${r.depth} groupDepth=${r.groupDepth}
+                            onSelect=${onSelect} showCols=${showCols}/>
+          `,
+        )}
         ${sessions.length === 0 && html`
           <div style="padding: 16px; font-family: var(--mono); font-size: 11px; color: var(--muted); text-align: center;">
             No sessions yet. Press <span class="kbd" style="border:1px solid var(--border); padding: 0 4px; border-radius: 3px;">n</span> to create one.

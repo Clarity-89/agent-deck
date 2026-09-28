@@ -1,0 +1,427 @@
+// Package store opens recall.db: one dedicated writer connection, one
+// read-only pool, the pragmas the design fixes, the schema check that makes
+// the file disposable, and the machine-global sweep lock.
+package store
+
+import (
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+
+	"github.com/asheshgoplani/agent-deck/internal/recall"
+	_ "modernc.org/sqlite"
+)
+
+// LocalHostUID is the host row every locally read source hangs off. Remote
+// rows (phase 4) carry the remote agent-deck's own machine id.
+const LocalHostUID = "local"
+
+// Store is an open recall.db.
+type Store struct {
+	Path string
+	// W is the single writer: SetMaxOpenConns(1), so two goroutines cannot
+	// interleave statements of one batch.
+	W *sql.DB
+	// R is the read-only pool with a 15 s busy timeout.
+	R *sql.DB
+}
+
+const writerPragmas = "?_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
+	"&_pragma=wal_autocheckpoint(1000)&_pragma=journal_size_limit(67108864)&_pragma=cache_size(-8000)&_pragma=mmap_size(0)"
+
+const readerPragmas = "?mode=ro&_pragma=busy_timeout(15000)&_pragma=query_only(1)&_pragma=cache_size(-8000)&_pragma=mmap_size(0)"
+
+// ErrSchema means the file at path was written by another schema version.
+var ErrSchema = errors.New("recall: recall.db has a different schema version")
+
+// Open opens or creates recall.db at path. A file whose meta.schema_version
+// is not recall.SchemaVersion is deleted and recreated: everything in it is
+// reproducible from transcripts, and that is the whole point of the split
+// with state.db. Callers that may run beside a sweep take the sweep lock
+// before recreating: OpenCurrent first, then Open under the lock.
+func Open(path string) (*Store, error) {
+	s, err := OpenCurrent(path)
+	if !errors.Is(err, ErrSchema) {
+		return s, err
+	}
+	if err := RemoveFiles(path); err != nil {
+		return nil, err
+	}
+	return createNew(path)
+}
+
+// OpenCurrent opens recall.db at path, creating it when absent, and returns
+// ErrSchema (with nothing deleted) when the file has another schema version.
+func OpenCurrent(path string) (*Store, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("recall: mkdir: %w", err)
+	}
+	s, err := open(path)
+	if err != nil {
+		return nil, err
+	}
+	ok, err := s.schemaCurrent()
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	if !ok {
+		var n int
+		empty := s.W.QueryRow(`SELECT count(*) FROM sqlite_master`).Scan(&n) == nil && n == 0
+		s.Close()
+		if !empty {
+			return nil, ErrSchema
+		}
+		return createNew(path)
+	}
+	return s, nil
+}
+
+// createNew opens a fresh recall.db at path and lays down the schema.
+func createNew(path string) (*Store, error) {
+	s, err := open(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.create(); err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func open(path string) (*Store, error) {
+	w, err := sql.Open("sqlite", "file:"+path+writerPragmas)
+	if err != nil {
+		return nil, fmt.Errorf("recall: open writer: %w", err)
+	}
+	w.SetMaxOpenConns(1)
+	if err := w.Ping(); err != nil {
+		_ = w.Close()
+		return nil, fmt.Errorf("recall: open writer: %w", err)
+	}
+	r, err := sql.Open("sqlite", "file:"+path+readerPragmas)
+	if err != nil {
+		_ = w.Close()
+		return nil, fmt.Errorf("recall: open reader: %w", err)
+	}
+	r.SetMaxOpenConns(4)
+	return &Store{Path: path, W: w, R: r}, nil
+}
+
+// schemaCurrent reports whether meta says this file is ours and current.
+// An empty file (no tables) is treated as not current so it gets created.
+func (s *Store) schemaCurrent() (bool, error) {
+	var n int
+	if err := s.W.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='meta'`).Scan(&n); err != nil {
+		return false, fmt.Errorf("recall: inspect: %w", err)
+	}
+	if n == 0 {
+		return false, nil
+	}
+	var v string
+	err := s.W.QueryRow(`SELECT v FROM meta WHERE k='schema_version'`).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("recall: read schema version: %w", err)
+	}
+	got, _ := strconv.Atoi(v)
+	return got == recall.SchemaVersion, nil
+}
+
+func (s *Store) create() error {
+	// Must precede the first table so gc can hand freed pages back with
+	// PRAGMA incremental_vacuum instead of a full VACUUM copy.
+	for _, stmt := range []string{`PRAGMA auto_vacuum=INCREMENTAL`, `VACUUM`} {
+		if _, err := s.W.Exec(stmt); err != nil {
+			return fmt.Errorf("recall: %s: %w", stmt, err)
+		}
+	}
+	var av int
+	if err := s.W.QueryRow(`PRAGMA auto_vacuum`).Scan(&av); err != nil || av != 2 {
+		return fmt.Errorf("recall: auto_vacuum not incremental (%d, %v)", av, err)
+	}
+	tx, err := s.W.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range recall.AllDDL() {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("recall: create schema: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO meta(k, v) VALUES ('schema_version', ?)`, strconv.Itoa(recall.SchemaVersion)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO host(host_uid, alias, is_local, last_seen) VALUES (?, 'this machine', 1, 0)`, LocalHostUID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Close closes both handles.
+func (s *Store) Close() {
+	if s == nil {
+		return
+	}
+	_ = s.R.Close()
+	_ = s.W.Close()
+}
+
+// Reset deletes the database and recreates it empty (recall rebuild).
+func (s *Store) Reset() error {
+	_ = s.R.Close()
+	_ = s.W.Close()
+	if err := RemoveFiles(s.Path); err != nil {
+		return err
+	}
+	n, err := open(s.Path)
+	if err != nil {
+		return err
+	}
+	*s = *n
+	return s.create()
+}
+
+// RemoveFiles deletes recall.db and its WAL sidecars. It only ever runs on
+// the disposable file.
+func RemoveFiles(path string) error {
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if err := os.Remove(path + suffix); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("recall: remove %s: %w", path+suffix, err)
+		}
+	}
+	return nil
+}
+
+// FileSize is the on-disk size of the main file plus WAL.
+func FileSize(path string) int64 {
+	var total int64
+	for _, suffix := range []string{"", "-wal"} {
+		if info, err := os.Stat(path + suffix); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+// ErrLocked means another sweep or backfill holds the machine-global lock.
+var ErrLocked = errors.New("recall: another sweep is running")
+
+// Lock takes the machine-global sweep lock (a flock beside recall.db) without
+// waiting. All profiles contend on this one file.
+func Lock(lockPath string) (release func(), err error) {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, ErrLocked
+		}
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// metaHostUID is the meta key holding this machine's recall identity.
+const metaHostUID = "host_uid"
+
+// HostUID returns this machine's stable recall identity: 32 hex characters
+// minted on first use and kept in meta. Every card this machine exports is
+// stamped with it, so a card stream is bound to the machine that produced
+// it and not to the alias it was reached under (an alias can be renamed or
+// repointed; the uid cannot). A rebuild mints a new one, which is correct:
+// a rebuilt index is a new corpus for a puller's cursor.
+func (s *Store) HostUID() (string, error) {
+	var v string
+	err := s.W.QueryRow(`SELECT v FROM meta WHERE k=?`, metaHostUID).Scan(&v)
+	if err == nil && v != "" {
+		return v, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("recall: mint host uid: %w", err)
+	}
+	v = hex.EncodeToString(buf)
+	if _, err := s.W.Exec(`INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING`, metaHostUID, v); err != nil {
+		return "", err
+	}
+	// Another opener may have won the race: read back what is stored.
+	if err := s.W.QueryRow(`SELECT v FROM meta WHERE k=?`, metaHostUID).Scan(&v); err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
+// Initial backfill state (docs/recall.md, issue #2329): the one-time
+// background pass that catches an empty or never-finished index up when
+// [recall] backfill_on_enable is true. The marker lives in recall.db's meta
+// table beside host_uid and last_sweep, so it resets with the disposable
+// index (a rebuild, or a schema bump, both warrant a fresh catch-up) and
+// survives a process restart (a daemon that dies mid-pass leaves it
+// "running"; the next daemon picks that up the same as "pending").
+const (
+	InitialBackfillPending = "pending"
+	InitialBackfillRunning = "running"
+	InitialBackfillDone    = "done"
+)
+
+const (
+	metaInitialBackfillState           = "initial_backfill_state"
+	metaInitialBackfillDoneAt          = "initial_backfill_done_at"
+	metaInitialBackfillSessionsDone    = "initial_backfill_sessions_done"
+	metaInitialBackfillSessionsPending = "initial_backfill_sessions_pending"
+	metaInitialBackfillRootsWalked     = "initial_backfill_roots_walked"
+	metaInitialBackfillRootsTotal      = "initial_backfill_roots_total"
+	metaInitialBackfillUnreadableRoots = "initial_backfill_unreadable_roots"
+)
+
+// InitialBackfillStatus is the `initial_backfill` block of `recall status
+// --json`. RootsWalked/RootsTotal and UnreadableRoots (each entry
+// "harness:profile:dir: error") are checkpointed by the same chunk that
+// checkpoints SessionsDone/SessionsPending, so a scan that only ever
+// reaches a fraction of the configured roots is visible here rather than
+// silently folded into a false "done".
+type InitialBackfillStatus struct {
+	State           string   `json:"state"`
+	DoneAt          int64    `json:"done_at,omitempty"`
+	SessionsDone    int      `json:"sessions_done"`
+	SessionsPending int      `json:"sessions_pending"`
+	RootsWalked     int      `json:"roots_walked,omitempty"`
+	RootsTotal      int      `json:"roots_total,omitempty"`
+	UnreadableRoots []string `json:"unreadable_roots,omitempty"`
+}
+
+// InitialBackfillStatus reads the persisted marker. An index with no marker
+// at all (built before this feature shipped, or by a plain `recall
+// backfill`) is always "pending", regardless of how many sessions it
+// already holds: a handful of sessions an ordinary hook sweep wrote before
+// the background pass ever ran look identical, in the ledger, to a fully
+// completed manual backfill, and treating session-count alone as proof of
+// completeness is exactly what let `recall status` report "done" on a
+// machine where the background pass had barely scanned two of ten
+// configured roots (issue: initial backfill completeness). Reporting
+// "pending" here costs nothing: ShouldRunInitialBackfill then lets the
+// throttled pass run once, which re-verifies every already-ledgered source
+// as unchanged (cheap) and persists a real marker so this fallback is never
+// consulted again for this index.
+func (s *Store) InitialBackfillStatus() (InitialBackfillStatus, error) {
+	var status InitialBackfillStatus
+	var state, doneAt, done, pending, walked, total, unreadable sql.NullString
+	row := s.W.QueryRow(`SELECT
+		(SELECT v FROM meta WHERE k=?),
+		(SELECT v FROM meta WHERE k=?),
+		(SELECT v FROM meta WHERE k=?),
+		(SELECT v FROM meta WHERE k=?),
+		(SELECT v FROM meta WHERE k=?),
+		(SELECT v FROM meta WHERE k=?),
+		(SELECT v FROM meta WHERE k=?)`,
+		metaInitialBackfillState, metaInitialBackfillDoneAt, metaInitialBackfillSessionsDone, metaInitialBackfillSessionsPending,
+		metaInitialBackfillRootsWalked, metaInitialBackfillRootsTotal, metaInitialBackfillUnreadableRoots)
+	if err := row.Scan(&state, &doneAt, &done, &pending, &walked, &total, &unreadable); err != nil {
+		return status, err
+	}
+	status.State = state.String
+	status.DoneAt, _ = strconv.ParseInt(doneAt.String, 10, 64)
+	status.SessionsDone, _ = strconv.Atoi(done.String)
+	status.SessionsPending, _ = strconv.Atoi(pending.String)
+	status.RootsWalked, _ = strconv.Atoi(walked.String)
+	status.RootsTotal, _ = strconv.Atoi(total.String)
+	if unreadable.String != "" {
+		status.UnreadableRoots = strings.Split(unreadable.String, "\n")
+	}
+	// A "done" marker written by pre-#2337 code has no roots_walked/
+	// roots_total meta rows at all (the fields didn't exist yet), which
+	// this query surfaces as both NullStrings being !Valid — distinct from
+	// a modern marker that legitimately finished with zero configured
+	// roots (roots_total would be the explicit string "0", Valid=true).
+	// Trusting that legacy "done" at face value is exactly the g14/sbbox
+	// symptom (roots=None/None forever "complete"): report it "pending"
+	// instead, once, so ShouldRunInitialBackfill lets the throttled pass
+	// re-walk every root and persist a real marker with roots_walked set;
+	// after that this branch is never hit again for this index.
+	if status.State == InitialBackfillDone && !walked.Valid && !total.Valid {
+		status.State = InitialBackfillPending
+		return status, nil
+	}
+	if status.State != "" {
+		return status, nil
+	}
+	var n int
+	if err := s.W.QueryRow(`SELECT count(*) FROM session`).Scan(&n); err != nil {
+		return status, err
+	}
+	status.State = InitialBackfillPending
+	status.SessionsDone = n
+	return status, nil
+}
+
+// SetInitialBackfillState writes the marker (pending/running/done); doneAt
+// is stamped only when state is done.
+func (s *Store) SetInitialBackfillState(state string, now int64) error {
+	tx, err := s.W.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, metaInitialBackfillState, state); err != nil {
+		return err
+	}
+	if state == InitialBackfillDone {
+		if _, err := tx.Exec(`INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, metaInitialBackfillDoneAt, strconv.FormatInt(now, 10)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SetInitialBackfillProgress checkpoints one chunk's worth of initial
+// backfill progress, so a restart mid-pass (or a `recall status` while it
+// runs) reports the last chunk's numbers rather than stale ones: how many
+// sessions are done/pending, and how many of the configured roots the scan
+// could actually walk. walked+len(unreadable) always equals total
+// (root-level discovery is not budget-limited, so every root is either
+// walked or found unreadable on the very first chunk), but a root that
+// never lists is reported here rather than silently dropped from the
+// count. unreadable entries are "harness:profile:dir: error".
+func (s *Store) SetInitialBackfillProgress(sessionsDone, sessionsPending, rootsWalked, rootsTotal int, unreadableRoots []string) error {
+	tx, err := s.W.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	vals := map[string]string{
+		metaInitialBackfillSessionsDone:    strconv.Itoa(sessionsDone),
+		metaInitialBackfillSessionsPending: strconv.Itoa(sessionsPending),
+		metaInitialBackfillRootsWalked:     strconv.Itoa(rootsWalked),
+		metaInitialBackfillRootsTotal:      strconv.Itoa(rootsTotal),
+		metaInitialBackfillUnreadableRoots: strings.Join(unreadableRoots, "\n"),
+	}
+	for k, v := range vals {
+		if _, err := tx.Exec(`INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, k, v); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}

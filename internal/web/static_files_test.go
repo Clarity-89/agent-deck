@@ -11,7 +11,7 @@ import (
 
 func TestIndexCacheControl(t *testing.T) {
 	s := NewServer(Config{Token: "test-token"})
-	req := httptest.NewRequest(http.MethodGet, "/?token=test-token", nil)
+	req := newLocalRequest(http.MethodGet, "/?token=test-token", nil)
 	w := httptest.NewRecorder()
 	s.handleIndex(w, req)
 	if w.Code != 200 {
@@ -25,7 +25,7 @@ func TestIndexCacheControl(t *testing.T) {
 
 func TestIndexImportMap(t *testing.T) {
 	s := NewServer(Config{Token: "test-token"})
-	req := httptest.NewRequest(http.MethodGet, "/?token=test-token", nil)
+	req := newLocalRequest(http.MethodGet, "/?token=test-token", nil)
 	w := httptest.NewRecorder()
 	s.handleIndex(w, req)
 	body := w.Body.String()
@@ -47,7 +47,7 @@ func TestIndexImportMap(t *testing.T) {
 
 func TestIndexThemeInit(t *testing.T) {
 	s := NewServer(Config{Token: "test-token"})
-	req := httptest.NewRequest(http.MethodGet, "/?token=test-token", nil)
+	req := newLocalRequest(http.MethodGet, "/?token=test-token", nil)
 	w := httptest.NewRecorder()
 	s.handleIndex(w, req)
 	body := w.Body.String()
@@ -64,7 +64,7 @@ func TestIndexThemeInit(t *testing.T) {
 
 func TestIndexNoCDN(t *testing.T) {
 	s := NewServer(Config{Token: "test-token"})
-	req := httptest.NewRequest(http.MethodGet, "/?token=test-token", nil)
+	req := newLocalRequest(http.MethodGet, "/?token=test-token", nil)
 	w := httptest.NewRecorder()
 	s.handleIndex(w, req)
 	body := w.Body.String()
@@ -93,7 +93,7 @@ func TestVendorFilesServed(t *testing.T) {
 		// always false, making the canvas fallback inert. See the 404 gate
 		// in TestAddonCanvasDeleted below.
 	} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req := newLocalRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
 		if w.Code != 200 {
@@ -284,7 +284,7 @@ func TestAddonCanvasDeleted(t *testing.T) {
 	s := NewServer(Config{Token: "test-token"})
 
 	// Index must not reference addon-canvas.js
-	req := httptest.NewRequest(http.MethodGet, "/?token=test-token", nil)
+	req := newLocalRequest(http.MethodGet, "/?token=test-token", nil)
 	w := httptest.NewRecorder()
 	s.handleIndex(w, req)
 	body := w.Body.String()
@@ -295,7 +295,7 @@ func TestAddonCanvasDeleted(t *testing.T) {
 	// Static file server must 404 on the deleted path
 	mux := http.NewServeMux()
 	mux.Handle("/static/", http.StripPrefix("/static/", s.staticFileServer()))
-	req2 := httptest.NewRequest(http.MethodGet, "/static/vendor/addon-canvas.js", nil)
+	req2 := newLocalRequest(http.MethodGet, "/static/vendor/addon-canvas.js", nil)
 	w2 := httptest.NewRecorder()
 	mux.ServeHTTP(w2, req2)
 	if w2.Code != 404 {
@@ -305,7 +305,7 @@ func TestAddonCanvasDeleted(t *testing.T) {
 
 func TestIndexXtermCSS(t *testing.T) {
 	s := NewServer(Config{Token: "test-token"})
-	req := httptest.NewRequest(http.MethodGet, "/?token=test-token", nil)
+	req := newLocalRequest(http.MethodGet, "/?token=test-token", nil)
 	w := httptest.NewRecorder()
 	s.handleIndex(w, req)
 	body := w.Body.String()
@@ -316,7 +316,7 @@ func TestIndexXtermCSS(t *testing.T) {
 
 func TestIndexAppRoot(t *testing.T) {
 	s := NewServer(Config{Token: "test-token"})
-	req := httptest.NewRequest(http.MethodGet, "/?token=test-token", nil)
+	req := newLocalRequest(http.MethodGet, "/?token=test-token", nil)
 	w := httptest.NewRecorder()
 	s.handleIndex(w, req)
 	body := w.Body.String()
@@ -325,17 +325,55 @@ func TestIndexAppRoot(t *testing.T) {
 	}
 }
 
-func TestCreateSessionDialogUsesModelIDCatalog(t *testing.T) {
-	data, err := embeddedStaticFiles.ReadFile("static/app/CreateSessionDialog.js")
+// Issue #2372: Claude Code sessions capture the mouse, so a plain drag goes to
+// the app. On macOS xterm only forces a native selection for Option-drag when
+// macOptionClickForcesSelection is on, and it defaults off, so without it there
+// is no way to select text in those sessions from the web UI on a Mac.
+// Copy-on-select must skip an empty selection, or a stray click would replace
+// the clipboard with nothing.
+func TestTerminalPanelSelectsAndCopiesPastMouseCapture(t *testing.T) {
+	data, err := embeddedStaticFiles.ReadFile("static/app/TerminalPanel.js")
 	if err != nil {
-		t.Fatalf("read CreateSessionDialog.js: %v", err)
+		t.Fatalf("read TerminalPanel.js: %v", err)
 	}
 	body := string(data)
+
+	for _, want := range []string{
+		"macOptionClickForcesSelection: true",
+		"terminal.onSelectionChange(",
+		"if (text && navigator.clipboard?.writeText)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("TerminalPanel.js missing %q", want)
+		}
+	}
+}
+
+// createSessionDialogSources returns the dialog plus modelCatalog.js, where
+// its model and effort tables live since #2388.
+func createSessionDialogSources(t *testing.T) string {
+	t.Helper()
+	var body strings.Builder
+	for _, name := range []string{"static/app/CreateSessionDialog.js", "static/app/modelCatalog.js"} {
+		data, err := embeddedStaticFiles.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		body.Write(data)
+	}
+	return body.String()
+}
+
+func TestCreateSessionDialogUsesModelIDCatalog(t *testing.T) {
+	body := createSessionDialogSources(t)
 
 	for _, want := range []string{
 		"MODEL_ID_CATALOG",
 		"<label>MODEL ID</label>",
 		`<option value="">Tool default</option>`,
+		"gpt-6-astra",
+		"gpt-6-sol",
+		"gpt-6-luna",
 		"gpt-5.6-sol",
 		"gpt-5.6-terra",
 		"gpt-5.6-luna",
@@ -344,6 +382,7 @@ func TestCreateSessionDialogUsesModelIDCatalog(t *testing.T) {
 		"gpt-5.4-mini",
 		"gpt-5.3-codex",
 		"o3-pro",
+		"claude-opus-5-5",
 		"claude-opus-5",
 		"claude-sonnet-5",
 		"claude-fable-5",
@@ -355,6 +394,7 @@ func TestCreateSessionDialogUsesModelIDCatalog(t *testing.T) {
 		"gemini-3-flash-preview",
 		"gemini-2.5-flash-lite",
 		"openai/gpt-5.5",
+		"anthropic/claude-opus-5-5",
 		"anthropic/claude-opus-5",
 		"anthropic/claude-sonnet-5",
 		"anthropic/claude-fable-5",
@@ -363,7 +403,7 @@ func TestCreateSessionDialogUsesModelIDCatalog(t *testing.T) {
 		"Custom model ID",
 	} {
 		if !strings.Contains(body, want) {
-			t.Fatalf("CreateSessionDialog.js missing %q", want)
+			t.Fatalf("CreateSessionDialog.js + modelCatalog.js missing %q", want)
 		}
 	}
 	if strings.Contains(body, "<label>VERSION</label>") {
@@ -372,20 +412,17 @@ func TestCreateSessionDialogUsesModelIDCatalog(t *testing.T) {
 }
 
 func TestCreateSessionDialogUsesToolSpecificReasoningEffortCatalog(t *testing.T) {
-	data, err := embeddedStaticFiles.ReadFile("static/app/CreateSessionDialog.js")
-	if err != nil {
-		t.Fatalf("read CreateSessionDialog.js: %v", err)
-	}
-	source := string(data)
+	source := createSessionDialogSources(t)
 	for _, want := range []string{
 		"REASONING EFFORT",
 		"reasoningEffort",
 		"minimal",
 		"xhigh",
 		"max",
+		"ultra",
 	} {
 		if !strings.Contains(source, want) {
-			t.Fatalf("CreateSessionDialog.js missing expected content %q", want)
+			t.Fatalf("CreateSessionDialog.js + modelCatalog.js missing expected content %q", want)
 		}
 	}
 }
@@ -403,7 +440,7 @@ func TestCreateSessionDialogUsesToolSpecificReasoningEffortCatalog(t *testing.T)
 // regressed the cascade swap. See .planning/research/PITFALLS.md Pitfall #2.
 func TestNoTailwindPlayCDN(t *testing.T) {
 	s := NewServer(Config{Token: "test-token"})
-	req := httptest.NewRequest(http.MethodGet, "/?token=test-token", nil)
+	req := newLocalRequest(http.MethodGet, "/?token=test-token", nil)
 	w := httptest.NewRecorder()
 	s.handleIndex(w, req)
 	body := w.Body.String()
@@ -420,10 +457,30 @@ func TestNoTailwindPlayCDN(t *testing.T) {
 	// The static file server should now 404 on /static/vendor/tailwind.js.
 	mux := http.NewServeMux()
 	mux.Handle("/static/", http.StripPrefix("/static/", s.staticFileServer()))
-	req2 := httptest.NewRequest(http.MethodGet, "/static/vendor/tailwind.js", nil)
+	req2 := newLocalRequest(http.MethodGet, "/static/vendor/tailwind.js", nil)
 	w2 := httptest.NewRecorder()
 	mux.ServeHTTP(w2, req2)
 	if w2.Code != 404 {
 		t.Errorf("GET /static/vendor/tailwind.js: expected 404, got %d", w2.Code)
+	}
+}
+
+// TestIndexServesGroupRoute pins that /g/{path} serves the SPA shell rather
+// than 404ing, so a selected group is linkable and survives a reload.
+func TestIndexServesGroupRoute(t *testing.T) {
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+
+	for _, path := range []string{"/g/work", "/g/work%2Finnotrade"} {
+		req := newLocalRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("GET %s = %d, want %d", path, rr.Code, http.StatusOK)
+		}
+		if !strings.Contains(rr.Body.String(), "<!doctype html") &&
+			!strings.Contains(rr.Body.String(), "<!DOCTYPE html") {
+			t.Errorf("GET %s did not serve the SPA shell", path)
+		}
 	}
 }

@@ -3469,14 +3469,14 @@ func TestInstance_HookFastPath_CodexRunningStale(t *testing.T) {
 	}
 }
 
-func TestInstance_HookFastPath_CodexWaitingFreshness(t *testing.T) {
+func TestInstance_HookFastPath_CodexWaitingExpiresPromptly(t *testing.T) {
 	inst := NewInstanceWithTool("hook-codex-waiting", "/tmp/test", "codex")
 	inst.hookStatus = "waiting"
-	inst.hookLastUpdate = time.Now().Add(-30 * time.Second)
+	inst.hookLastUpdate = time.Now().Add(-6 * time.Second)
 
 	_, fresh := inst.GetHookStatus()
-	if !fresh {
-		t.Error("codex waiting hook should be fresh for waiting window")
+	if fresh {
+		t.Error("codex waiting hook should expire promptly so tmux can detect a new turn")
 	}
 }
 
@@ -4223,10 +4223,21 @@ func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Claude(t *
 }
 
 func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Codex(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	codexHome := filepath.Join(home, ".codex")
+	t.Setenv("CODEX_HOME", codexHome)
 
 	inst := NewInstanceWithTool("hook-anchor-codex", "/tmp/test", "codex")
+	// The Codex notify writer stores each payload id as the anchor, so an
+	// ephemeral title thread can land there too: a turn end binds the anchor
+	// only once its thread owns a rollout.
 	WriteHookSessionAnchor(inst.ID, "anchor-codex-1")
+	inst.UpdateHookStatus(&HookStatus{Status: "waiting", Event: "turn/completed", UpdatedAt: time.Now()})
+	if inst.CodexSessionID != "" {
+		t.Fatalf("rollout-less anchor bound on a turn end: %q", inst.CodexSessionID)
+	}
+	seedCodex155Rollout(t, codexHome, "anchor-codex-1", "turn-1")
 
 	hookStatus := &HookStatus{
 		Status:    "waiting",

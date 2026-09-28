@@ -16,6 +16,12 @@ import (
 // Claude Code replaces all such characters with hyphens in project directory names
 var claudeDirNameRegex = regexp.MustCompile(`[^a-zA-Z0-9-]`)
 
+// claudeProjectDirNameRegex accepts exactly the alphabet ConvertToClaudeDirName
+// emits: one non-empty path component with no separator and no "..". It is
+// the bound claudeProjectDir enforces before a project path chosen by a
+// caller (the web API accepts one in a request body) selects a directory.
+var claudeProjectDirNameRegex = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
+
 // uuidSessionFileRegex matches UUID-format JSONL session filenames.
 var uuidSessionFileRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$`)
 
@@ -137,6 +143,18 @@ func extractExplicitClaudeIDForFlags(command, flag string) (string, bool) {
 // Example: /Users/master/Code cloud/!Project → -Users-master-Code-cloud--Project
 func ConvertToClaudeDirName(path string) string {
 	return claudeDirNameRegex.ReplaceAllString(path, "-")
+}
+
+// claudeProjectDir returns configDir/projects/<encoded> and true when encoded
+// is a single safe path component, which is what ConvertToClaudeDirName
+// always produces. Anything else (empty, a separator, "..") yields false so a
+// caller-supplied project path can never select a directory outside the
+// projects tree of the config dir.
+func claudeProjectDir(configDir, encoded string) (string, bool) {
+	if !claudeProjectDirNameRegex.MatchString(encoded) {
+		return "", false
+	}
+	return filepath.Join(configDir, "projects", encoded), true
 }
 
 // ClaudeProject represents a project entry in Claude's config
@@ -550,11 +568,94 @@ func GetClaudeConfigDirSourceForInstance(inst *Instance) (path, source string) {
 	return resolveClaudeConfigDir(resolveOpts{inst: inst})
 }
 
+// GetClaudeConfigDirForInstanceInGroup resolves the config dir the instance
+// WOULD have if its GroupPath were groupPath, without mutating the instance.
+// Used by `session move --group` (#2086 follow-up) to compute the destination
+// config dir from the group the session is about to land in. Priority is
+// unchanged: Instance.Account and conductor still beat the group level.
+// Passing "" falls back to inst.GroupPath, i.e. it is then identical to
+// GetClaudeConfigDirForInstance.
+func GetClaudeConfigDirForInstanceInGroup(inst *Instance, groupPath string) string {
+	path, _ := resolveClaudeConfigDir(resolveOpts{inst: inst, groupPath: groupPath})
+	return path
+}
+
 // IsClaudeConfigDirExplicitForInstance returns true if ANY priority level
 // sets a config dir for this Instance.
 func IsClaudeConfigDirExplicitForInstance(inst *Instance) bool {
 	_, source := resolveClaudeConfigDir(resolveOpts{inst: inst})
 	return source != "default"
+}
+
+// Config-dir source labels that only SpawnClaudeConfigDirForInstance can
+// return. The rest come from resolveClaudeConfigDir.
+const (
+	// ClaudeConfigSourceWorkerScratch means the running process was handed the
+	// per-session scratch home agent-deck prepared for it.
+	ClaudeConfigSourceWorkerScratch = "worker-scratch"
+	// ClaudeConfigSourceAmbient means agent-deck exported nothing, so the
+	// process inherited whatever CLAUDE_CONFIG_DIR its shell had. The path
+	// returned alongside it is where the resolver would land, which is a
+	// well-founded guess and not an observation.
+	ClaudeConfigSourceAmbient = "ambient"
+)
+
+// SpawnClaudeConfigDirForInstance returns the CLAUDE_CONFIG_DIR the spawned
+// claude process actually runs under, with a label for how it was decided.
+//
+// It exists because GetClaudeConfigDirForInstance answers a different question.
+// That function resolves which *account* a session belongs to — the user's
+// intent — and deliberately ignores worker-scratch dirs, because a scratch home
+// is an ephemeral mirror and must never be mistaken for a credential source.
+// But the scratch home is exactly what the process is handed at spawn, and
+// therefore exactly where its CLAUDE.md, settings.json, skills and projects
+// come from. A reader asking "what is loaded into this session" who is shown
+// the profile dir is shown files that are not the ones being read: on a real
+// session that meant listing two phantom memory files and missing the one the
+// harness actually loaded.
+//
+// The gate is reproduced from the spawn builders (buildClaudeCommandWithMessage
+// / buildBashExportPrefix / buildClaudeResumeCommand, issue #949) rather than
+// re-invented, so this cannot drift from what is really exported:
+//
+//  1. no prepared scratch, or the scratch is gone from disk → the resolved dir
+//  2. scratch prepared but the config-dir gate is closed (nothing explicit) →
+//     dormant scratch, the process inherits the ambient dir
+//  3. otherwise → the scratch home
+//
+// A caller that needs to know whether the answer is observed or inferred should
+// test the source against [ClaudeConfigSourceAmbient].
+func SpawnClaudeConfigDirForInstance(inst *Instance) (path, source string) {
+	if inst == nil {
+		return "", ""
+	}
+	resolved, resolvedSource := resolveClaudeConfigDir(resolveOpts{inst: inst})
+	if !IsClaudeConfigDirExplicitForInstance(inst) {
+		// The gate is closed: agent-deck exports no CLAUDE_CONFIG_DIR at all,
+		// so any prepared scratch stays dormant and the process falls back to
+		// the harness's own default. Reporting the resolved default path is
+		// right; reporting it as if we had set it is not.
+		return resolved, ClaudeConfigSourceAmbient
+	}
+	scratch := strings.TrimSpace(inst.WorkerScratchConfigDir)
+	if scratch == "" {
+		// WorkerScratchConfigDir lives only on the process that prepared it —
+		// it is not a column in the instances table. A CLI invocation that
+		// loaded this session from state.db therefore sees it empty even while
+		// the running pane is reading a scratch home. The path is deterministic
+		// from the instance id, so recover it and let the filesystem decide.
+		scratch = WorkerScratchConfigDirFor(inst.ID)
+	}
+	if scratch == "" {
+		return resolved, resolvedSource
+	}
+	if info, err := os.Stat(scratch); err != nil || !info.IsDir() {
+		// Never created, or cleaned up since (a stopped session): whichever, no
+		// process is reading it now, and the resolved dir is what a fresh spawn
+		// would use.
+		return resolved, resolvedSource
+	}
+	return scratch, ClaudeConfigSourceWorkerScratch
 }
 
 // GetClaudeCommand returns the configured Claude command/alias
@@ -781,9 +882,10 @@ func discoverLatestClaudeJSONL(projectPath string) (string, bool) {
 		encoded = "-"
 	}
 
-	projectDir := filepath.Join(configDir, "projects", encoded)
-	// #nosec G703 -- projectDir is derived from configDir (CLAUDE_CONFIG_DIR)
-	// joined with an encoded session ID; not from untrusted input.
+	projectDir, ok := claudeProjectDir(configDir, encoded)
+	if !ok {
+		return "", false
+	}
 	if _, err := os.Stat(projectDir); os.IsNotExist(err) {
 		return "", false
 	}
@@ -820,6 +922,107 @@ func discoverLatestClaudeJSONL(projectPath string) (string, bool) {
 		return "", false
 	}
 	return bestUUID, true
+}
+
+// claudeConfigDirRootsForInstance returns every Claude config-dir root that
+// could plausibly hold this instance's transcript, symlink-resolved and
+// deduplicated:
+//
+//  1. GetClaudeConfigDirForInstance(inst) — the dir the resume/spawn code
+//     itself resolves (account/conductor/group/env/profile/global/default).
+//  2. The raw CLAUDE_CONFIG_DIR env var, in case it differs from (1) (the
+//     resolver can rank a more-specific TOML override above it).
+//  3. Every OTHER configured account slot's config_dir (#924) — a session
+//     can legitimately belong to an account other than Instance.Account
+//     right after an account switch that hasn't been persisted onto the
+//     instance yet, the exact #2301/#1815 incident shape.
+//  4. The bare default ~/.claude.
+//
+// Used by the #2301 continue-mode existence check
+// (buildClaudeResumeCommand) so it can't mistake "wrong root" for
+// "no transcript" the way a single process-wide GetClaudeConfigDir() call
+// does for any account/conductor/group-scoped instance.
+func claudeConfigDirRootsForInstance(inst *Instance) []string {
+	seen := make(map[string]bool)
+	var roots []string
+	add := func(dir string) {
+		if dir == "" {
+			return
+		}
+		resolved := dir
+		if r, err := filepath.EvalSymlinks(dir); err == nil {
+			resolved = r
+		}
+		if seen[resolved] {
+			return
+		}
+		seen[resolved] = true
+		roots = append(roots, resolved)
+	}
+
+	add(GetClaudeConfigDirForInstance(inst))
+	add(envClaudeConfigDirIgnoringScratchLeak())
+
+	if userConfig, _ := LoadUserConfig(); userConfig != nil {
+		for name := range userConfig.Profiles {
+			add(userConfig.GetProfileClaudeConfigDir(name))
+		}
+	}
+
+	if home, err := os.UserHomeDir(); err == nil {
+		add(filepath.Join(home, ".claude"))
+	}
+
+	return roots
+}
+
+// transcriptEvidenceAcrossRoots reports whether ANY of the given Claude
+// config-dir roots holds a transcript for projectPath (found), and whether
+// any root could not be conclusively checked, e.g. a permission error
+// (uncertain). A root that simply doesn't exist is confirmed-empty, not
+// uncertain — only a real read failure counts, since it means the root's
+// true contents are unknown rather than known-absent.
+//
+// Callers must fail towards "a transcript might exist" whenever uncertain
+// is true: an unreadable root is exactly the case where guessing "no
+// transcript" risks silently discarding a real, resumable conversation.
+func transcriptEvidenceAcrossRoots(projectPath string, roots []string) (found bool, uncertain bool) {
+	resolvedPath := projectPath
+	if resolved, err := filepath.EvalSymlinks(projectPath); err == nil {
+		resolvedPath = resolved
+	}
+	encoded := ConvertToClaudeDirName(resolvedPath)
+	if encoded == "" {
+		encoded = "-"
+	}
+
+	for _, configDir := range roots {
+		projectDir, ok := claudeProjectDir(configDir, encoded)
+		if !ok {
+			return false, false
+		}
+		entries, err := os.ReadDir(projectDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			uncertain = true
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			base := e.Name()
+			if strings.HasPrefix(base, "agent-") {
+				continue
+			}
+			if uuidSessionFileRegex.MatchString(base) {
+				return true, false
+			}
+		}
+	}
+	return false, uncertain
 }
 
 // getProjectSettingsPath returns the path to .claude/settings.local.json for a project

@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ const (
 	ConductorAgentClaude = "claude"
 	ConductorAgentCodex  = "codex"
 	ConductorAgentHermes = "hermes"
+	ConductorAgentPi     = "pi"
 
 	ConductorSessionTitlePrefix     = "conductor-"
 	ConductorHeartbeatMessagePrefix = "Heartbeat:"
@@ -62,6 +65,13 @@ var conductorAgentSpecs = map[string]ConductorAgentSpec{
 		InstructionsFileName:   "HERMES.md",
 		SupportsClearOnCompact: true,
 	},
+	ConductorAgentPi: {
+		Agent:                  ConductorAgentPi,
+		DisplayName:            "Pi",
+		DefaultCommand:         "pi",
+		InstructionsFileName:   "AGENTS.md",
+		SupportsClearOnCompact: false,
+	},
 }
 
 // ConductorSettings defines conductor (meta-agent orchestration) configuration
@@ -91,6 +101,11 @@ type ConductorSettings struct {
 	// Discord defines Discord bot integration settings
 	Discord DiscordSettings `toml:"discord,omitempty"`
 
+	// GitHubWatcher configures the opt-in GitHub event watcher that lives in
+	// conductor/gh-watcher/ (issue #2134). The Go binary only parses this table;
+	// conductor/setup.sh reads it to decide whether to install the poller unit.
+	GitHubWatcher GitHubWatcherSettings `toml:"github_watcher,omitempty"`
+
 	// Dir overrides the base conductor directory. Empty = default
 	// (<data-dir>/conductor with legacy ~/.agent-deck/conductor fallback).
 	// Tilde and $VAR are expanded.
@@ -105,6 +120,34 @@ type ConductorSettings struct {
 	// 'conductor migrate-dir'). The bridge daemon similarly freezes
 	// AGENT_DECK_CONDUCTOR_DIR at install time.
 	Dir string `toml:"dir,omitempty"`
+}
+
+// GitHubWatcherMode values accepted by [conductor.github_watcher].mode.
+const (
+	// GitHubWatcherModeLog records classified events without sending anything.
+	GitHubWatcherModeLog = "log"
+	// GitHubWatcherModeDispatch sends the lean [github:...] trigger to the conductor.
+	GitHubWatcherModeDispatch = "dispatch"
+)
+
+// GitHubWatcherSettings is the [conductor.github_watcher] table. Both keys are
+// optional: Enabled defaults to false and Mode defaults to "log", so a config
+// without the table changes nothing.
+type GitHubWatcherSettings struct {
+	// Enabled turns the poller on. conductor/setup.sh installs the launchd or
+	// systemd unit only when this is true.
+	Enabled bool `toml:"enabled,omitempty"`
+
+	// Mode is "log" (default) or "dispatch". Use EffectiveMode to read it.
+	Mode string `toml:"mode,omitempty"`
+}
+
+// EffectiveMode returns Mode with the "log" default applied.
+func (g GitHubWatcherSettings) EffectiveMode() string {
+	if g.Mode == "" {
+		return GitHubWatcherModeLog
+	}
+	return g.Mode
 }
 
 // ConductorID is a Telegram/Discord bot identifier used by the conductor
@@ -347,9 +390,21 @@ type ConductorMeta struct {
 	// HeartbeatIdleMinutes is the minutes of inactivity before pausing heartbeats.
 	// 0 or negative = disabled (never pause). Positive = number of minutes.
 	HeartbeatIdleMinutes int `json:"heartbeat_idle_minutes"`
+
+	// Warning is set by LoadConductorMeta when meta.json parsed successfully
+	// but contained something this build doesn't fully understand (an agent
+	// this binary doesn't recognize, for example a newer release's runtime
+	// read by an older binary). The conductor is still returned rather than
+	// treated as missing; a caller that must not trust the stored agent for
+	// a destructive or recreating action (like the bridge's fresh-create
+	// path) should check this and refuse instead. Never persisted.
+	Warning string `json:"-"`
 }
 
 // GetAgent returns the normalized conductor agent, defaulting to Claude.
+// LoadConductorMeta preserves an unrecognized agent as-is (with a warning);
+// this is the zero-value fallback for display/dispatch call sites that need
+// a supported agent rather than the raw stored value.
 func (m *ConductorMeta) GetAgent() string {
 	if m == nil {
 		return ConductorAgentClaude
@@ -408,7 +463,8 @@ func GetConductorAgentSpec(agent string) (ConductorAgentSpec, error) {
 	normalized := normalizeConductorAgent(agent)
 	spec, ok := conductorAgentSpecs[normalized]
 	if !ok {
-		return ConductorAgentSpec{}, fmt.Errorf("unsupported conductor agent %q (supported: %s, %s, %s)", agent, ConductorAgentClaude, ConductorAgentCodex, ConductorAgentHermes)
+		supported := slices.Sorted(maps.Keys(conductorAgentSpecs))
+		return ConductorAgentSpec{}, fmt.Errorf("unsupported conductor agent %q (supported: %s)", agent, strings.Join(supported, ", "))
 	}
 	return spec, nil
 }
@@ -553,12 +609,31 @@ func ConductorDir() (string, error) {
 }
 
 // ConductorNameDir returns the directory for a named conductor (~/.agent-deck/conductor/<name>)
+//
+// The name must be a single path element: empty, ".", "..", and anything
+// containing a path separator are rejected so the result always stays inside
+// the conductor base dir. This is deliberately looser than
+// ValidateConductorName because ListConductors also resolves directory names
+// that already exist on disk.
 func ConductorNameDir(name string) (string, error) {
+	if err := validateConductorDirName(name); err != nil {
+		return "", err
+	}
 	base, err := ConductorDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(base, name), nil
+}
+
+// validateConductorDirName rejects names that are not a single, local path
+// element.
+func validateConductorDirName(name string) error {
+	if name == "" || name == "." || name == ".." ||
+		strings.ContainsAny(name, `/\`) || !filepath.IsLocal(name) {
+		return fmt.Errorf("invalid conductor name %q: must be a single directory name", name)
+	}
+	return nil
 }
 
 // ConductorProfileDir returns the per-profile conductor directory.
@@ -610,16 +685,36 @@ func LoadConductorMeta(name string) (*ConductorMeta, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read meta.json for conductor %q: %w", name, err)
 	}
-	var meta ConductorMeta
+	// Invalid UTF-8 anywhere in the file (e.g. in an unrelated field like
+	// description) is not fatal: json.Unmarshal already sanitizes invalid
+	// byte sequences in string values to U+FFFD, same as main did before this
+	// validation existed. Rejecting the whole file here would make an older
+	// binary treat metadata as missing over a field it doesn't even care
+	// about, so we don't add a stricter check than json.Unmarshal already does.
+	var meta *ConductorMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("failed to parse meta.json for conductor %q: %w", name, err)
+	}
+	if meta == nil {
+		return nil, fmt.Errorf("failed to parse meta.json for conductor %q: expected an object", name)
 	}
 	if meta.Name == "" {
 		meta.Name = name
 	}
-	meta.Agent = meta.GetAgent()
+	// An agent this build doesn't recognize (the older-binary/newer-data
+	// case: a release that adds a conductor runtime, as hermes and pi were
+	// added) must not make the whole conductor disappear from ListConductors,
+	// getConductorEnv, and ConductorClearOnCompact. Keep the record and
+	// preserve the raw agent value instead of silently coercing it to claude;
+	// a warning is attached so a caller that must not treat it as safe to
+	// recreate (the bridge's fresh-create path) can see it's unrecognized.
+	if spec, specErr := GetConductorAgentSpec(meta.Agent); specErr != nil {
+		meta.Warning = fmt.Sprintf("unrecognized agent %q in meta.json for conductor %q: %v", meta.Agent, name, specErr)
+	} else {
+		meta.Agent = spec.Agent
+	}
 	meta.Profile = normalizeConductorProfile(meta.Profile)
-	return &meta, nil
+	return meta, nil
 }
 
 // SaveConductorMeta writes meta.json for a conductor. It takes the conductor
@@ -666,11 +761,17 @@ func saveConductorMetaLocked(meta *ConductorMeta) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal meta.json: %w", err)
 	}
-	metaPath := filepath.Join(dir, "meta.json")
 	perm := os.FileMode(0o644)
 	if len(meta.Env) > 0 || meta.EnvFile != "" {
 		perm = 0o600 // restrict access when env vars contain secrets
 	}
+	return writeConductorMetaFile(dir, data, perm)
+}
+
+// writeConductorMetaFile atomically replaces dir/meta.json with data. The
+// caller MUST already hold the conductor base lock.
+func writeConductorMetaFile(dir string, data []byte, perm os.FileMode) error {
+	metaPath := filepath.Join(dir, "meta.json")
 	// Write atomically via unique temp-file + rename so a crash mid-write
 	// cannot truncate or corrupt meta.json. Same pattern used by
 	// event_writer.go, mcp_catalog.go, transition_notifier.go, and
@@ -722,6 +823,11 @@ func ListConductors() ([]ConductorMeta, error) {
 		meta, err := LoadConductorMeta(entry.Name())
 		if err != nil {
 			continue
+		}
+		if meta.Warning != "" {
+			sessionLog.Warn("conductor_meta_warning",
+				slog.String("conductor", entry.Name()),
+				slog.String("warning", meta.Warning))
 		}
 		conductors = append(conductors, *meta)
 	}
@@ -779,6 +885,45 @@ func renderConductorInstructionsTemplate(baseTemplate, name, profile string, spe
 	return content
 }
 
+// renderConductorInstructionsGenerations renders every prior generated-template
+// generation of baseTemplate, newest first, exactly as the release that shipped
+// it would have written the file.
+func renderConductorInstructionsGenerations(baseTemplate, name, profile string, spec ConductorAgentSpec) []string {
+	generations := conductorInstructionsGenerations(baseTemplate)
+	rendered := make([]string, 0, len(generations))
+	for _, generation := range generations {
+		rendered = append(rendered, renderConductorInstructionsTemplate(generation, name, profile, spec))
+	}
+	return rendered
+}
+
+// conductorPerNameTemplateFor returns the per-conductor instructions template
+// for agent. Hermes gets its own template; every other agent (claude, codex,
+// pi, ...) shares the generic one, which substitutes {AGENT}/{AGENT_DISPLAY}/
+// {INSTRUCTIONS_FILE} per the caller's spec.
+func conductorPerNameTemplateFor(agent string) string {
+	if agent == ConductorAgentHermes {
+		return conductorPerNameHermesMDTemplate
+	}
+	return conductorPerNameClaudeMDTemplate
+}
+
+// previousConductorAgentSpec reports the spec of the agent a conductor is
+// being switched away from, but only when that agent writes the same
+// instructions file as the incoming spec (codex and pi both use AGENTS.md).
+// Those are the cases where the incoming setup must replace the previous
+// agent's generated content instead of leaving it stale.
+func previousConductorAgentSpec(existing *ConductorMeta, spec ConductorAgentSpec) (ConductorAgentSpec, bool) {
+	if existing == nil {
+		return ConductorAgentSpec{}, false
+	}
+	previousSpec, ok := conductorAgentSpecs[normalizeConductorAgent(existing.Agent)]
+	if !ok || previousSpec.Agent == spec.Agent || previousSpec.InstructionsFileName != spec.InstructionsFileName {
+		return ConductorAgentSpec{}, false
+	}
+	return previousSpec, true
+}
+
 func renderConductorClaudeTemplate(baseTemplate, name, profile string) string {
 	spec, _ := GetConductorAgentSpec(ConductorAgentClaude)
 	return renderConductorInstructionsTemplate(baseTemplate, name, profile, spec)
@@ -786,6 +931,17 @@ func renderConductorClaudeTemplate(baseTemplate, name, profile string) string {
 
 func matchesTemplateContent(actual, expected string) bool {
 	return strings.TrimSuffix(actual, "\n") == strings.TrimSuffix(expected, "\n")
+}
+
+// matchesAnyTemplateContent reports whether actual matches any of the given
+// generated-template generations.
+func matchesAnyTemplateContent(actual string, candidates []string) bool {
+	for _, c := range candidates {
+		if matchesTemplateContent(actual, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetupConductor creates a Claude conductor for backward compatibility.
@@ -877,19 +1033,28 @@ func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool,
 		// No custom path - write the default template only if absent. An existing
 		// symlink keeps the user's customization; an existing regular file may
 		// carry in-place edits, so re-running setup must not clobber it.
-		var perNameTemplate string
-		if spec.Agent == ConductorAgentHermes {
-			perNameTemplate = conductorPerNameHermesMDTemplate
-		} else {
-			perNameTemplate = conductorPerNameClaudeMDTemplate
-		}
+		perNameTemplate := conductorPerNameTemplateFor(spec.Agent)
 		content := renderConductorInstructionsTemplate(perNameTemplate, name, profile, spec)
-		if err := writeFileIfAbsent(targetPath, []byte(content), 0o644); err != nil {
+		oldGenerations := renderConductorInstructionsGenerations(perNameTemplate, name, profile, spec)
+		// When the conductor is switching between two agents that share an
+		// instructions filename (codex and pi both read AGENTS.md), the sibling
+		// agent's generated content is replaceable too; otherwise it would be
+		// stranded under the new agent's name. Hand edits and symlinks stay.
+		if previousSpec, ok := previousConductorAgentSpec(existing, spec); ok {
+			siblingTemplate := conductorPerNameTemplateFor(previousSpec.Agent)
+			oldGenerations = append(oldGenerations, renderConductorInstructionsTemplate(siblingTemplate, name, profile, previousSpec))
+			oldGenerations = append(oldGenerations, renderConductorInstructionsGenerations(siblingTemplate, name, profile, previousSpec)...)
+		}
+		if err := writeGeneratedFileOrMigrate(targetPath, oldGenerations, content, 0o644); err != nil {
 			return fmt.Errorf("failed to write %s: %w", spec.InstructionsFileName, err)
 		}
 	}
-	for otherAgent, otherSpec := range conductorAgentSpecs {
-		if otherAgent == spec.Agent {
+	// Drop instructions files left behind by other agents. Keying off the
+	// filename rather than the agent name matters because agents can share one
+	// (codex and pi both read AGENTS.md): removing by agent would delete the
+	// file this run just wrote.
+	for _, otherSpec := range conductorAgentSpecs {
+		if otherSpec.InstructionsFileName == spec.InstructionsFileName {
 			continue
 		}
 		stalePath := filepath.Join(dir, otherSpec.InstructionsFileName)
@@ -1268,8 +1433,8 @@ const conductorHeartbeatScript = `#!/bin/bash
 SESSION="conductor-{NAME}"
 PROFILE="{PROFILE}"
 
-# Check if conductor is enabled (grep -q avoids quoting issues in subshells)
-if ! agent-deck -p "$PROFILE" conductor status --json 2>/dev/null | grep -q '"enabled".*true'; then
+# Check this conductor's heartbeat flag, including after teardown.
+if ! agent-deck -p "$PROFILE" conductor status "{NAME}" --json 2>/dev/null | grep -q '"heartbeat"[[:space:]]*:[[:space:]]*true'; then
     exit 0
 fi
 
@@ -1293,18 +1458,45 @@ for candidate in \
     fi
 done
 
-MSG="{HEARTBEAT_PREFIX} Check sessions in your group ({NAME}). List any that are waiting, auto-respond where safe, and report what needs my attention."
-if [ -n "$RULES_FILE" ]; then
-    RULES=$(cat "$RULES_FILE")
-    if [ -n "$RULES" ]; then
-        MSG="$MSG
-
-$RULES"
-    fi
+if [ "$STATUS" != "idle" ] && [ "$STATUS" != "waiting" ]; then
+    exit 0
 fi
 
-if [ "$STATUS" = "idle" ] || [ "$STATUS" = "waiting" ]; then
-    agent-deck -p "$PROFILE" session send "$SESSION" "$MSG" --no-wait -q
+# Issue #2348: every send is a new turn that re-reads the conductor's whole
+# conversation. heartbeat-tick prints a delta-only {HEARTBEAT_PREFIX} message,
+# or nothing when no waiting/error session or inbox record changed since the
+# last delivered tick; nothing printed means no turn at all.
+LOG_FILE="$CONDUCTOR_ROOT/{NAME}/heartbeat.log"
+TICK_FAILURE="$CONDUCTOR_ROOT/{NAME}/heartbeat-tick-failed"
+SEND_FAILURE="$CONDUCTOR_ROOT/{NAME}/heartbeat-send-failed"
+TICK_ERROR="$CONDUCTOR_ROOT/{NAME}/heartbeat-tick.stderr"
+if ! MSG=$(agent-deck -p "$PROFILE" conductor heartbeat-tick "{NAME}" --rules="$RULES_FILE" 2>"$TICK_ERROR"); then
+    if [ ! -f "$TICK_FAILURE" ]; then
+        IFS= read -r TICK_DETAIL < "$TICK_ERROR" || true
+        printf 'heartbeat: tick failed: %s\n' "${TICK_DETAIL:-unknown error}" >> "$LOG_FILE"
+        : > "$TICK_FAILURE"
+    fi
+    unlink "$TICK_ERROR" 2>/dev/null || true
+    exit 1
+fi
+if [ -s "$TICK_ERROR" ]; then
+    if [ ! -f "$TICK_FAILURE" ]; then
+        IFS= read -r TICK_DETAIL < "$TICK_ERROR" || true
+        printf 'heartbeat: tick diagnostic: %s\n' "$TICK_DETAIL" >> "$LOG_FILE"
+        : > "$TICK_FAILURE"
+    fi
+else
+    unlink "$TICK_FAILURE" 2>/dev/null || true
+fi
+unlink "$TICK_ERROR" 2>/dev/null || true
+if [ -n "$MSG" ]; then
+    if SEND_ERROR=$(agent-deck -p "$PROFILE" session send "$SESSION" "$MSG" --no-wait -q 2>&1); then
+        unlink "$SEND_FAILURE" 2>/dev/null || true
+        agent-deck -p "$PROFILE" conductor heartbeat-tick "{NAME}" --rules="$RULES_FILE" --commit-message="$MSG" >/dev/null
+    elif [ ! -f "$SEND_FAILURE" ]; then
+        printf 'heartbeat: send failed: %s\n' "${SEND_ERROR%%$'\n'*}" >> "$LOG_FILE"
+        : > "$SEND_FAILURE"
+    fi
 fi
 `
 
@@ -1408,6 +1600,106 @@ func writeFileIfAbsent(path string, content []byte, perm os.FileMode) error {
 	return closeErr
 }
 
+// exchangeGeneratedFiles atomically swaps two pathnames. After the exchange,
+// the temporary pathname holds the displaced destination, which lets the
+// caller validate and retain the exact file it replaced for recovery.
+var exchangeGeneratedFiles = exchangeGeneratedFile
+
+// writeGeneratedFileOrMigrate creates a generated file when absent and upgrades
+// it only when its contents exactly match one of the prior generated-template
+// generations (newest first; see conductorInstructionsGenerations). Edited
+// files and existing symlinks remain user-owned. Migration retains the
+// displaced inode so an editor with an open descriptor cannot lose its writes.
+func writeGeneratedFileOrMigrate(path string, previousGenerations []string, current string, perm os.FileMode) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return writeFileIfAbsent(path, []byte(current), perm)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to replace unsafe generated-file target %q (%s)", path, info.Mode().Type())
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !matchesAnyTemplateContent(string(content), previousGenerations) {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".previous-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	exchanged := false
+	defer func() {
+		if !exchanged {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	fail := func(op string, opErr error) error {
+		_ = tmp.Close()
+		return fmt.Errorf("%s generated replacement: %w", op, opErr)
+	}
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		return fail("chmod", err)
+	}
+	if _, err := tmp.Write([]byte(current)); err != nil {
+		return fail("write", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail("sync", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close generated replacement: %w", err)
+	}
+
+	// Avoid needless exchanges when a change is already visible. This recheck is
+	// only an optimization: correctness comes from validating the file displaced
+	// by the atomic exchange below.
+	latestInfo, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("recheck generated target: %w", err)
+	}
+	if !latestInfo.Mode().IsRegular() || !os.SameFile(info, latestInfo) {
+		return fmt.Errorf("generated target changed during migration: %s", path)
+	}
+	latest, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("recheck generated content: %w", err)
+	}
+	if !matchesAnyTemplateContent(string(latest), previousGenerations) {
+		return fmt.Errorf("generated target was edited during migration: %s", path)
+	}
+	if err := exchangeGeneratedFiles(tmpPath, path); err != nil {
+		return fmt.Errorf("replace generated target: %w", err)
+	}
+	// From this point tmpPath belongs to the displaced inode, which may still
+	// have an editor writing through an open descriptor. Never unlink it.
+	exchanged = true
+	fsyncDir(dir)
+	displacedInfo, statErr := os.Lstat(tmpPath)
+	var displaced []byte
+	var readErr error
+	if statErr == nil && displacedInfo.Mode().IsRegular() {
+		displaced, readErr = os.ReadFile(tmpPath)
+	}
+	if statErr != nil || !displacedInfo.Mode().IsRegular() || readErr != nil ||
+		!os.SameFile(info, displacedInfo) || !matchesAnyTemplateContent(string(displaced), previousGenerations) {
+		// A second exchange could overwrite a newer visible edit. Keep both
+		// paths and make the publication conflict actionable instead.
+		return fmt.Errorf("generated target %q changed during publication; publication occurred, displaced file retained at %q for reconciliation", path, tmpPath)
+	}
+	sessionLog.Info("generated_instructions_migrated", slog.String("path", path), slog.String("previous_path", tmpPath))
+	return nil
+}
+
 // InstallSharedConductorInstructions writes the shared instructions file for the given conductor agent,
 // or creates a symlink if customPath is provided.
 func InstallSharedConductorInstructions(agent, customPath string) error {
@@ -1429,12 +1721,12 @@ func InstallSharedConductorInstructions(agent, customPath string) error {
 		return createSymlinkWithExpansion(targetPath, customPath)
 	}
 
-	// No custom path - write the default template only if nothing is there yet.
-	// An existing file is preserved: a symlink keeps the user's customization,
-	// and a regular file may carry in-place edits we must not clobber on re-run.
-	// writeFileIfAbsent's O_EXCL makes both cases a no-op.
+	// No custom path: create the current generated template, or migrate an exact
+	// copy of a prior generated-template generation. Customized files and
+	// symlinks are preserved.
 	content := renderConductorInstructionsTemplate(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
-	if err := writeFileIfAbsent(targetPath, []byte(content), 0o644); err != nil {
+	oldGenerations := renderConductorInstructionsGenerations(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
+	if err := writeGeneratedFileOrMigrate(targetPath, oldGenerations, content, 0o644); err != nil {
 		return fmt.Errorf("failed to write shared %s: %w", spec.InstructionsFileName, err)
 	}
 	return nil
@@ -2746,14 +3038,65 @@ func installHeartbeatDaemonSystemd(name string, intervalMinutes int) error {
 // UninstallHeartbeatDaemon stops and removes the heartbeat timer for a conductor.
 func UninstallHeartbeatDaemon(name string) error {
 	plat := platform.Detect()
+	var err error
 	switch plat {
 	case platform.PlatformMacOS:
-		return uninstallHeartbeatDaemonLaunchd(name)
+		err = uninstallHeartbeatDaemonLaunchd(name)
 	case platform.PlatformLinux, platform.PlatformWSL2:
-		return uninstallHeartbeatDaemonSystemd(name)
-	default:
-		return nil
+		err = uninstallHeartbeatDaemonSystemd(name)
 	}
+	if err != nil {
+		return err
+	}
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		return err
+	}
+	if meta.Warning != "" {
+		// Older binary, newer data (#2354): SaveConductorMeta would reject
+		// the unrecognized agent and drop fields this build doesn't know.
+		// Turning the heartbeat off must never be blocked by that.
+		return disableConductorHeartbeatRaw(name)
+	}
+	meta.HeartbeatEnabled = false
+	return SaveConductorMeta(meta)
+}
+
+// disableConductorHeartbeatRaw sets heartbeat_enabled=false in meta.json
+// without decoding it into ConductorMeta, so the stored agent and any fields
+// this build doesn't know are kept as they are.
+func disableConductorHeartbeatRaw(name string) error {
+	lock, err := acquireConductorBaseLock()
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return err
+	}
+	metaPath := filepath.Join(dir, "meta.json")
+	info, err := os.Stat(metaPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat meta.json for conductor %q: %w", name, err)
+	}
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return fmt.Errorf("failed to read meta.json for conductor %q: %w", name, err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("failed to parse meta.json for conductor %q: %w", name, err)
+	}
+	if fields == nil {
+		return fmt.Errorf("failed to parse meta.json for conductor %q: expected an object", name)
+	}
+	fields["heartbeat_enabled"] = json.RawMessage("false")
+	data, err = json.MarshalIndent(fields, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal meta.json: %w", err)
+	}
+	return writeConductorMetaFile(dir, data, info.Mode().Perm())
 }
 
 func uninstallHeartbeatDaemonLaunchd(name string) error {
@@ -2761,21 +3104,38 @@ func uninstallHeartbeatDaemonLaunchd(name string) error {
 	if err != nil {
 		return err
 	}
-	_ = exec.Command("launchctl", "unload", hbPlistPath).Run()
+	if _, err := os.Stat(hbPlistPath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := exec.Command("launchctl", "unload", hbPlistPath).Run(); err != nil {
+		return fmt.Errorf("stop launchd heartbeat: %w", err)
+	}
 	return RemoveHeartbeatPlist(name)
 }
 
 func uninstallHeartbeatDaemonSystemd(name string) error {
-	timerName := SystemdHeartbeatTimerName(name)
-	_ = exec.Command("systemctl", "--user", "disable", "--now", timerName).Run()
-
 	timerPath, err := SystemdHeartbeatTimerPath(name)
-	if err == nil {
-		_ = os.Remove(timerPath)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(timerPath); err == nil {
+		if err := exec.Command("systemctl", "--user", "disable", "--now", SystemdHeartbeatTimerName(name)).Run(); err != nil { //nolint:gosec // G204: fixed binary and argv, no shell; name only selects a --user unit
+			return fmt.Errorf("stop systemd heartbeat: %w", err)
+		}
+		if err := os.Remove(timerPath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	svcPath, err := SystemdHeartbeatServicePath(name)
-	if err == nil {
-		_ = os.Remove(svcPath)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(svcPath); err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
 	return nil

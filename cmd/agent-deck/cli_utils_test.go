@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -431,6 +433,33 @@ func TestResolveSessionCommand_PlainClaudeUnaffected(t *testing.T) {
 	}
 }
 
+// TestResolveSessionCommand_ShellAliasIsPlainShell is walk defect #5's
+// regression test: `-c shell` is not a real tool id (MatchTool's builtins
+// never recognize the literal string "shell"), so before this fix it fell
+// to the generic-shell fallback with the raw text as a literal command —
+// `bash -c 'shell'`, which fails with "shell: command not found" and leaves
+// a bare interactive prompt behind. "shell" must instead behave exactly
+// like an empty --cmd: NewInstance's own default Tool and command.
+func TestResolveSessionCommand_ShellAliasIsPlainShell(t *testing.T) {
+	for _, raw := range []string{"shell", "Shell", "SHELL", " shell "} {
+		t.Run(raw, func(t *testing.T) {
+			tool, command, wrapper, note, isPassthrough, err := resolveSessionCommand(raw, "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tool != "" {
+				t.Errorf("tool = %q, want empty (same as omitting --cmd)", tool)
+			}
+			if command != "" {
+				t.Errorf("command = %q, want empty — never the literal, nonexistent \"shell\" command", command)
+			}
+			if wrapper != "" || note != "" || isPassthrough {
+				t.Errorf("wrapper=%q note=%q isPassthrough=%v, want all zero-valued", wrapper, note, isPassthrough)
+			}
+		})
+	}
+}
+
 // TestResolveSessionCommand_CustomToolSubcommand_UsesWrapperSuffix is
 // the regression test for the Codex bot P1 review finding on PR #1821: a
 // custom tool configured with a `command` override (e.g.
@@ -656,5 +685,28 @@ func TestShouldInheritParentGroup(t *testing.T) {
 				t.Fatalf("git worktree probe called = %v, want %v (lazy thunk must not run when steps 1-2 decide)", probed, tt.wantProbe)
 			}
 		})
+	}
+}
+
+func TestErrorWithData_PreservesLargeExtraPayload(t *testing.T) {
+	const extraCount = 1025
+	extra := make(map[string]interface{}, extraCount)
+	for i := 0; i < extraCount; i++ {
+		extra[strconv.Itoa(i)] = i
+	}
+	extra["success"] = true
+
+	output := captureStdout(t, func() {
+		NewCLIOutput(true, false).ErrorWithData("failed", "example", extra)
+	})
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(output), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(payload), extraCount+3; got != want {
+		t.Fatalf("payload fields = %d, want %d", got, want)
+	}
+	if payload["1024"] != float64(1024) || payload["success"] != false {
+		t.Fatalf("large payload lost its final field or reserved success value")
 	}
 }

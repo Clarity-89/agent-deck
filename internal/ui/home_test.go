@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
@@ -150,6 +151,16 @@ func TestCreateSessionTool_Crush(t *testing.T) {
 	tool, command := createSessionTool("crush")
 	if tool != "crush" || command != "crush" {
 		t.Fatalf("createSessionTool(\"crush\") = (%q, %q), want (\"crush\", \"crush\")", tool, command)
+	}
+}
+
+// TUI session creation must produce Tool="muse" rather than
+// Tool="shell" with Command="muse", matching the tmux/userconfig
+// wiring for the Muse Code CLI integration.
+func TestCreateSessionTool_Muse(t *testing.T) {
+	tool, command := createSessionTool("muse")
+	if tool != "muse" || command != "muse" {
+		t.Fatalf("createSessionTool(\"muse\") = (%q, %q), want (\"muse\", \"muse\")", tool, command)
 	}
 }
 
@@ -307,7 +318,7 @@ func TestHomeUpdateSearch(t *testing.T) {
 	home.height = 30
 
 	// Disable global search to test local search behavior
-	home.globalSearchIndex = nil
+	home.recallSource = nil
 
 	// Press / to open search (should open local search when global is not available)
 	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}}
@@ -887,38 +898,35 @@ func TestHomeSearchOpensGlobalWhenAvailable(t *testing.T) {
 	home := NewHome()
 	home.width = 100
 	home.height = 30
+	src := newStubRecall()
+	home.recallSource = src
+	home.globalSearch.SetSource(src)
 
-	// Create a mock index
-	tmpDir := t.TempDir()
-	searchEnabled := true
-	config := session.GlobalSearchSettings{
-		Enabled:        &searchEnabled,
-		Tier:           "instant",
-		MemoryLimitMB:  100,
-		IndexRateLimit: 100,
-	}
-	index, err := session.NewGlobalSearchIndex(tmpDir, config)
-	if err != nil {
-		t.Fatalf("Failed to create test index: %v", err)
-	}
-	defer index.Close()
-
-	home.globalSearchIndex = index
-	home.globalSearch.SetIndex(index)
-
-	// Press / to open search - should open global search when index is available
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}}
-	model, _ := home.Update(msg)
-
+	// G opens Recall when the index is available.
+	model, cmd := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
 	h, ok := model.(*Home)
 	if !ok {
 		t.Fatal("Update should return *Home")
 	}
 	if !h.globalSearch.IsVisible() {
-		t.Error("Global search should be visible after pressing / when index is available")
+		t.Error("Global search should be visible after pressing G when index is available")
 	}
 	if h.search.IsVisible() {
 		t.Error("Local search should NOT be visible when global search opens")
+	}
+	if cmd == nil {
+		t.Error("opening must schedule the bounded refresh")
+	}
+	if h.err != nil {
+		t.Errorf("no notice when Recall opens: %v", h.err)
+	}
+	h.globalSearch.Hide()
+
+	// / stays the quick local filter even with the index open.
+	model, _ = h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	h = model.(*Home)
+	if h.globalSearch.IsVisible() || !h.search.IsVisible() {
+		t.Errorf("/ must open the local title search: global %v local %v", h.globalSearch.IsVisible(), h.search.IsVisible())
 	}
 }
 
@@ -926,14 +934,14 @@ func TestHomeSearchOpensLocalWhenNoIndex(t *testing.T) {
 	home := NewHome()
 	home.width = 100
 	home.height = 30
+	home.initialLoading = false
 
-	// Ensure no global search index
-	home.globalSearchIndex = nil
+	// Ensure no recall index
+	home.recallSource = nil
 
-	// Press / to open search - should fall back to local search
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}}
-	model, _ := home.Update(msg)
-
+	// G falls back to the local search and says why inside the overlay:
+	// the footer is hidden behind it for as long as it is open.
+	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
 	h, ok := model.(*Home)
 	if !ok {
 		t.Fatal("Update should return *Home")
@@ -944,37 +952,100 @@ func TestHomeSearchOpensLocalWhenNoIndex(t *testing.T) {
 	if !h.search.IsVisible() {
 		t.Error("Local search should be visible when global index is not available")
 	}
+	if frame := stripAnsi(h.View()); !strings.Contains(frame, "Recall is off") || !strings.Contains(frame, "Local Search") {
+		t.Errorf("the fallback must be announced on the overlay itself:\n%s", frame)
+	}
+	h.search.Hide()
+
+	// / never announces anything: it is the local filter by design.
+	model, _ = h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	h = model.(*Home)
+	if !h.search.IsVisible() || h.err != nil {
+		t.Errorf("/ local: visible %v err %v", h.search.IsVisible(), h.err)
+	}
+	if frame := stripAnsi(h.View()); strings.Contains(frame, "Recall is off") {
+		t.Errorf("/ must not carry the G notice:\n%s", frame)
+	}
+}
+
+// TestHomeSearchNoticeWhenIndexFailedToOpen: an open error is quoted as
+// such; "enabled = false" is not a guess about a locked or unreadable DB.
+func TestHomeSearchNoticeWhenIndexFailedToOpen(t *testing.T) {
+	home := NewHome()
+	home.width, home.height = 100, 30
+	home.initialLoading = false
+	home.recallOff = "Recall index unavailable: schema lock held"
+	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	frame := stripAnsi(model.(*Home).View())
+	if !strings.Contains(frame, "Recall index unavailable: schema lock held") || strings.Contains(frame, "enabled = false") {
+		t.Errorf("notice must quote the open error:\n%s", frame)
+	}
+}
+
+// TestHomeSearchRecallOffGolden pins the local search with the "Recall is
+// off" notice at the three widths: the notice must be on screen for as
+// long as the overlay is, on every width, and fit inside it.
+func TestHomeSearchRecallOffGolden(t *testing.T) {
+	for _, w := range []int{200, 120, 80} {
+		home := NewHome()
+		home.width, home.height = w, 24
+		home.initialLoading = false
+		home.search.SetSize(w, 24)
+		home.search.SetItems([]*session.Instance{{ID: "heron-fix", Title: "heron-fix", Tool: "claude"}})
+		model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+		h := model.(*Home)
+		if !h.search.IsVisible() {
+			t.Fatalf("%d: local search not open", w)
+		}
+		got := stripAnsi(h.View())
+		for _, line := range strings.Split(got, "\n") {
+			if cw := cellWidth(line); cw > w {
+				t.Fatalf("%d: a line is %d cells wide:\n%s", w, cw, line)
+			}
+		}
+		assertFrameGolden(t, fmt.Sprintf("local_search_recall_off_%d.golden", w), got)
+	}
+}
+
+// assertFrameGolden compares a whole frame with internal/ui/testdata
+// (UPDATE_GOLDEN=1 rewrites).
+//
+// Every golden frame also passes assertNoOverwideRows: no row may take more
+// cells than the frame's own width on either terminal width convention
+// (#2334).
+func assertFrameGolden(t *testing.T, name, got string) {
+	t.Helper()
+	assertNoOverwideRows(t, got, 0)
+	got = strings.TrimRight(got, "\n") + "\n"
+	path := filepath.Join("testdata", name)
+	if os.Getenv("UPDATE_GOLDEN") == "1" {
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden %s: %v (UPDATE_GOLDEN=1 to create)", path, err)
+	}
+	if string(want) != got {
+		t.Fatalf("golden %s differs.\n--- want\n%s\n--- got\n%s", path, want, got)
+	}
 }
 
 func TestHomeGlobalSearchEscape(t *testing.T) {
 	home := NewHome()
 	home.width = 100
 	home.height = 30
+	src := newStubRecall()
+	home.recallSource = src
+	home.globalSearch.SetSource(src)
 
-	// Create a mock index
-	tmpDir := t.TempDir()
-	searchEnabled := true
-	config := session.GlobalSearchSettings{
-		Enabled:        &searchEnabled,
-		Tier:           "instant",
-		MemoryLimitMB:  100,
-		IndexRateLimit: 100,
-	}
-	index, err := session.NewGlobalSearchIndex(tmpDir, config)
-	if err != nil {
-		t.Fatalf("Failed to create test index: %v", err)
-	}
-	defer index.Close()
-
-	home.globalSearchIndex = index
-	home.globalSearch.SetIndex(index)
-
-	// Open global search with /
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}}
+	// Open Recall search with G
+	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}}
 	home.Update(msg)
 
 	if !home.globalSearch.IsVisible() {
-		t.Fatal("Global search should be visible after pressing /")
+		t.Fatal("Global search should be visible after pressing G")
 	}
 
 	// Press Escape to close
@@ -1599,10 +1670,10 @@ func TestRemoteSelectionNOpensRemoteAwareNewDialog(t *testing.T) {
 	// account-slot fetch for the selected remote, answered under test control.
 	capture := &remoteCreateCapture{}
 	home.remoteCreateSink = capture.sink
-	home.remoteAccountsFetcher = func(remoteName string) tea.Cmd {
+	home.remoteCreationCatalogFetcher = func(remoteName string) tea.Cmd {
 		capture.accountsFetchedFor = append(capture.accountsFetchedFor, remoteName)
 		return func() tea.Msg {
-			return remoteAccountsFetchedMsg{remoteName: remoteName, accounts: []string{"srv-alice"}}
+			return (remoteAccountsFetchedMsg{remoteName: remoteName, accounts: []string{"srv-alice"}}).catalogMessage()
 		}
 	}
 
@@ -1671,6 +1742,14 @@ func TestRemoteNewDialogCustomizationPreservesRemoteValues(t *testing.T) {
 
 	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	h := model.(*Home)
+	// Remote tool choices become available only after this opening receives
+	// the owning host's catalog. Never select from controller presets.
+	model, _ = h.Update(remoteCreationCatalogFetchedMsg{
+		remoteName: "myserver",
+		catalog:    remoteDialogTestCatalog(),
+		gen:        h.remoteAccountsGen,
+	})
+	h = model.(*Home)
 	h.newDialog.nameInput.SetValue("custom remote")
 	h.newDialog.pathInput.SetValue("~/custom-project")
 	h.newDialog.SetDefaultTool("codex")
@@ -2011,7 +2090,11 @@ func TestRenderHelpBarCompact(t *testing.T) {
 
 func TestRenderHelpBarCompactWithSession(t *testing.T) {
 	home := NewHome()
-	home.width = 85 // Compact mode (70-99)
+	// 99: top of Compact mode (70-99). The footer now separates every key
+	// chip from its label with a space and gives every global key a label,
+	// so the bar is wider at a given width and a lower-priority hint like
+	// Fork needs more room than the narrow end of this range affords.
+	home.width = 99
 	home.height = 30
 	home.footerMode = session.FooterFull // verbose width-adaptive tiers
 
@@ -2335,7 +2418,7 @@ func TestCuratedFooterAlwaysEndsWithSettingsThenHelp(t *testing.T) {
 	}
 	home.cursor = 0
 
-	result := home.renderHelpBar()
+	result := tmux.StripANSI(home.renderHelpBar())
 
 	settingsKey := home.actionKey(hotkeySettings)
 	helpKey := home.actionKey(hotkeyHelp)
@@ -2362,7 +2445,7 @@ func TestCuratedFooterLiveSessionShowsAttach(t *testing.T) {
 	}
 	home.cursor = 0
 
-	result := home.renderHelpBar()
+	result := tmux.StripANSI(home.renderHelpBar())
 	if !strings.Contains(result, "⏎ attach") {
 		t.Errorf("live session should advertise Enter attach\nGot: %q", result)
 	}
@@ -2483,7 +2566,7 @@ func TestCuratedFooterGroupShowsCollapseExpand(t *testing.T) {
 		{Type: session.ItemTypeGroup, Path: "g", Group: &session.Group{Name: "g", Path: "g", Expanded: true}},
 	}
 	home.cursor = 0
-	if result := home.renderHelpBar(); !strings.Contains(result, "Tab collapse") {
+	if result := tmux.StripANSI(home.renderHelpBar()); !strings.Contains(result, "Tab collapse") {
 		t.Errorf("expanded group should advertise Tab collapse\nGot: %q", result)
 	}
 
@@ -2491,7 +2574,7 @@ func TestCuratedFooterGroupShowsCollapseExpand(t *testing.T) {
 	home.flatItems = []session.Item{
 		{Type: session.ItemTypeGroup, Path: "g", Group: &session.Group{Name: "g", Path: "g", Expanded: false}},
 	}
-	if result := home.renderHelpBar(); !strings.Contains(result, "Tab expand") {
+	if result := tmux.StripANSI(home.renderHelpBar()); !strings.Contains(result, "Tab expand") {
 		t.Errorf("collapsed group should advertise Tab expand\nGot: %q", result)
 	}
 }
@@ -2530,7 +2613,7 @@ func TestCuratedFooterRemoteSessionShowsAttach(t *testing.T) {
 	}
 	home.cursor = 0
 
-	result := home.renderHelpBar()
+	result := tmux.StripANSI(home.renderHelpBar())
 	if !strings.Contains(result, "⏎ attach") {
 		t.Errorf("curated footer for a remote session should advertise Enter attach\nGot: %q", result)
 	}
@@ -2578,7 +2661,7 @@ func TestCuratedFooterNarrowKeepsSettingsAndHelp(t *testing.T) {
 	}
 	home.cursor = 0
 
-	result := home.renderHelpBar()
+	result := tmux.StripANSI(home.renderHelpBar())
 	settingsKey := home.actionKey(hotkeySettings)
 	helpKey := home.actionKey(hotkeyHelp)
 	if !strings.Contains(result, settingsKey+" settings") {
@@ -3177,7 +3260,7 @@ func TestRestartSessionFreshCmdSessionMissingReturnsError(t *testing.T) {
 	}
 }
 
-func TestRebuildFlatItemsAutoClearsEmptyStatusFilter(t *testing.T) {
+func TestRebuildFlatItemsKeepsEmptyStatusFilter(t *testing.T) {
 	home := NewHome()
 	home.initialLoading = false
 
@@ -3194,23 +3277,32 @@ func TestRebuildFlatItemsAutoClearsEmptyStatusFilter(t *testing.T) {
 
 	// Set a filter for a status that no session has
 	home.statusFilter = session.StatusError
+	home.keepEmptyFilter = true
 
 	home.rebuildFlatItems()
 
-	// Filter should have been auto-cleared since no sessions match "error"
-	if home.statusFilter != "" {
-		t.Errorf("statusFilter should be auto-cleared when filter matches nothing, got %q", home.statusFilter)
+	if home.statusFilter != session.StatusError {
+		t.Errorf("statusFilter should remain selected when nothing matches, got %q", home.statusFilter)
 	}
 
-	// All sessions should be visible
+	// No sessions should be visible until the user changes the filter.
 	sessionCount := 0
 	for _, item := range home.flatItems {
 		if item.Type == session.ItemTypeSession {
 			sessionCount++
 		}
 	}
-	if sessionCount != 2 {
-		t.Errorf("expected 2 sessions in flatItems after auto-clear, got %d", sessionCount)
+	if sessionCount != 0 {
+		t.Errorf("expected no sessions in filtered flatItems, got %d", sessionCount)
+	}
+}
+
+func TestRebuildFlatItemsRestoredStatusFilterFallsBack(t *testing.T) {
+	inst := &session.Instance{ID: "s1", Tool: "claude", Status: session.StatusRunning}
+	h := &Home{statusFilter: session.StatusError, groupTree: session.NewGroupTree([]*session.Instance{inst})}
+	h.rebuildFlatItems()
+	if h.statusFilter != "" || len(h.flatItems) == 0 {
+		t.Fatalf("restored zero-match filter did not fall back: filter=%q rows=%d", h.statusFilter, len(h.flatItems))
 	}
 }
 
@@ -3659,18 +3751,19 @@ func TestRebuildFlatItemsTimeFilter(t *testing.T) {
 	}
 }
 
-func TestRebuildFlatItemsAutoClearsEmptyTimeFilter(t *testing.T) {
+func TestRebuildFlatItemsKeepsEmptyTimeFilter(t *testing.T) {
 	h := &Home{}
 	// Only session is 30 days old; "today" should match nothing.
 	inst := &session.Instance{ID: "s1", Title: "old", Tool: "claude", Status: session.StatusIdle, LastAccessedAt: time.Now().AddDate(0, 0, -30)}
 	h.timeFilter = session.TimeFilterToday
+	h.keepEmptyFilter = true
 	h.groupTree = session.NewGroupTree([]*session.Instance{inst})
 	h.windowsCollapsed = make(map[string]bool)
 
 	h.rebuildFlatItems()
 
-	if h.timeFilter != session.TimeFilterAll {
-		t.Errorf("timeFilter should be auto-cleared when it matches nothing, got %v", h.timeFilter)
+	if h.timeFilter != session.TimeFilterToday {
+		t.Errorf("timeFilter should remain selected when nothing matches, got %v", h.timeFilter)
 	}
 	sessionCount := 0
 	for _, item := range h.flatItems {
@@ -3678,8 +3771,8 @@ func TestRebuildFlatItemsAutoClearsEmptyTimeFilter(t *testing.T) {
 			sessionCount++
 		}
 	}
-	if sessionCount != 1 {
-		t.Errorf("expected 1 session in flatItems after auto-clear, got %d", sessionCount)
+	if sessionCount != 0 {
+		t.Errorf("expected no sessions in filtered flatItems, got %d", sessionCount)
 	}
 }
 
@@ -4350,9 +4443,9 @@ func TestDeleteBindingOnNonDefaultGroupOpensDialog(t *testing.T) {
 
 // findAccountsFetched digs the account-slot fetch result out of a message
 // that may be a tea.BatchMsg (n batches the account fetch with the MCP fetch).
-func findAccountsFetched(msg tea.Msg) (remoteAccountsFetchedMsg, bool) {
+func findAccountsFetched(msg tea.Msg) (remoteCreationCatalogFetchedMsg, bool) {
 	switch m := msg.(type) {
-	case remoteAccountsFetchedMsg:
+	case remoteCreationCatalogFetchedMsg:
 		return m, true
 	case tea.BatchMsg:
 		for _, c := range m {
@@ -4364,5 +4457,62 @@ func findAccountsFetched(msg tea.Msg) (remoteAccountsFetchedMsg, bool) {
 			}
 		}
 	}
-	return remoteAccountsFetchedMsg{}, false
+	return remoteCreationCatalogFetchedMsg{}, false
+}
+
+// TestMCPManagerUnsupportedToolShowsFeedback verifies that a direct MCP hotkey
+// press on an unsupported local tool produces user-visible feedback without
+// opening the MCP dialog.
+func TestMCPManagerUnsupportedToolShowsFeedback(t *testing.T) {
+	inst := &session.Instance{
+		ID:    "unsupported-mcp",
+		Title: "Unsupported MCP",
+		Tool:  "pi",
+	}
+	home := newTestHomeWithItems(100, 30, []session.Item{
+		{Type: session.ItemTypeSession, Session: inst},
+	})
+	home.cursor = 0
+
+	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	updated := model.(*Home)
+
+	if updated.mcpDialog.IsVisible() {
+		t.Fatal("unsupported tool must not open the MCP dialog")
+	}
+	if updated.err == nil {
+		t.Fatal("unsupported MCP hotkey must show user-visible feedback")
+	}
+	const want = `MCP management is not supported for tool "pi"`
+	if got := updated.err.Error(); got != want {
+		t.Fatalf("error = %q, want %q", got, want)
+	}
+}
+
+// TestMCPManagerRemoteSessionKeepsExistingNoOp verifies that the local-only
+// unsupported-tool feedback does not change the existing remote-row behavior.
+func TestMCPManagerRemoteSessionKeepsExistingNoOp(t *testing.T) {
+	remote := session.RemoteSessionInfo{
+		ID:         "remote-mcp",
+		Title:      "Remote MCP",
+		RemoteName: "dev",
+	}
+	home := newTestHomeWithItems(100, 30, []session.Item{
+		{
+			Type:          session.ItemTypeRemoteSession,
+			RemoteSession: &remote,
+			RemoteName:    "dev",
+		},
+	})
+	home.cursor = 0
+
+	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	updated := model.(*Home)
+
+	if updated.mcpDialog.IsVisible() {
+		t.Fatal("remote session must not open the local MCP dialog")
+	}
+	if updated.err != nil {
+		t.Fatalf("remote session m hotkey changed existing no-op behavior: %v", updated.err)
+	}
 }

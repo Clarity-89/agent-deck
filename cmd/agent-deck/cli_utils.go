@@ -277,6 +277,18 @@ func resolveSessionCommand(rawCommand, explicitWrapper string) (toolName, comman
 		return "", "", wrapper, "", false, nil
 	}
 
+	// walk defect #5: "shell" isn't a real tool id. MatchTool's builtin
+	// detectors never recognize it, so it falls to the generic "shell"
+	// fallback with the raw text as the literal command — `bash -c 'shell'`,
+	// which fails with "shell: command not found". A plain shell session is
+	// already what an empty --cmd produces (NewInstance's default Tool, and
+	// the TUI's first preset button); accept "shell" as that same alias.
+	// "shell" is a reserved built-in name (builtins.go), so it can never be
+	// shadowed by a [tools.shell] override — there is no competing meaning.
+	if strings.EqualFold(raw, "shell") {
+		return "", "", wrapper, "", false, nil
+	}
+
 	toolName = detectTool(raw)
 	base, extra := splitFirstWord(raw)
 
@@ -627,7 +639,7 @@ func (c *CLIOutput) Error(message string, code string) {
 // keys always win over extra entries.
 func (c *CLIOutput) ErrorWithData(message string, code string, extra map[string]interface{}) {
 	if c.jsonMode {
-		payload := make(map[string]interface{}, len(extra)+3)
+		payload := make(map[string]interface{})
 		for k, v := range extra {
 			payload[k] = v
 		}
@@ -902,8 +914,14 @@ func SubstateLabel(sub session.Substate) string {
 		return "usage limit"
 	case session.SubstateIdleAtEmptyPrompt:
 		return "idle at prompt"
+	case session.SubstateInteractiveMenu:
+		return "awaiting menu choice"
+	case session.SubstateBackgroundWork:
+		return "idle at prompt, background shells alive"
 	case session.SubstateRunning:
 		return "working"
+	case session.SubstateHookLag:
+		return "turn done, hook lagging"
 	default:
 		return ""
 	}

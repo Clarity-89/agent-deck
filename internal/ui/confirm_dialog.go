@@ -35,6 +35,12 @@ const (
 	ConfirmUpdateRemote      // push this controller's release to an older remote (TUI 'u' on its header, #2164)
 	ConfirmCrossHarnessTransfer
 	ConfirmSwitchAccount // Edit Session: same-harness account switch (restart, conversation carried over)
+	// ConfirmArchiveDestinationSwitch offers the explicit "archive destination
+	// copy and switch" retry after a switch was refused because the
+	// destination already holds a newer or genuinely divergent conversation
+	// that install could not prove stale. It is never a dead end.
+	ConfirmArchiveDestinationSwitch
+	ConfirmKillWindow
 )
 
 // ConfirmDialog handles confirmation for destructive actions
@@ -60,6 +66,15 @@ type ConfirmDialog struct {
 	targetHarness  string
 	targetAccount  string
 	sourceSnapshot crossHarnessConfirmationSource
+	// remoteSource is the remote row a remote switch confirmation was opened
+	// for (remoteName set); the switch is cancelled when the row changed.
+	remoteSource session.RemoteSessionInfo
+	// switchWarnings are the remote preview's warnings (e.g. the target
+	// harness missing on that host); the local preview shows none here.
+	switchWarnings []string
+
+	windowIndex int    // Tmux window index for ConfirmKillWindow.
+	windowID    string // Tmux window id (e.g. "@12") captured when the dialog opened, for ConfirmKillWindow.
 
 	// Notice (ConfirmNotice) carries an acknowledge-only title/body.
 	noticeTitle string
@@ -101,6 +116,30 @@ func (c *ConfirmDialog) ShowDeleteSession(sessionID string, sessionName string, 
 	c.worktree = worktree
 	c.buttonCount = 2
 	c.focusedButton = 1 // default to Cancel
+}
+
+// ShowKillWindow shows confirmation for killing a tmux window (sub-tab)
+// inside a session. windowIndex, windowName and windowID (the stable tmux
+// window id, e.g. "@12") all describe the one cached row the user selected;
+// the dialog shows id and name so the user confirms a specific window, and
+// confirm re-verifies both live before killing anything.
+func (c *ConfirmDialog) ShowKillWindow(sessionID string, windowIndex int, windowName string, windowID string) {
+	c.visible = true
+	c.confirmType = ConfirmKillWindow
+	c.targetID = sessionID
+	c.targetName = windowName
+	c.windowIndex = windowIndex
+	c.windowID = windowID
+	c.buttonCount = 2
+	c.focusedButton = 1 // default to Cancel
+}
+
+// ShowKillWindowRefused replaces a kill-window confirmation with the reason
+// the kill was refused (last window, or the window changed since it was
+// selected). Shown in the modal because the footer error is clamped away on
+// a full viewport.
+func (c *ConfirmDialog) ShowKillWindowRefused(reason string) {
+	c.ShowNotice("⚠  Window Not Killed", reason+"\n\nNothing was closed.")
 }
 
 // ShowArchiveSession shows confirmation for archiving a session.
@@ -245,12 +284,20 @@ func (c *ConfirmDialog) ShowDeleteGroup(groupPath, groupName string) {
 // final viewport clamp can truncate when the panel fills the height), this dialog
 // replaces the whole view while visible, so the message is always seen. Dismissed
 // with Enter/Esc/o.
-// crossHarnessConfirmationSource is the complete mutable source identity
-// which participates in a transfer. It is captured before the disclosure is
-// shown, so accepting the modal cannot silently transfer a later incarnation.
+// crossHarnessConfirmationSource is the source identity which participates in
+// a transfer. It is captured before the disclosure is shown, so accepting the
+// modal cannot silently transfer a later incarnation.
+//
+// Status is deliberately NOT part of it. A live session's Status is refreshed
+// by the background poller (Running/Idle/Waiting) independently of anything
+// the operator does, so including it made a confirmation held open for one
+// poll tick cancel itself with "the source session changed while this
+// confirmation was open" - the switch then only landed on a retry that raced
+// the poller successfully. Status is liveness, not identity: it changes no
+// transcript, config dir, account or target, and the durable recovery guard
+// (sourceRecoveryIdentityMatches) already excludes it for the same reason.
 type crossHarnessConfirmationSource struct {
 	id, tool, account, project, title, group, command string
-	status                                            session.Status
 	claudeID, codexID, workingDir                     string
 	lastStartedAt                                     time.Time
 }
@@ -261,7 +308,7 @@ func snapshotCrossHarnessConfirmationSource(inst *session.Instance) crossHarness
 	}
 	return crossHarnessConfirmationSource{
 		id: inst.ID, tool: inst.Tool, account: inst.Account, project: inst.ProjectPath,
-		title: inst.Title, group: inst.GroupPath, command: inst.Command, status: inst.Status,
+		title: inst.Title, group: inst.GroupPath, command: inst.Command,
 		claudeID: inst.ClaudeSessionID, codexID: inst.CodexSessionID,
 		workingDir: inst.EffectiveWorkingDir(), lastStartedAt: inst.LastStartedAt,
 	}
@@ -270,9 +317,23 @@ func snapshotCrossHarnessConfirmationSource(inst *session.Instance) crossHarness
 func (s crossHarnessConfirmationSource) matches(inst *session.Instance) bool {
 	return inst != nil && s.id == inst.ID && s.tool == inst.Tool && s.account == inst.Account &&
 		s.project == inst.ProjectPath && s.title == inst.Title && s.group == inst.GroupPath &&
-		s.command == inst.Command && s.status == inst.Status && s.claudeID == inst.ClaudeSessionID &&
+		s.command == inst.Command && s.claudeID == inst.ClaudeSessionID &&
 		s.codexID == inst.CodexSessionID && s.workingDir == inst.EffectiveWorkingDir() &&
 		s.lastStartedAt.Equal(inst.LastStartedAt)
+}
+
+// remoteSwitchDetails adds what only a remote switch needs to say: the
+// whole operation runs on that host with its own slots, transcripts and
+// credentials, plus the remote preview's warnings.
+func (c *ConfirmDialog) remoteSwitchDetails() string {
+	if c.remoteName == "" {
+		return ""
+	}
+	out := fmt.Sprintf("\n• Runs on %s: its account slot, transcript and credentials stay there", c.remoteName)
+	for _, w := range c.switchWarnings {
+		out += "\n⚠ on " + c.remoteName + ": " + w
+	}
+	return out
 }
 
 func displayConfirmAccount(account string) string {
@@ -291,6 +352,7 @@ func displayConfirmAccount(account string) string {
 func (c *ConfirmDialog) ShowSwitchAccount(source *session.Instance, harness, account string) {
 	c.visible = true
 	c.confirmType = ConfirmSwitchAccount
+	c.remoteName, c.switchWarnings = "", nil
 	c.sourceSnapshot = snapshotCrossHarnessConfirmationSource(source)
 	c.targetID, c.targetName = c.sourceSnapshot.id, c.sourceSnapshot.title
 	c.targetHarness, c.targetAccount = harness, account
@@ -304,6 +366,7 @@ func (c *ConfirmDialog) ShowSwitchAccount(source *session.Instance, harness, acc
 func (c *ConfirmDialog) ShowCrossHarnessTransfer(source *session.Instance, harness, account string, losses []string) {
 	c.visible = true
 	c.confirmType = ConfirmCrossHarnessTransfer
+	c.remoteName, c.switchWarnings = "", nil
 	c.sourceSnapshot = snapshotCrossHarnessConfirmationSource(source)
 	c.targetID, c.targetName = c.sourceSnapshot.id, c.sourceSnapshot.title
 	c.targetHarness, c.targetAccount = harness, account
@@ -312,10 +375,64 @@ func (c *ConfirmDialog) ShowCrossHarnessTransfer(source *session.Instance, harne
 	c.focusedButton = 1
 }
 
+// ShowRemoteSwitchAccount is ShowSwitchAccount for a session a remote deck
+// owns: the same question, fed by the remote's own switch-preview, and the
+// switch runs on that host. warnings are the remote preview's warnings.
+func (c *ConfirmDialog) ShowRemoteSwitchAccount(remoteName string, source session.RemoteSessionInfo, harness, account string, warnings []string) {
+	c.visible = true
+	c.confirmType = ConfirmSwitchAccount
+	c.remoteName, c.remoteSource, c.switchWarnings = remoteName, source, warnings
+	c.sourceSnapshot = crossHarnessConfirmationSource{}
+	c.targetID, c.targetName = source.ID, source.Title
+	c.targetHarness, c.targetAccount = harness, account
+	c.switchFrom = source.Account
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowRemoteCrossHarnessTransfer is ShowCrossHarnessTransfer for a session a
+// remote deck owns; losses and warnings come from the remote's preview.
+func (c *ConfirmDialog) ShowRemoteCrossHarnessTransfer(remoteName string, source session.RemoteSessionInfo, harness, account string, losses, warnings []string) {
+	c.visible = true
+	c.confirmType = ConfirmCrossHarnessTransfer
+	c.remoteName, c.remoteSource, c.switchWarnings = remoteName, source, warnings
+	c.sourceSnapshot = crossHarnessConfirmationSource{tool: source.Tool}
+	c.targetID, c.targetName = source.ID, source.Title
+	c.targetHarness, c.targetAccount = harness, account
+	c.noticeBody = strings.Join(losses, "\n• ")
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// RemoteSourceMatches validates a remote switch confirmation against the
+// row the remote currently reports: identity, title, harness and slot must
+// be the ones the user confirmed.
+func (c *ConfirmDialog) RemoteSourceMatches(info *session.RemoteSessionInfo) bool {
+	return info != nil && c.remoteSource.ID == info.ID && c.remoteSource.Title == info.Title &&
+		c.remoteSource.Tool == info.Tool && c.remoteSource.Account == info.Account
+}
+
 // CrossHarnessSourceMatches validates the modal-time snapshot at acceptance,
 // before the asynchronous switch captures its own execution-time snapshot.
 func (c *ConfirmDialog) CrossHarnessSourceMatches(inst *session.Instance) bool {
 	return c.sourceSnapshot.matches(inst)
+}
+
+// ShowArchiveDestinationSwitch offers to archive an existing destination
+// transcript that a same-harness account switch could not prove stale (newer,
+// or diverging after its common prefix with the source) and retry. reason is
+// the refusal text from the failed attempt. Default focus is Cancel: this is
+// a data-preserving retry, not a routine action.
+func (c *ConfirmDialog) ShowArchiveDestinationSwitch(source *session.Instance, harness, account, reason string) {
+	c.visible = true
+	c.confirmType = ConfirmArchiveDestinationSwitch
+	c.sourceSnapshot = snapshotCrossHarnessConfirmationSource(source)
+	c.targetID, c.targetName = c.sourceSnapshot.id, c.sourceSnapshot.title
+	c.targetHarness, c.targetAccount = harness, account
+	c.switchFrom = source.Account
+	c.noticeBody = reason
+	c.buttonCount = 2
+	c.focusedButton = 1
 }
 
 func (c *ConfirmDialog) TargetHarness() string { return c.targetHarness }
@@ -442,6 +559,23 @@ func (c *ConfirmDialog) GetConfirmType() ConfirmType {
 	return c.confirmType
 }
 
+// GetWindowIndex returns the tmux window index for ConfirmKillWindow.
+func (c *ConfirmDialog) GetWindowIndex() int {
+	return c.windowIndex
+}
+
+// GetWindowID returns the tmux window id captured when the ConfirmKillWindow
+// dialog opened, for re-verification at confirm time.
+func (c *ConfirmDialog) GetWindowID() string {
+	return c.windowID
+}
+
+// GetWindowName returns the window name shown in the ConfirmKillWindow
+// dialog, re-verified against the live window at confirm time.
+func (c *ConfirmDialog) GetWindowName() string {
+	return c.targetName
+}
+
 // GetRemoteName returns the remote name for remote session confirmations.
 func (c *ConfirmDialog) GetRemoteName() string {
 	return c.remoteName
@@ -525,7 +659,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y delete · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmArchiveSession, ConfirmArchiveRemoteSession:
 		title = "Archive Session?"
@@ -541,7 +675,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Archive", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y archive · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y archive · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmUnarchiveSession, ConfirmUnarchiveRemoteSession:
 		title = "Unarchive Session?"
@@ -556,7 +690,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Unarchive", ColorGreen, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y unarchive · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y unarchive · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmCloseSession:
 		title = "Close Session?"
@@ -570,7 +704,18 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Close", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y close · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y close · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmKillWindow:
+		title = "⚠  Kill Window?"
+		warning = fmt.Sprintf("This will kill tmux window %d (%s):\n\n  \"%s\"", c.windowIndex, c.windowID, c.targetName)
+		details = "• Any processes in the window will be killed\n• Other windows in the session are unaffected"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Kill", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y kill · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmDeleteRemoteSession:
 		title = "⚠  Delete Remote Session?"
@@ -581,7 +726,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y delete · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmDeleteRemoteGroup:
 		title = "⚠  Delete Remote Group?"
@@ -592,7 +737,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y delete · n cancel · ←/→ navigate · Enter select · Esc")))
 	case ConfirmUpdateRemote:
 		title = "Update Remote?"
 		warning = fmt.Sprintf("Update remote %s from v%s to v%s?", c.remoteName, c.targetName, c.targetID)
@@ -602,7 +747,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Update", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y update · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y update · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmCloseRemoteSession:
 		title = "Close Remote Session?"
@@ -613,7 +758,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Close", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y close · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y close · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmRemoveSession:
 		title = "Remove Session?"
@@ -624,7 +769,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Remove", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y remove · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y remove · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmBulkRemoveErrored:
 		title = "Remove All Errored Sessions?"
@@ -635,7 +780,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Remove All", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y remove · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y remove · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmDeleteGroup:
 		title = "⚠  Delete Group?"
@@ -646,7 +791,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y delete · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmQuitWithPool:
 		title = "MCP Pool Running"
@@ -657,7 +802,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Keep running", ColorGreen, c.focusedButton == 0), "  ",
 			renderButton("Shut down", ColorRed, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("k keep · s shut down · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("k keep · s shut down · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmCreateDirectory:
 		title = "📁  Directory Not Found"
@@ -671,29 +816,48 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Create", ColorGreen, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorRed, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y create · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y create · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmCrossHarnessTransfer:
 		title = "Transfer Context to Fresh Target?"
-		warning = fmt.Sprintf("%s → NEW %s target (account %s).\n\nThe original source session is kept unchanged.", c.sourceSnapshot.tool, c.targetHarness, displayConfirmAccount(c.targetAccount))
+		if c.remoteName != "" {
+			title = "Transfer Context on " + c.remoteName + "?"
+		}
+		warning = fmt.Sprintf("%s → NEW %s target (account %s).\n\nThe source stays visible until the target is verified ready; it is then archived as superseded (reversible).", c.sourceSnapshot.tool, c.targetHarness, displayConfirmAccount(c.targetAccount))
 		details = "Not transferred:\n• " + c.noticeBody + "\n\nTarget readiness is pending until a target-native identity and ready event are observed."
+		details += c.remoteSwitchDetails()
 		borderColor = ColorYellow
 		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
 			renderButton("Transfer", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y transfer · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y transfer · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmSwitchAccount:
 		title = "Switch Account?"
+		if c.remoteName != "" {
+			title = "Switch Account on " + c.remoteName + "?"
+		}
 		warning = fmt.Sprintf("Move this session to another %s account:\n\n  \"%s\"\n  %s  →  %s", c.targetHarness, c.targetName, displayConfirmAccount(c.switchFrom), displayConfirmAccount(c.targetAccount))
 		details = "• The session is stopped and restarted with its conversation carried over\n• Tools, MCPs, plugins and usage limits follow the new account\n• Authentication is not checked until the restarted harness reports ready"
+		details += c.remoteSwitchDetails()
 		borderColor = ColorYellow
 		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
 			renderButton("Switch", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y switch · n cancel · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y switch · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmArchiveDestinationSwitch:
+		title = "Archive Destination Copy?"
+		warning = fmt.Sprintf("Move this session to another %s account:\n\n  \"%s\"\n  %s  →  %s", c.targetHarness, c.targetName, displayConfirmAccount(c.switchFrom), displayConfirmAccount(c.targetAccount))
+		details = "The target account already has a conversation for this session that is newer or has diverged:\n\n  " + c.noticeBody + "\n\n• Its current copy is archived alongside it as \"<file>.pre-switch-<timestamp>\", never deleted\n• The source conversation is then installed in its place and the switch proceeds"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Archive & Switch", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y archive & switch · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmNotice:
 		title = c.noticeTitle
@@ -712,7 +876,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Install", ColorGreen, c.focusedButton == 0), "  ",
 			renderButton("Skip", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y install · n skip · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y install · n skip · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmInstallHermesHooks:
 		title = "Hermes Agent Hooks"
@@ -723,7 +887,7 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Install", ColorGreen, c.focusedButton == 0), "  ",
 			renderButton("Skip", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y install · n skip · ←/→ navigate · Enter select · Esc"))
+			hintStyle.Render(glueHintGroups("y install · n skip · ←/→ navigate · Enter select · Esc")))
 	}
 
 	// Title style
@@ -789,4 +953,37 @@ func (c *ConfirmDialog) View() string {
 	}
 
 	return dialogBox
+}
+
+// nbsp is a non-breaking space. ansi.Wordwrap excludes U+00A0 from its
+// breakable-space check, so substituting it for an ordinary space pins two
+// words onto the same rendered line.
+const nbsp = "\u00a0"
+
+// glueHintGroups joins the words within each " · "-separated key-group of a
+// footer hint with a non-breaking space, so a narrow dialog can only wrap at a
+// group boundary and never splits a key from its label (e.g. "Enter" /
+// "select" on a 50-col confirm dialog). The " · " separators themselves keep
+// their ordinary, breakable spaces.
+func glueHintGroups(hint string) string {
+	return glueGroups(hint, " · ")
+}
+
+// glueBracketHintGroups is glueHintGroups' counterpart for "[Key] Label  ..."
+// style hints (double-space-separated groups, e.g. the search dialog's
+// footer): it glues the single space between each bracketed key and its label,
+// while leaving the double-space group separators breakable.
+func glueBracketHintGroups(hint string) string {
+	return glueGroups(hint, "  ")
+}
+
+// glueGroups splits hint on sep, replaces every ordinary space inside each
+// group with a non-breaking one, and rejoins with sep — a plain string
+// transform with no rendering side effects.
+func glueGroups(hint, sep string) string {
+	groups := strings.Split(hint, sep)
+	for i, g := range groups {
+		groups[i] = strings.ReplaceAll(g, " ", nbsp)
+	}
+	return strings.Join(groups, sep)
 }

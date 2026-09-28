@@ -3,7 +3,7 @@ import { html } from 'htm/preact'
 import { useState, useMemo, useEffect } from 'preact/hooks'
 import { Dot } from '../icons.js'
 import {
-  selectedIdSignal, mutationsEnabledSignal, confirmDialogSignal,
+  selectedIdSignal, selectSession, mutationsEnabledSignal, confirmDialogSignal,
 } from '../state.js'
 import { archivedSessionsSignal, loadArchivedSessions } from '../state.js'
 import { apiFetch } from '../api.js'
@@ -39,7 +39,7 @@ function formatArchivedAt(iso) {
 
 function clearSelectionIf(id) {
   if (selectedIdSignal.value !== id) return
-  selectedIdSignal.value = null
+  selectSession(null)
   if (typeof window !== 'undefined' && window.location.pathname.startsWith('/s/')) {
     history.replaceState(null, '', '/')
   }
@@ -84,6 +84,9 @@ export function ArchivedPane() {
       return
     }
     confirmDialogSignal.value = {
+      tone: 'danger',
+      confirmLabel: 'Delete',
+      title: 'Delete archived session?',
       message: `Delete archived session "${s.title}"? This removes it permanently.`,
       onConfirm: () => apiFetch('DELETE', `/api/sessions/${s.id}`)
         .then(() => {

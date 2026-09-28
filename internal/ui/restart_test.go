@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -255,9 +257,9 @@ func TestAutoRestart_RespectsSettingAndInstallState(t *testing.T) {
 // TestRestartEnv_RoundTrip pins the hand-off: stale copies are dropped,
 // both values survive, and parse reads back exactly what build wrote.
 func TestRestartEnv_RoundTrip(t *testing.T) {
-	env := buildRestartEnv([]string{"PATH=/bin", restartSelectEnv + "=stale", restartedFromEnv + "=0.0.1"},
+	env := buildRestartEnv([]string{"PATH=/bin", restartSelectEnv + "=stale", RestartedFromEnv + "=0.0.1"},
 		RestartHandoff{SelectedID: "sess-42", OldVersion: "1.16.0"})
-	want := []string{"PATH=/bin", restartSelectEnv + "=sess-42", restartedFromEnv + "=1.16.0"}
+	want := []string{"PATH=/bin", restartSelectEnv + "=sess-42", RestartedFromEnv + "=1.16.0"}
 	if strings.Join(env, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("env = %q, want %q", env, want)
 	}
@@ -274,16 +276,16 @@ func TestRestartEnv_RoundTrip(t *testing.T) {
 	}
 	// Nothing selected: only the version travels.
 	env = buildRestartEnv([]string{"A=1"}, RestartHandoff{OldVersion: "1.16.0"})
-	if len(env) != 2 || env[1] != restartedFromEnv+"=1.16.0" {
+	if len(env) != 2 || env[1] != RestartedFromEnv+"=1.16.0" {
 		t.Fatalf("env without selection = %q", env)
 	}
 	// The process-level consume reads and unsets both.
 	t.Setenv(restartSelectEnv, "sess-7")
-	t.Setenv(restartedFromEnv, "1.15.0")
+	t.Setenv(RestartedFromEnv, "1.15.0")
 	if got := consumeRestartEnv(); got != (RestartHandoff{SelectedID: "sess-7", OldVersion: "1.15.0"}) {
 		t.Fatalf("consumeRestartEnv = %+v", got)
 	}
-	if os.Getenv(restartSelectEnv) != "" || os.Getenv(restartedFromEnv) != "" {
+	if os.Getenv(restartSelectEnv) != "" || os.Getenv(RestartedFromEnv) != "" {
 		t.Fatal("consumeRestartEnv must unset both variables so children never inherit them")
 	}
 }
@@ -428,5 +430,76 @@ func TestRestartDeck_PreArmCheckPassesRealBinary(t *testing.T) {
 	}
 	if exe, ok := h.RestartTarget(); !ok || exe != path {
 		t.Fatalf("RestartTarget = %q, %v", exe, ok)
+	}
+}
+
+// captureUILog routes uiLog into a buffer for one test and returns it.
+func captureUILog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := uiLog
+	uiLog = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	t.Cleanup(func() { uiLog = prev })
+	return &buf
+}
+
+// TestRestart_DeferredWhileUnattendedUpdateRuns pins the v1.16.11 rollout
+// fix: the TUI's periodic check spawned `update --unattended`, the binary
+// on disk changed, and auto_restart re-exec'd the TUI while that child was
+// still sweeping the remotes. The child died (its stdout pipe went away
+// with the old image) and stayed a zombie. Now neither the auto path nor
+// the key restarts while the child runs; both resume once it has exited.
+func TestRestart_DeferredWhileUnattendedUpdateRuns(t *testing.T) {
+	logs := captureUILog(t)
+	h := newAutoRestartTestHome(t)
+	h.autoInstallInFlight = "1.16.1"
+	h.autoInstallAttempts = map[string]time.Time{"1.16.1": time.Now().Add(-3 * time.Second)}
+
+	for i := 0; i < 3; i++ {
+		if cmd := h.maybeAutoRestart(); cmd != nil || h.restartRequested || h.isQuitting {
+			t.Fatalf("tick %d: auto restart must wait for the update child (cmd=%v requested=%v)", i, cmd, h.restartRequested)
+		}
+	}
+	if h.err != nil {
+		t.Fatalf("deferral is not an error, got footer %v", h.err)
+	}
+	if got := logs.String(); !strings.Contains(got, `"msg":"tui_restart_deferred_for_update"`) || !strings.Contains(got, `"updating_to":"1.16.1"`) {
+		t.Fatalf("log = %s, want one tui_restart_deferred_for_update line naming the version", got)
+	}
+	if strings.Count(logs.String(), "tui_restart_deferred_for_update") != 1 {
+		t.Fatalf("deferral must be logged once per autoRestartLogEvery, got:\n%s", logs.String())
+	}
+	assertRestartQueued(t, h, "restart queued after the update")
+	h.restartQueued = false // keep this test on the auto path
+	h.err = nil
+
+	// The child exits: the finished handler clears the flag and the next
+	// tick arms the restart.
+	h.err = nil
+	h.handleUnattendedInstallFinished(unattendedInstallFinishedMsg{version: "1.16.1", output: "ok"})
+	if h.autoInstallInFlight != "" {
+		t.Fatalf("inFlight = %q after the child exited", h.autoInstallInFlight)
+	}
+	if cmd := h.maybeAutoRestart(); cmd == nil || !h.restartRequested {
+		t.Fatal("once the update child has exited the restart must be armed")
+	}
+}
+
+// assertRestartQueued pins the key press during an unattended update run:
+// it is not refused, it queues the restart and says so in the footer.
+func assertRestartQueued(t *testing.T, h *Home, wantMsg string) {
+	t.Helper()
+	_, cmd := h.tryRestartDeck()
+	if h.restartRequested || h.isQuitting || cmd != nil {
+		t.Fatalf("queued restart must not start yet (requested=%v quitting=%v cmd=%v)", h.restartRequested, h.isQuitting, cmd)
+	}
+	if !h.restartQueued {
+		t.Fatal("key press during the update run must queue the restart")
+	}
+	if h.err == nil || h.err.Error() != wantMsg {
+		t.Fatalf("footer = %v, want %q", h.err, wantMsg)
+	}
+	if strings.Contains(h.err.Error(), "blocked") {
+		t.Fatalf("queued is not blocked: %v", h.err)
 	}
 }

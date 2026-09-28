@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // ---------------------------------------------------------------------------
@@ -91,19 +93,17 @@ func TestSendWithRetryTarget_SkipVerifyReportsUnverified(t *testing.T) {
 	}
 }
 
-func TestSendWithRetryTarget_ReportsNoEvidenceStatus(t *testing.T) {
+func TestSendWithRetryTarget_NoEvidenceIsUnknown(t *testing.T) {
 	mock := &mockSendRetryTarget{
-		statuses: []string{"waiting"},
+		statuses: []string{"active"},
 		panes:    []string{""},
 	}
 	delivery, err := sendWithRetryTarget(mock, "hello", false, sendRetryOptions{
 		maxRetries: 4, checkDelay: 0, verifyDelivery: true,
+		targetBusyByHook: func() (bool, bool) { return true, true },
 	})
-	if err == nil {
-		t.Fatal("expected #876 no-evidence error")
-	}
-	if delivery != deliveryNoEvidence {
-		t.Fatalf("delivery status: want %q, got %q", deliveryNoEvidence, delivery)
+	if err != nil || delivery != deliveryUnverified {
+		t.Fatalf("absence of evidence is unknown, got delivery=%q err=%v", delivery, err)
 	}
 }
 
@@ -138,6 +138,18 @@ type guardedSendMock struct {
 
 func (m *guardedSendMock) SendKeysAndEnter(string) error {
 	atomic.AddInt32(&m.sendKeysCalls, 1)
+	return nil
+}
+
+// SendKeysAndEnterChecked mirrors SendKeysAndEnter above, with the pre-Enter
+// paste check *tmux.Session runs in between: a check that reports not-ok
+// withholds the Enter and surfaces its error.
+func (m *guardedSendMock) SendKeysAndEnterChecked(_ string, capture func() (string, error), check tmux.PostPasteCheck) error {
+	atomic.AddInt32(&m.sendKeysCalls, 1)
+	pane, capErr := capture()
+	if ok, err := check(pane, capErr); !ok {
+		return err
+	}
 	return nil
 }
 

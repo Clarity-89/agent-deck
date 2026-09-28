@@ -33,6 +33,48 @@ func TestNextRecheck(t *testing.T) {
 	}
 }
 
+// TestNextRecheckAfterFailures pins the exponential-backoff-with-jitter
+// schedule a headless poller uses after repeated failures: doubling per
+// consecutive failure, capped at RecheckBackoffMax, and never checking
+// before the un-jittered floor for that failure count.
+func TestNextRecheckAfterFailures(t *testing.T) {
+	now := time.Date(2026, 9, 13, 17, 0, 0, 0, time.UTC)
+
+	if got := NextRecheckAfterFailures(time.Time{}, 3); !got.IsZero() {
+		t.Fatalf("never checked: NextRecheckAfterFailures = %v, want zero (due now)", got)
+	}
+	if got, want := NextRecheckAfterFailures(now, 0), now.Add(RecheckInterval); !got.Equal(want) {
+		t.Fatalf("no failures: NextRecheckAfterFailures = %v, want %v (same as NextRecheck(last, false))", got, want)
+	}
+
+	// Pin jitter to zero so the floor of each step is exact.
+	origJitter := backoffJitter
+	backoffJitter = func(int64) int64 { return 0 }
+	t.Cleanup(func() { backoffJitter = origJitter })
+
+	if got, want := NextRecheckAfterFailures(now, 1), now.Add(RecheckBackoff); !got.Equal(want) {
+		t.Fatalf("1st failure: NextRecheckAfterFailures = %v, want %v", got, want)
+	}
+	if got, want := NextRecheckAfterFailures(now, 2), now.Add(2*RecheckBackoff); !got.Equal(want) {
+		t.Fatalf("2nd failure: NextRecheckAfterFailures = %v, want %v (doubled)", got, want)
+	}
+	// Enough consecutive failures must saturate at the cap, not keep doubling
+	// into an ever-larger delay.
+	if got, want := NextRecheckAfterFailures(now, 20), now.Add(RecheckBackoffMax); !got.Equal(want) {
+		t.Fatalf("many failures: NextRecheckAfterFailures = %v, want the capped %v", got, want)
+	}
+
+	// Jitter only ever adds delay (never checks earlier than the floor) and
+	// stays bounded (never balloons past the floor plus its ceiling).
+	backoffJitter = func(n int64) int64 { return n - 1 }
+	floor := now.Add(RecheckBackoff)
+	ceiling := floor.Add(RecheckBackoff / 4)
+	got := NextRecheckAfterFailures(now, 1)
+	if got.Before(floor) || got.After(ceiling) {
+		t.Fatalf("jittered NextRecheckAfterFailures = %v, want within [%v, %v]", got, floor, ceiling)
+	}
+}
+
 // fakeInstaller drives an Installer with canned check results and counts
 // the unattended runs it started.
 type fakeInstaller struct {
@@ -67,6 +109,7 @@ func newFakeInstaller(t *testing.T, info *UpdateInfo) *fakeInstaller {
 			f.installs = append(f.installs, exe+" "+trigger)
 			return "ok", f.instErr
 		},
+		Pending: func() bool { return false },
 		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		ticks:   f.tick,
 		handled: make(chan struct{}),
@@ -151,6 +194,12 @@ func TestInstaller_SkipConditions(t *testing.T) {
 	}
 	for name, arrange := range cases {
 		t.Run(name, func(t *testing.T) {
+			// Pin jitter to zero so the backoff boundary below is exact;
+			// NextRecheckAfterFailures otherwise adds up to 25% jitter.
+			origJitter := backoffJitter
+			backoffJitter = func(int64) int64 { return 0 }
+			t.Cleanup(func() { backoffJitter = origJitter })
+
 			f := newFakeInstaller(t, &UpdateInfo{Available: true, CurrentVersion: "1.16.7", LatestVersion: "1.16.8"})
 			arrange(f)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -198,4 +247,40 @@ func TestTailBuffer(t *testing.T) {
 	if got := tb.String(); got != "efghijkl" {
 		t.Fatalf("tail = %q, want the last 8 bytes", got)
 	}
+}
+
+// TestInstaller_DrainsPendingLaunchAgentsWhenCurrent pins the daemon's
+// retry of a pending launch agent (a bootstrap that failed after bootout,
+// or an agent deferred by a run inside it): with nothing to install and
+// the marker set, a tick runs the unattended updater (which drains what it
+// can from inside the daemon's own service), once per InstallRetryAfter.
+func TestInstaller_DrainsPendingLaunchAgentsWhenCurrent(t *testing.T) {
+	f := newFakeInstaller(t, &UpdateInfo{Available: false, CurrentVersion: "1.16.7", LatestVersion: "1.16.7"})
+	pending := true
+	f.inst.Pending = func() bool { f.mu.Lock(); defer f.mu.Unlock(); return pending }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.inst.Run(ctx)
+
+	now := time.Date(2026, 9, 19, 17, 0, 0, 0, time.UTC)
+	f.step(t, now)
+	if _, installs := f.counts(); len(installs) != 1 || installs[0] != "/bin/agent-deck web" {
+		t.Fatalf("pending agent: installs=%v, want one unattended run", installs)
+	}
+	f.step(t, now.Add(RecheckInterval))
+	if _, installs := f.counts(); len(installs) != 1 {
+		t.Fatalf("inside the retry window: installs=%v", installs)
+	}
+	f.step(t, now.Add(InstallRetryAfter))
+	if _, installs := f.counts(); len(installs) != 2 {
+		t.Fatalf("after the retry window: installs=%v, want a second run", installs)
+	}
+	f.mu.Lock()
+	pending = false
+	f.mu.Unlock()
+	f.step(t, now.Add(2*InstallRetryAfter))
+	if _, installs := f.counts(); len(installs) != 2 {
+		t.Fatalf("marker cleared: installs=%v, want no further run", installs)
+	}
+	cancel()
 }

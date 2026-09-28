@@ -5,8 +5,8 @@
 import { html } from 'htm/preact'
 import { useState, useEffect, useMemo, useRef } from 'preact/hooks'
 import { Icon, ICONS } from './icons.js'
-import { menuModelSignal } from './dataModel.js'
-import { selectedIdSignal, createSessionDialogSignal, infoDrawerOpenSignal, mutationsEnabledSignal, shortcutsOverlaySignal } from './state.js'
+import { menuModelSignal, openCreateSessionForGroup, currentGroupPath } from './dataModel.js'
+import { selectSession, infoDrawerOpenSignal, mutationsEnabledSignal, shortcutsOverlaySignal } from './state.js'
 import { paletteOpenSignal, activeTabSignal, tweaksOpenSignal } from './uiState.js'
 
 export function CommandPalette() {
@@ -31,13 +31,13 @@ export function CommandPalette() {
       { id: 'cmd-terminal',  sec: 'COMMANDS', label: 'Open Terminal',  tool: '›_', run: () => { activeTabSignal.value = 'terminal'; close() } },
       { id: 'cmd-costs',     sec: 'COMMANDS', label: 'Costs dashboard', tool: '$', run: () => { activeTabSignal.value = 'costs'; close() } },
       { id: 'cmd-search',    sec: 'COMMANDS', label: 'Session search', tool: '/', run: () => { activeTabSignal.value = 'search'; close() } },
-      { id: 'cmd-archived',  sec: 'COMMANDS', label: 'Archived sessions', tool: '⌂', run: () => { activeTabSignal.value = 'archived'; close() } },
+      { id: 'cmd-archived',  sec: 'COMMANDS', label: 'Archived sessions', tool: '^', run: () => { activeTabSignal.value = 'archived'; close() } },
       { id: 'cmd-tweaks',    sec: 'COMMANDS', label: 'Open Tweaks',    tool: 'T', run: () => { tweaksOpenSignal.value = true; close() } },
       { id: 'cmd-shortcuts', sec: 'COMMANDS', label: 'Keyboard shortcuts', tool: '?', run: () => { shortcutsOverlaySignal.value = true; close() } },
       { id: 'cmd-settings',  sec: 'COMMANDS', label: 'Settings drawer', tool: 'S', run: () => { infoDrawerOpenSignal.value = true; close() } },
     ]
     if (mutationsEnabledSignal.value) {
-      list.unshift({ id: 'cmd-new', sec: 'COMMANDS', label: 'New session', tool: 'n', run: () => { createSessionDialogSignal.value = true; close() } })
+      list.unshift({ id: 'cmd-new', sec: 'COMMANDS', label: 'New session', tool: 'n', run: () => { openCreateSessionForGroup(currentGroupPath()); close() } })
     }
     return list
   }, [])
@@ -47,7 +47,7 @@ export function CommandPalette() {
     sec: 'SESSIONS',
     label: s.title,
     tool: s.tool || s.kind,
-    run: () => { selectedIdSignal.value = s.id; activeTabSignal.value = 'terminal'; close() },
+    run: () => { selectSession(s.id); activeTabSignal.value = 'terminal'; close() },
   }))
 
   const all = [...cmds, ...sessRows].filter(r => !q || r.label.toLowerCase().includes(q.toLowerCase()))
