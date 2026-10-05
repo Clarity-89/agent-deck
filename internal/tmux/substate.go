@@ -1,6 +1,9 @@
 package tmux
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // Substate is an ADDITIVE refinement of the coarse session status (Honest
 // Status v2). It never changes the canonical status string ("running",
@@ -37,11 +40,14 @@ const (
 	// answer (#2185).
 	SubstateInteractiveMenu Substate = "interactive-menu"
 
-	// SubstateBackgroundWork marks a Claude session sitting at its input
-	// prompt with run_in_background shells or a Monitor still alive ("N
-	// shells still running" / "· N shells ·" in the footer). The turn is
-	// done and the session is waiting for input; the shells are context, not
-	// activity. See background_work.go for why this is not "running".
+	// SubstateBackgroundWork marks a Claude session whose foreground turn is
+	// over (empty prompt, Stop hook fired) while work it started is still in
+	// flight: a Workflow ("◯ name ▰▰▱ 3/5 · 18m32s" under the footer), background
+	// agents ("Waiting for N background agents to finish"), run_in_background
+	// shells or Monitors ("· 2 shells, 1 monitor ·" in the footer), or the
+	// same evidence in the transcript. Pairs with status "running" (issue
+	// #2473: a running workflow means a running session); the session settles
+	// to waiting only once nothing is in flight. See background_work.go.
 	SubstateBackgroundWork Substate = "background-work"
 
 	// SubstateModelUnavailable marks the Fable-down no-op loop: the model
@@ -128,8 +134,10 @@ const crunchedNoopMarker = "Crunched for 0s"
 //     is on screen. Checked before idle-at-empty-prompt: both conditions make
 //     hasClaudePrompt true, but a menu awaiting a choice is blocked-on-input,
 //     not idle (#2185).
-//  5. idle-at-empty-prompt — sitting at the prompt with nothing happening.
-//  6. none      — no distinct refinement.
+//  5. background-work — at the prompt, but a workflow / background agent /
+//     shell / monitor started by the session is still in flight (#2473).
+//  6. idle-at-empty-prompt — sitting at the prompt with nothing happening.
+//  7. none      — no distinct refinement.
 func (d *PromptDetector) ClassifySubstate(content string) Substate {
 	// The gate is explicit per tool: each arm reads only renderings captured
 	// from that tool. A tool without an arm stays SubstateNone — unknown is
@@ -145,10 +153,17 @@ func (d *PromptDetector) ClassifySubstate(content string) Substate {
 }
 
 // SubstateDetail returns free-text detail for the substate ClassifySubstate
-// would return for content, or "" when there is none. Today only the codex
-// usage-limit banner carries one: the retry time the banner prints ("try
-// again at Oct 10th, 2026 8:03 AM").
+// would return for content, or "" when there is none: the retry time the codex
+// usage-limit banner prints ("try again at Oct 10th, 2026 8:03 AM"), and for a
+// Claude background-work frame the in-flight work ("workflow
+// comms-followon-round3 3/5 · 18m32s", issue #2473).
 func (d *PromptDetector) SubstateDetail(content string) string {
+	if d.tool == "claude" {
+		if d.classifyClaudeSubstate(content) == SubstateBackgroundWork {
+			return ParseClaudeBackgroundWork(content).Summary()
+		}
+		return ""
+	}
 	if d.tool != "codex" {
 		return ""
 	}
@@ -206,7 +221,7 @@ func (d *PromptDetector) classifyClaudeSubstate(content string) Substate {
 		if hasOpenInteractiveMenu(content) {
 			return SubstateInteractiveMenu
 		}
-		if claudeBackgroundShellsPending(content) {
+		if claudeBackgroundWorkPending(content) {
 			return SubstateBackgroundWork
 		}
 		return SubstateIdleAtEmptyPrompt
@@ -223,14 +238,21 @@ func (d *PromptDetector) classifyClaudeSubstate(content string) Substate {
 // just not idle. Kept separate from permissionPrompts so this list only
 // needs to be unambiguous, not exhaustive — a marker missing here degrades to
 // the pre-existing idle-at-empty-prompt label rather than a false positive.
+//
+// Every entry is menu chrome (a key hint or an option label) that Claude's
+// prose never prints at the tail of a reply. The question lines a dialog
+// opens with ("Do you want to proceed?", "Would you like …") are NOT here:
+// Claude often ends a reply with exactly such a question in prose, and a
+// prose question is not an open menu (issue #2473: it must not hold a running
+// workflow at waiting). They count only beside a selected option, see
+// interactiveMenuQuestions.
 var interactiveMenuMarkers = []string{
 	"Use arrow keys to navigate",
 	"Press Enter to select",
 	"Tab/Arrow keys to navigate",
 	"Enter to select",
+	"Esc to cancel",
 	"No, and tell Claude what to do differently",
-	"Do you want",
-	"Would you like",
 	"Allow once",
 	"Allow always",
 	// First-run trust dialog ("❯ No, exit / Yes, I trust this folder"), which
@@ -242,6 +264,20 @@ var interactiveMenuMarkers = []string{
 	"How is Claude doing this session",
 	"0: Dismiss",
 }
+
+// interactiveMenuQuestions are the question lines a permission dialog opens
+// with. On their own they are prose; they mark an open menu only when a
+// selected numbered option ("❯ 1. Yes", menuOptionCursorRe) follows them.
+var interactiveMenuQuestions = []string{
+	"do you want",
+	"would you like",
+}
+
+// menuOptionCursorRe matches the selection cursor on a numbered menu option
+// ("❯ 1. Yes", "│ ❯ 2. No"). The cursor is what makes it a menu: a numbered
+// list in Claude's prose carries no "❯", and the empty input prompt carries
+// no number.
+var menuOptionCursorRe = regexp.MustCompile(`^[\s│]*❯\s*\d+\.\s+\S`)
 
 // codexInteractiveMenuMarkers are the footer strings codex renders under an
 // open picker (model switch on rate limit, approval choices). Captured from
@@ -264,12 +300,26 @@ func hasCodexInteractiveMenu(content string) bool {
 
 // hasOpenInteractiveMenu reports whether the pane shows an open selection
 // menu awaiting the operator's choice, scoped to the recent tail so a stale
-// menu scrolled out of view does not keep matching forever.
+// menu scrolled out of view does not keep matching forever. Menu chrome
+// (interactiveMenuMarkers) counts on its own; a dialog question
+// (interactiveMenuQuestions) counts only when a selected numbered option
+// follows it, so a reply that ends in a prose question is not a menu.
 func hasOpenInteractiveMenu(content string) bool {
 	recent := recentTailLower(content, 15)
 	for _, marker := range interactiveMenuMarkers {
 		if strings.Contains(recent, strings.ToLower(marker)) {
 			return true
+		}
+	}
+	question := false
+	for _, line := range strings.Split(recent, "\n") {
+		if question && menuOptionCursorRe.MatchString(line) {
+			return true
+		}
+		for _, q := range interactiveMenuQuestions {
+			if strings.Contains(line, q) {
+				question = true
+			}
 		}
 	}
 	return false
@@ -279,7 +329,41 @@ func hasOpenInteractiveMenu(content string) bool {
 // actively working (spinner char or an "esc|ctrl+c to interrupt" hint). It is
 // the substate-classification counterpart of the busy checks inside
 // hasClaudePrompt, scoped to the same recent-tail window.
+// claudeLiveSpinnerRe excludes completed summaries and quoted prose. A bare
+// spinner is live only immediately above the current framed composer (#2502).
+var claudeLiveSpinnerRe = regexp.MustCompile(`^[✳✽✶✻✢·]\s+[\p{L}\p{M}]+(?:[ -][\p{L}\p{M}]+)*…(?: \([^\r\n]*\))?$`)
+
+func hasClaudeLiveSpinner(content string) bool {
+	if hasOpenInteractiveMenu(content) {
+		return false
+	}
+	lines := lastNLines(StripANSI(content), 25)
+	for i := len(lines) - 1; i >= 2; i-- {
+		line := strings.TrimSpace(lines[i])
+		if prompt, _ := isClaudePromptLine(line); !prompt {
+			continue
+		}
+		// Only the bottom-most prompt is the composer. Require its top
+		// border so an echoed user message cannot make old output live.
+		if !strings.HasPrefix(strings.TrimSpace(lines[i-1]), "────") {
+			return false
+		}
+		for j := i - 2; j >= 0; j-- {
+			candidate := strings.TrimSpace(lines[j])
+			if candidate == "" || strings.HasPrefix(candidate, "⎿") && strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(candidate, "⎿")), "Tip:") {
+				continue
+			}
+			return claudeLiveSpinnerRe.MatchString(candidate)
+		}
+		return false
+	}
+	return false
+}
+
 func (d *PromptDetector) hasClaudeBusyIndicator(content string) bool {
+	if hasClaudeLiveSpinner(content) {
+		return true
+	}
 	// Scope ALL checks to the recent tail: a spinner char left in scrollback
 	// must not permanently classify the session as running and mask a later
 	// auth/model failure. recentTailLower lowercases, which does not affect the

@@ -238,12 +238,16 @@ func journalSendOutcome(delivery string, sendErr error) string {
 // acceptance. Computed once, right after performSend returns, so the moved
 // journal write (recordSendEvent, run after the verdict) still measures the
 // real send latency rather than however long the verdict took to print.
-func sendEventDetail(res sendDeliveryResult, sendErr error, sentAt time.Time) map[string]any {
+//
+// The detail also says who sent what (issue #2481): see sendJournalMeta.
+// All additive keys: a reader that predates them ignores them.
+func sendEventDetail(res sendDeliveryResult, sendErr error, sentAt time.Time, meta sendJournalMeta) map[string]any {
 	outcome := journalSendOutcome(res.delivery, sendErr)
 	detail := map[string]any{"outcome": outcome, "delivery": res.delivery, "transport": res.transport}
 	if outcome == health.SendConfirmed {
 		detail["ack_ms"] = health.Milliseconds(time.Since(sentAt))
 	}
+	meta.addTo(detail)
 	return detail
 }
 

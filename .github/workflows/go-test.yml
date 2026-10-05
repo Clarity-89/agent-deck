@@ -38,6 +38,9 @@ on:
       - 'scripts/ci-test-summary.py'
       - 'tests/known-flaky.txt'
       - 'tests/ci/ci-test-summary.test.sh'
+      - 'tests/comms_matrix/**'
+      - '.github/workflows/comms-matrix.yml'
+      - 'sandbox/Dockerfile'
 
 # One in-flight run per PR (or per branch on push). Rapid follow-up pushes
 # cancel the stale run instead of stacking 20-minute jobs.
@@ -57,6 +60,11 @@ permissions:
   contents: read
 
 jobs:
+  comms-matrix:
+    # Advisory for the first week; promote only after clean real-PR runs.
+    name: Comms matrix advisory
+    uses: ./.github/workflows/comms-matrix.yml
+
   # Docs-only PRs still need the required check to REPORT, but running the
   # full race suite for a README tweak is waste. Decide once here; the shards
   # and the gate below read the answer.
@@ -191,9 +199,9 @@ jobs:
           if-no-files-found: ignore
 
   # The single required context the main ruleset names. It passes when the
-  # diff is not Go-relevant, or when every shard passed; it fails (and never
-  # skips) otherwise, so a docs-only PR still reports and a broken shard
-  # still blocks.
+  # diff is not Go-relevant or every Go shard passed. It fails (and never
+  # skips) otherwise, so a docs-only PR still reports. The comms matrix is
+  # advisory and deliberately does not feed this gate.
   full-test-suite:
     name: Full test suite (PR gate)
     needs: [changes, shard]

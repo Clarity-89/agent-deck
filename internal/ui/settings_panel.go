@@ -116,6 +116,7 @@ type SettingsPanel struct {
 	sidebarDensity         int // index into sidebarDensityValues
 	pendingToolVisibility  bool
 	pendingPrivacy         bool   // Enter/Space on the Privacy row: home opens consent or turns it off
+	privacyTickLabel       string // daily tick acknowledgment, read on Show
 	privacyLabel           string // "on (full)" / "off", read from telemetry state on Show
 
 	// Text input state
@@ -212,6 +213,7 @@ func (s *SettingsPanel) Show() {
 	s.editingText = false
 	s.needsRestart = false
 	s.privacyLabel = telemetryPrivacyLabel()
+	s.privacyTickLabel = telemetry.ReadInstallTickStatus().Summary()
 
 	// Load current config
 	config, _ := session.LoadUserConfig()
@@ -1296,7 +1298,8 @@ func (s *SettingsPanel) View() string {
 	if s.cursor == int(SettingPrivacy) {
 		line = highlightStyle.Render(line)
 	}
-	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+	content.WriteString(dimStyle.Render("    "+s.privacyTickLabel) + "\n\n")
 
 	// MCP & TOOLS
 	content.WriteString(sectionStyle.Render("MCP SERVERS & CUSTOM TOOLS"))

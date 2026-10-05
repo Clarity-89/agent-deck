@@ -44,7 +44,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.16.22" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.16.26" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -88,6 +88,7 @@ func initTelemetrySettings() {
 	telemetry.SetEndpoint(cfg.Telemetry.Endpoint)
 	telemetry.SetPostHogKey(cfg.Telemetry.PostHogKey)
 	telemetry.SetConfigLevel(cfg.Telemetry.Level)
+	telemetry.SetConfigOwner(cfg.Telemetry.Owner)
 }
 
 // telemetrySignalClose flushes the TUI's pending telemetry (activity hour,
@@ -612,6 +613,9 @@ func main() {
 		case "inbox":
 			handleInbox(profile, args[1:])
 			return
+		case "msg":
+			handleMsg(profile, args[1:])
+			return
 		case "feedback":
 			handleFeedback(args[1:])
 			return
@@ -835,6 +839,11 @@ func main() {
 			return
 		}
 	}
+
+	// This process is the TUI or the web server and lives long enough to reuse
+	// one persistent channel per remote. One-shot CLI commands never get here,
+	// so they do not dial a channel they would drop on exit (#2481).
+	session.EnableRemoteChannels()
 
 	// [updates] auto_update_remotes: bring older remotes up to this version
 	// in the background. On by default (auto_update_remotes = false opts
@@ -1472,7 +1481,7 @@ var commandRegistry = map[string]bool{
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
 	"hermes-hooks": true, "cursor-hooks": true, "tmux-hooks": true, "pi-hooks": true, "deepseek": true, "notify-daemon": true,
-	"run-task": true, "inbox": true, "feedback": true, "telemetry": true,
+	"run-task": true, "inbox": true, "msg": true, "feedback": true, "telemetry": true,
 	"debug-dump": true, "version": true, "--version": true, "-v": true,
 	"help": true, "--help": true, "-h": true, "completion": true,
 	"__complete": true,
@@ -1740,19 +1749,23 @@ func resolveAutoParentInstanceChecked(instances []*session.Instance) (*session.I
 		}
 	}
 
-	if tmuxCurrent := strings.TrimSpace(GetCurrentSessionID()); tmuxCurrent != "" {
-		candidates = append(candidates, tmuxCurrent)
-	}
-
 	seen := map[string]bool{}
-	for _, candidate := range candidates {
+	resolve := func(candidate string) *session.Instance {
 		if candidate == "" || seen[candidate] {
-			continue
+			return nil
 		}
 		seen[candidate] = true
-		if inst, _, _ := ResolveSession(candidate, instances); inst != nil {
+		inst, _, _ := ResolveSession(candidate, instances)
+		return inst
+	}
+	for _, candidate := range candidates {
+		if inst := resolve(candidate); inst != nil {
 			return inst, ""
 		}
+	}
+	// The tmux probe runs last, only when the environment named no session.
+	if inst := resolve(strings.TrimSpace(GetCurrentSessionID())); inst != nil {
+		return inst, ""
 	}
 	return nil, authoritative
 }
@@ -2114,38 +2127,22 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 		session.ReconcileDeclarativeGroups(groupTree, cfg)
 	}
 
-	// Resolve parent session if specified
-	var parentInstance *session.Instance
-	if sessionParent != "" {
-		var errMsg string
-		parentInstance, errMsg, _ = ResolveSession(sessionParent, instances)
-		if parentInstance == nil {
-			fmt.Printf("Error: %s\n", errMsg)
-			os.Exit(1)
-			return // unreachable, satisfies staticcheck SA5011
-		}
-		// Sub-sessions cannot have sub-sessions (single level only)
-		if parentInstance.IsSubSession() {
-			fmt.Printf("Error: cannot create sub-session of a sub-session (single level only)\n")
-			os.Exit(1)
-		}
+	// Resolve parent session (see selectLaunchParent)
+	parentInstance, launchedBy, parentNote, parentErr := selectLaunchParent(sessionParent, *noParent, launchNestUnderParent(), instances)
+	if parentErr != nil {
+		message, _ := launchParentErrorParts(parentErr)
+		fmt.Printf("Error: %s\n", message)
+		os.Exit(1)
+	}
+	if parentNote != "" {
+		fmt.Fprintln(os.Stderr, parentNote)
+	}
+	if parentInstance != nil {
 		// handleAdd resolves `path` AFTER this block (see below), so the
 		// cwd-derived group is not available here. Passing "" preserves
 		// handleAdd's existing behavior; the #972 cwd-over-parent priority
 		// is wired into `launch` where path is already known at this point.
 		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
-	} else if !*noParent {
-		var unresolvedParent string
-		parentInstance, unresolvedParent = resolveAutoParentInstanceChecked(instances)
-		if parentInstance == nil && unresolvedParent != "" {
-			fmt.Printf("Error: automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session\n", unresolvedParent)
-			os.Exit(1)
-		}
-		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
-		} else {
-			parentInstance = nil
-		}
 	}
 
 	// Resolve group selector to a canonical path when possible.
@@ -2645,6 +2642,9 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 	if parentInstance != nil {
 		autoHints[hintKeyParent] = parentInstance.ID
 	}
+	if launchedBy != nil {
+		autoHints[hintKeyLaunchedBy] = launchedBy.ID
+	}
 	sessionHints, sessionTags := applyCreationHints(storage, newInstance, creationHints, autoHints)
 	// An operator-named conversation (--resume-session) is an explicit
 	// ownership declaration, so it is an authoritative harness link from
@@ -3030,6 +3030,11 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		// pointer so "nobody" ([]) and "unknown" (absent: tmux could not be
 		// asked, or a build predating the field) stay distinct.
 		Viewers *[]tmux.Viewer `json:"viewers,omitempty"`
+
+		// BackgroundWork is the in-flight background work behind substate
+		// background-work (issue #2473): kind, task, step/steps, elapsed,
+		// source. Omitted when nothing is in flight.
+		BackgroundWork *tmux.BackgroundWork `json:"background_work,omitempty"`
 	}
 	sessions := make([]sessionJSON, len(instances))
 	viewers := session.ViewersByTmuxSession(context.Background(), instances)
@@ -3062,6 +3067,7 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 			StatusSource:      "live",
 			Substate:          substate,
 			SubstateDetail:    inst.SubstateDetail(),
+			BackgroundWork:    inst.BackgroundWorkJSON(),
 			Profile:           profileName,
 			CreatedAt:         inst.CreatedAt,
 			SSHHost:           inst.SSHHost,
@@ -3637,6 +3643,9 @@ func handleStatus(profile string, args []string) {
 			// usage-limit retry time). Same omitempty contract.
 			SubstateDetail string `json:"substate_detail,omitempty"`
 			Path           string `json:"path"`
+
+			// BackgroundWork: see buildListJSON (issue #2473).
+			BackgroundWork *tmux.BackgroundWork `json:"background_work,omitempty"`
 		}
 		type statusJSON struct {
 			Waiting  int                 `json:"waiting"`
@@ -3668,6 +3677,7 @@ func handleStatus(profile string, args []string) {
 					Status:         StatusString(inst.Status),
 					Substate:       substate,
 					SubstateDetail: inst.SubstateDetail(),
+					BackgroundWork: inst.BackgroundWorkJSON(),
 					Path:           inst.ProjectPath,
 				}
 				if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
@@ -3703,6 +3713,9 @@ func handleStatus(profile string, args []string) {
 				}
 				suffix := ""
 				if lbl := SubstateLabel(inst.Substate()); lbl != "" {
+					if work := inst.BackgroundWork(); work.InFlight() {
+						lbl += ": " + work.Summary() // issue #2473
+					}
 					suffix = "  [" + lbl + "]"
 				}
 				fmt.Printf("  %s %-16s %-10s %-22s %s%s\n", symbol, inst.Title, inst.Tool, truncate(modelStatusDisplay(inst), 22), path, suffix)
@@ -3986,15 +3999,16 @@ func handleProfileSetDefault(out *CLIOutput, name string) {
 func handleUpdate(args []string) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	checkOnly := fs.Bool("check", false, "Only check for updates, don't install")
-	jsonOut := fs.Bool("json", false, "With --check: print the result as JSON (current, latest, available, publishing, auto_install, auto_restart, timer, on_disk, running_tuis, pending_launch_agents)")
+	jsonOut := fs.Bool("json", false, "With --check: print the result as JSON (current, latest, available, publishing, auto_install, auto_restart, timer, on_disk, running_tuis, pending_launch_agents, remote_nudges); with --timer-status/--install-timer/--ensure-timer: the timer state or what was done")
 	targetVersion := fs.String("version", "", "Install a specific released version (e.g. 1.7.3); may be a downgrade")
 	unattended := fs.Bool("unattended", false, "Install without prompts (no changelog, no stdin); honours [updates] auto_install; exit 2 on Homebrew installs")
 	checkNow := fs.Bool("check-now", false, "Same as --unattended, but for a controller's nudge: checks GitHub right away and never nudges this host's own remotes")
 	trigger := fs.String("trigger", "", "Who started this run, for the debug log: tui, timer or manual (default: $AGENTDECK_UPDATE_TRIGGER or manual)")
-	installTimer := fs.Bool("install-timer", false, "Install (or replace) the daily unattended update timer (launchd on macOS, systemd --user on Linux)")
+	installTimer := fs.Bool("install-timer", false, "Install the daily unattended update timer (launchd on macOS, systemd --user on Linux), rewrite a stale one, migrate a legacy agentdeck-autoupdate unit; an active current timer is left alone")
+	ensureTimer := fs.Bool("ensure-timer", false, "Install or heal the update timer only where none is active (what unattended runs, the daemon and remote update do); honours [updates] manage_timer")
 	uninstallTimer := fs.Bool("uninstall-timer", false, "Remove the daily unattended update timer")
-	timerStatus := fs.Bool("timer-status", false, "Show whether the daily update timer is installed and loaded")
-	dryRun := fs.Bool("dry-run", false, "With --install-timer/--uninstall-timer: print the files and commands, execute nothing")
+	timerStatus := fs.Bool("timer-status", false, "Show whether the daily update timer is installed and loaded (kinds: launchd, systemd, systemd-legacy, none)")
+	dryRun := fs.Bool("dry-run", false, "With --install-timer/--ensure-timer/--uninstall-timer: print the files and commands, execute nothing")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck update [options]")
@@ -4013,8 +4027,9 @@ func handleUpdate(args []string) {
 		fmt.Println("  agent-deck update --check-now          # What a controller's nudge runs on this host")
 		fmt.Println("  agent-deck update --install-timer     # Daily unattended update at 07:MM (random minute)")
 		fmt.Println("  agent-deck update --install-timer --dry-run")
+		fmt.Println("  agent-deck update --ensure-timer      # Install/heal only where no timer is active")
 		fmt.Println("  agent-deck update --uninstall-timer")
-		fmt.Println("  agent-deck update --timer-status")
+		fmt.Println("  agent-deck update --timer-status [--json]")
 		fmt.Println()
 		fmt.Println("On macOS every install re-registers com.agentdeck.* launchd agents that run")
 		fmt.Println("this binary (bootout + bootstrap), otherwise they crash-loop with EX_CONFIG.")
@@ -4030,13 +4045,17 @@ func handleUpdate(args []string) {
 		os.Exit(code)
 	}
 
+	timerOpts := timerCommandOptions{DryRun: *dryRun, JSON: *jsonOut, ManageTimer: session.GetUpdateSettings().GetManageTimer()}
 	switch {
 	case *installTimer:
-		exit(runTimerCommand("install", *dryRun, os.Stdout))
+		exit(runTimerCommand("install", timerOpts, os.Stdout))
+	case *ensureTimer:
+		exit(runTimerCommand("ensure", timerOpts, os.Stdout))
 	case *uninstallTimer:
-		exit(runTimerCommand("uninstall", *dryRun, os.Stdout))
+		exit(runTimerCommand("uninstall", timerOpts, os.Stdout))
 	case *timerStatus:
-		exit(runTimerCommand("status", false, os.Stdout))
+		timerOpts.DryRun = false
+		exit(runTimerCommand("status", timerOpts, os.Stdout))
 	}
 
 	if *unattended || *checkNow {
@@ -4073,7 +4092,7 @@ func handleUpdate(args []string) {
 			timer = update.QueryTimerStatus(cfg, update.ExecRunner{})
 		}
 		onDisk := onDiskVersion()
-		if err := printUpdateCheckJSON(os.Stdout, buildUpdateCheckJSON(info, session.GetUpdateSettings(), timer, onDisk, runningTUIReports(onDisk), update.ListPendingRebootstrap())); err != nil {
+		if err := printUpdateCheckJSON(os.Stdout, buildUpdateCheckJSON(info, session.GetUpdateSettings(), timer, onDisk, runningTUIReports(onDisk), pendingLaunchAgentsForCheck(), session.LoadRemoteNudges()...)); err != nil {
 			exit(1)
 		}
 		exit(0)
@@ -4104,6 +4123,7 @@ func handleUpdate(args []string) {
 		if *checkOnly {
 			printOutdatedTUIs(onDiskVersion())
 			printPendingLaunchAgents()
+			printFailedRemoteNudges(os.Stdout, session.LoadRemoteNudges())
 			return
 		}
 		// Nothing to install, but a launch agent an earlier run left
@@ -4140,6 +4160,7 @@ func handleUpdate(args []string) {
 		}
 		printOutdatedTUIs(onDiskVersion())
 		printPendingLaunchAgents()
+		printFailedRemoteNudges(os.Stdout, session.LoadRemoteNudges())
 		return
 	}
 

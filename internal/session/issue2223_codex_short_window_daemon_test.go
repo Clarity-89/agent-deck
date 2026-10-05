@@ -83,8 +83,8 @@ func TestIssue2223_CodexTwoCompletionsWithinShortWindowBothDelivered(t *testing.
 	n.wake = &wakeNudgeWiring{
 		nudger: NewWakeNudger(0),
 		now:    time.Now,
-		isIdle: func(*Instance) bool { return true },
-		send:   func(*Instance, string) error { return nil },
+		isIdle: func(*Instance, string) bool { return true },
+		send:   func(*Instance, string, string) error { return nil },
 	}
 
 	t0 := now.Add(-4 * time.Hour)

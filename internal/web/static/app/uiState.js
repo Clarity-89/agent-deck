@@ -69,10 +69,25 @@ export const statusFiltersSignal = signal([])
 export const mobileTabSignal = signal('fleet')
 
 // Sidebar column show/hide menu state.
-export const showColsSignal = signal(loadJSON('agentdeck.showCols', {
-  tool: true, cost: true, branch: false, attach: false, sandbox: false, lastSeen: false,
-}))
+// Options added after a viewer persisted their choice are merged in with
+// their default, so the menu checkbox matches what the row renders; an
+// explicitly saved value (annotations: false) still wins.
+export const showColsSignal = signal({
+  annotations: true,
+  ...loadJSON('agentdeck.showCols', {
+    tool: true, cost: true, branch: false, attach: false, sandbox: false, lastSeen: false,
+  }),
+})
 persist(showColsSignal, 'agentdeck.showCols')
+
+// Fleet board layout: 'groups' (the one-card-per-group grid, the default) or
+// 'status' (opt-in kanban by the semantic status hint).
+export const fleetViewSignal = signal(loadJSON('agentdeck.fleetView', 'groups'))
+persist(fleetViewSignal, 'agentdeck.fleetView')
+
+// Whether the pinned conductor banner shows its fleet summary (default open).
+export const conductorBannerOpenSignal = signal(loadJSON('agentdeck.conductorBannerOpen', true))
+persist(conductorBannerOpenSignal, 'agentdeck.conductorBannerOpen')
 
 // Profile selector. Initialized to empty so cold loads don't flash a
 // hardcoded default before /api/profiles resolves. AppShell seeds this

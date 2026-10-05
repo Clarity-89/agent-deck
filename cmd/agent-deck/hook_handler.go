@@ -52,6 +52,79 @@ type hookPayload struct {
 	// false. A missing field must NOT be read as "fresh user turn" (which would
 	// reset the loop guard every Stop); resolveStopHookActive fails safe to true.
 	StopHookActive *bool `json:"stop_hook_active"`
+
+	// Comms Ledger producer fields (docs/comms.md): the text each harness
+	// already puts on the wire, forwarded to the daemon's spool instead of
+	// discarded. Unknown to a harness that does not send them.
+	// Decoded leniently (raw, then read as a string) so a harness that
+	// sends an unexpected type for one of them never makes the whole
+	// payload undecodable for the status path.
+	TranscriptPath       json.RawMessage `json:"transcript_path"`
+	TurnID               json.RawMessage `json:"turn_id"`                // Codex hooks only; Claude's Stop has none
+	LastAssistantMessage json.RawMessage `json:"last_assistant_message"` // Claude Stop
+	Prompt               json.RawMessage `json:"prompt"`                 // Claude UserPromptSubmit
+}
+
+// rawString reads a leniently decoded field as a string ("" for anything
+// that is not a JSON string).
+func rawString(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+// commsSpoolEdge maps a Claude Code hook event to the comms spool edge it
+// carries. Empty edge: nothing to spool for this event. P1 enables two
+// producers only (docs/comms.md): Claude through this handler and Codex
+// through codex-notify. A Codex Stop hook (recognisable by its turn_id,
+// which Claude's Stop does not carry) is never spooled here, so a user who
+// also points Codex hooks at hook-handler cannot duplicate a turn the
+// notify line already produced. Every other harness is status-only in P1.
+func commsSpoolEdge(p hookPayload) (harness, edge, text, prompt string) {
+	turnID := rawString(p.TurnID)
+	switch normalizeHookEventKey(p.HookEventName) {
+	case "userpromptsubmit":
+		if turnID != "" {
+			return "", "", "", "" // Codex UserPromptSubmit
+		}
+		return "claude", session.CommsEdgePromptStart, "", rawString(p.Prompt)
+	case "stop":
+		if turnID != "" || p.ConversationID != "" {
+			return "", "", "", "" // Codex Stop (notify owns the turn) or Cursor stop (status only)
+		}
+		return "claude", session.CommsEdgeTurnEnd, rawString(p.LastAssistantMessage), ""
+	}
+	return "", "", "", ""
+}
+
+// spoolCommsFromHook forwards the hook's text to the daemon's spool when
+// the ledger is on. It never writes the ledger itself (the #824 rule), never
+// blocks on anything but one small file write, and never fails the hook.
+func spoolCommsFromHook(instanceID string, p hookPayload) {
+	harness, edge, text, prompt := commsSpoolEdge(p)
+	if edge == "" || !session.CommsLedgerEnabled() {
+		return
+	}
+	sessionID := strings.TrimSpace(p.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(p.ConversationID)
+	}
+	transcript := ""
+	if harness == "claude" {
+		if clean, ok := session.ValidateTranscriptPath(rawString(p.TranscriptPath)); ok {
+			transcript = clean
+		}
+	}
+	if err := session.WriteCommsSpool(session.CommsSpoolEntry{
+		Harness: harness, Event: p.HookEventName, Edge: edge, Instance: instanceID,
+		SessionID: sessionID, TurnID: strings.TrimSpace(rawString(p.TurnID)), Text: text, Prompt: prompt,
+		TranscriptPath: transcript, Cwd: strings.TrimSpace(p.Cwd), TSignal: time.Now().UnixMilli(),
+	}); err != nil {
+		hookHandlerLog.Warn("comms_spool_write_failed",
+			slog.String("instance", instanceID), slog.String("event", p.HookEventName), slog.String("error", err.Error()))
+	}
 }
 
 // resolveStopHookActive fails safe (audit B8): an absent stop_hook_active is
@@ -229,6 +302,10 @@ func handleHookHandler() {
 		return
 	}
 
+	// Comms Ledger: spool the text this event carries (Claude Stop and
+	// UserPromptSubmit only in P1).
+	spoolCommsFromHook(instanceID, payload)
+
 	// Map event to status
 	status := mapEventToStatus(payload.HookEventName)
 
@@ -305,13 +382,49 @@ func handleHookHandler() {
 	// injected as additionalContext. State, not events — complements the #1225
 	// Stop-edge drain below, which delivers queued deltas. No-op for sessions
 	// without children; AGENTDECK_NO_CHILDREN_CONTEXT=1 opts a session out.
-	if ctxEvent := claudeContextEventName(payload.HookEventName); ctxEvent != "" &&
-		os.Getenv("AGENTDECK_NO_CHILDREN_CONTEXT") != "1" {
-		if summary := buildChildrenContextSummary(instanceID); summary != "" {
-			if out := childrenContextJSON(ctxEvent, summary); out != "" {
-				fmt.Println(out)
+	//
+	// Issue #2469: the same hook first drains the parent's durable inbox and
+	// injects the records (text included) as additionalContext, so the turn
+	// a wake nudge, a heartbeat or a human started already carries every
+	// pending child record and the model acts with zero tool calls. The
+	// fleet snapshot follows, as a one-line delta emitted only when changed.
+	if ctxEvent := claudeContextEventName(payload.HookEventName); ctxEvent != "" {
+		isSessionStart := normalizeHookEventKey(payload.HookEventName) == "sessionstart"
+		var parts []string
+		// Fleet snapshot first: it is the slow part (a storage load) and the
+		// hook's output is discarded on timeout, so consuming the inbox is the
+		// LAST thing done before printing.
+		if os.Getenv("AGENTDECK_NO_CHILDREN_CONTEXT") != "1" {
+			if summary := buildChildrenContextSummary(instanceID, isSessionStart); summary != "" {
+				parts = append(parts, summary)
 			}
 		}
+		// Drain only on UserPromptSubmit, which the install makes synchronous;
+		// SessionStart is async and its additionalContext timing is the
+		// harness's, so records are never consumed there.
+		var ledger *session.LedgerDelivery
+		if !isSessionStart {
+			// Comms Ledger canary: an enrolled parent reads its records
+			// from the ledger (acknowledging what a wake line showed);
+			// every other session keeps the inbox drain.
+			// The ledger's context already ends with what the inbox holds.
+			if dl, ok := session.LedgerPromptContext(instanceID, rawString(payload.Prompt)); ok {
+				ledger = dl
+				if dl.Text != "" {
+					parts = append([]string{dl.Text}, parts...)
+				}
+			} else if drained, _, derr := session.DrainForPrompt(instanceID); derr == nil && drained != "" {
+				parts = append([]string{drained}, parts...)
+			}
+		}
+		printed := false
+		if len(parts) > 0 {
+			if out := childrenContextJSON(ctxEvent, strings.Join(parts, "\n")); out != "" {
+				_, err := fmt.Println(out)
+				printed = err == nil
+			}
+		}
+		ledger.Done(printed)
 	}
 
 	// Issue #1225: on the Stop edge (the turn boundary), a parent drains its
@@ -326,9 +439,28 @@ func handleHookHandler() {
 	// the maintainer note in the PR. Emitting here is harmless under the legacy
 	// async install (Claude ignores stdout) and activates once sync lands.
 	if isStopHookEvent(payload.HookEventName) && stopHookDrainEnabled(getClaudeConfigDirForHooks()) {
+		// Comms Ledger canary: the turn that ended confirms what it carried;
+		// urgent ledger records pending block once more. When the ledger does
+		// not block, the inbox's Stop drain runs for what the inbox holds.
+		// The ledger's Stop decision already ran the inbox's Stop drain
+		// (leaving out turns the ledger showed) when it did not block itself.
+		if dl, ledgerOK := session.LedgerStopDecision(instanceID, resolveStopHookActive(payload)); ledgerOK {
+			printed := false
+			if dl.Blocked {
+				if out, mErr := json.Marshal(dl.Decision); mErr == nil {
+					_, err := fmt.Println(string(out))
+					printed = err == nil
+				}
+			}
+			dl.Done(printed)
+			return
+		}
 		if dec, blocked, derr := session.DrainForStopHook(instanceID, resolveStopHookActive(payload)); derr == nil && blocked {
 			if out, mErr := json.Marshal(dec); mErr == nil {
 				fmt.Println(string(out))
+				// A Stop-hook block buys the parent another turn: a machine
+				// wake for `msg stats`, like a typed nudge.
+				session.SpoolCommsWake(instanceID, "inbox", "stop", dec.Reason, "")
 			}
 		}
 	}
@@ -1102,7 +1234,11 @@ func logCostDebug(format string, args ...any) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			hookHandlerLog.Debug("cost_debug_log_close_failed", slog.String("error", err.Error()))
+		}
+	}()
 	msg := fmt.Sprintf(format, args...)
 	fmt.Fprintf(f, "%s %s\n", time.Now().Format("15:04:05.000"), msg)
 }

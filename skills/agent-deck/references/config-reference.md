@@ -32,6 +32,10 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[global_search] Section](#global_search-section)
 - [[recall] Section](#recall-section)
 - [[notifications] Section](#notifications-section)
+- [[inbox] Section](#inbox-section)
+- [[comms] Section](#comms-section)
+- [[send] Section](#send-section)
+- [[remotes.<name>] Talkback](#remotesname-talkback)
 - [[health] Section](#health-section)
 - [[performance] Section](#performance-section)
 - [[core] Section](#core-section)
@@ -50,7 +54,7 @@ default_tool   = "claude"   # Pre-selected tool when creating sessions
 default_path   = ""         # Fallback project directory for add/launch without a path
 sync_title     = true       # Let agents rename sessions from their session-name
 push_title     = true       # Use the exact deck title at supported Claude startup
-group_sort     = "creation" # within-group order: "creation" (default) or "actionable"
+group_sort     = "creation" # within-group order: "creation" (default), "actionable" or "alphabetical"
 send_transport = "tmux"     # `session send` delivery: "tmux" (default) or "auto" (socket)
 ```
 
@@ -60,7 +64,7 @@ send_transport = "tmux"     # `session send` delivery: "tmux" (default) or "auto
 | `default_path` | string | `""` | Fallback project directory for `add` and `launch` when no path argument is given (#1303). Resolution chain: explicit path arg (including `.`, which always means the current directory) → target group's `default_path` (DB-resident, set via `group update` or the TUI) → this key → cwd. Supports `~` and `$VAR` expansion; silently skipped if the directory doesn't exist. |
 | `sync_title` | bool | `true` | When `true`, agent-deck overwrites a session's title with the agent's own session-name (e.g. Claude's `--name` / `/rename`, issues #572/#697). Set `false` to keep the title you gave the session — globally, for every tool. A title you supply explicitly is already exempt: `add -t`, `launch -t`, the TUI New Session dialog, an explicit fork title, and `rename` all lock the title on creation (#1615/#1715), so only auto-derived folder-name titles follow the agent. The per-session title-lock (`agent-deck session set-title-lock <id> on|off`) remains as a finer-grained override. Also toggleable in the TUI Settings panel (`S`) under **SESSIONS**. |
 | `push_title` | bool | `true` | Pass the exact deck title as `--name <title>` on supported Claude start/restart/resume commands. Case, punctuation, Unicode and long names are preserved; invalid UTF-8, control/bidirectional-control characters and line separators omit the default. An explicit `--name`/`-n` override wins. Missing settings default to enabled; configuration read/parse errors disable automatic naming. A deck rename applies on the next supported startup. No running prompt receives input. |
-| `group_sort` | string | `"creation"` | Order of sessions within a group. `"creation"` (default) keeps the order sessions were created in, and respects the `K`/`J` manual reorder. `"actionable"` restores the issue #857 sort that surfaces the most recently actionable sessions (error → waiting → running → idle → stopped, then recency) to the top of each group. Pin and Maestro rows are unaffected by this setting. |
+| `group_sort` | string | `"creation"` | Order of sessions within a group. `"creation"` (default) keeps the order sessions were created in, and respects the `K`/`J` manual reorder. `"actionable"` restores the issue #857 sort that surfaces the most recently actionable sessions (error → waiting → running → idle → stopped, then recency) to the top of each group. `"alphabetical"` (#2451) orders sessions A→Z by title, case-insensitively; sessions whose titles match ignoring case keep their creation order. In `"actionable"` and `"alphabetical"` mode the sort is reapplied whenever the session list reloads, so a `K`/`J` move does not stick. Any other value falls back to `"creation"`. The setting orders the TUI and the web UI; `agent-deck list` prints sessions in storage order and does not apply it, and remote rows keep the remote's own listing order. Pin and Maestro rows are unaffected by this setting. |
 | `send_transport` | string | `"tmux"` | How `agent-deck session send` delivers to a Claude-compatible target (discussion #2089). `"tmux"` (default) is the historical keystroke path. `"auto"` opts in to Claude Code's own messaging socket when the target has one — a live process, `peerProtocol == 1`, a readable socket path, and a session record whose pid is in the target pane's process tree — and falls back to tmux keystrokes on anything that fails a check *before* a byte is written (dead pid, stale record, no socket, old protocol, ambiguous or out-of-tree record, etc). Once a write to the socket starts, it is never retried on tmux, even on failure, to avoid double delivery. Claude's own inbox sends no in-band acknowledgement or refusal on any path, so a socket send reports `delivery: "queued_socket"` with `submitted: false` and `acknowledged: false`: the bytes were written, and nothing confirms the target accepted them. With `--wait`, a socket send returns immediately with exit 0 and no output when the target cannot be shown to be idle: `wait_outcome: "unverified_busy_target"` when a pre-write probe (the same hook-driven status `--defer-if-busy` holds on) confirmed the target was mid-turn, and `wait_outcome: "unverified_busy_probe_failed"` when no status could be read at all. The write does not interrupt a running turn, so the next completion belongs to that turn and cannot be attributed to this message. When the probe reads idle, `--wait` runs normally and prints output, but tags it `wait_outcome: "observed_not_correlated"` and `verified: false`: the probe narrows the window rather than closing it, so a turn that started between the idle probe and the write would be reported the same way. Only an in-band receipt keyed to the message id could close that, and Claude's inbox provides none, so no socket `--wait` claims correlation (`verified: false` on all three outcomes). A tmux `--wait` carries neither key, because its submit verification is a real pane-observed signal for the message it just typed. `--stream` is NOT gated this way — on a busy target it will emit the running turn's events as if they were this message's; gating it is a follow-up, out of scope here. A message that is a bare slash command (starts with `/`) always routes to tmux, because the socket path sets `skipSlashCommands`, and Claude would otherwise render e.g. `/compact` as literal text instead of running it. Any unrecognized value (a typo'd `"AUTO"`) falls back to `"tmux"` with a one-line warning. |
 
 ### Startup naming boundaries
@@ -655,11 +659,15 @@ Conductor (meta-agent orchestration) settings. The `[conductor]` block also carr
 ```toml
 [conductor]
 dir = ""   # Override the base conductor directory (default: <data-dir>/conductor)
+human_digest_minutes = 30   # info items for the human leave as one digest at most this often
+need_retire_cycles = 3      # unanswered urgent line: escalated once on this cycle, then dropped
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `dir` | string | `""` | Base directory for conductor homes (`meta.json`, `CLAUDE.md`, heartbeat scripts). Empty uses the default resolution: `$XDG_DATA_HOME/agent-deck/conductor` with a legacy `~/.agent-deck/conductor` fallback. Tilde and `$VAR` are expanded. |
+| `human_digest_minutes` | int | `30` | Conductor to human (#2469): queued `info` items (`conductor notify --tier info`, `[info]` reply lines) are sent by the bridge as ONE digest once this many minutes passed since the last digest (or since the oldest item, before the first), or earlier right after the next urgent message (always as its own message, at most 20 items each). `0` sends them on the next bridge poll. |
+| `need_retire_cycles` | int | `3` | An unanswered `NEED:` / `[urgent]` / `URGENT:` heartbeat line is forwarded on cycles 1..N-1, replaced once on cycle N by `STILL BLOCKED (N cycles, no reply): <line>`, then dropped until it disappears from a reply. A cycle counts only once the bridge delivered that reply (`tier-filter --ack`), so a channel outage never retires a line unseen. Counts persist on disk (`runtime/human-outbox/<conductor>.need.json`). |
 
 > **Note:** Each conductor's `heartbeat.sh` honors `[conductor].dir` and self-heals — when you change `dir`, the script content is auto-refreshed by the migration that runs on the next `agent-deck conductor list` / `status` / `setup` / `teardown`. The surface that goes **stale** is the daemon, not the script: the launchd heartbeat plist (and the Linux systemd unit) bakes absolute script/log paths at install time and is regenerated only by `agent-deck conductor setup`. After changing `dir`, re-run `agent-deck conductor setup <name>` per conductor to regenerate and reload the daemon. (A `conductor migrate-dir` helper to automate this is planned.) A `conductor list`/`status` after a dir change will flag a stale heartbeat daemon in its `[migrated]` output.
 
@@ -673,12 +681,14 @@ Tool-agnostic spawn settings.
 [launch]
 inject_identity = true   # Default: true
 context_level = "primer" # none | primer | full — global default (issue #2260)
+nest_under_parent = false # Default: false
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `inject_identity` | bool | `true` | Tell every spawned session, through its harness's own instruction mechanism, that it runs inside agent-deck: its session id, title, tool, group, profile, account, parent session and project path, the six most useful `agent-deck` commands, `session current --json` as the way to fetch the live record, and the `===AGENTDECK_DONE===` completion sentinel. The block (under 40 lines) is regenerated from the session record on every start/restart and written to `<data-dir>/agent-deck/runtime/identity/<session-id>/identity.md`; its path is exported as `AGENTDECK_IDENTITY_FILE`. Per-session opt-out: `agent-deck add|launch --no-identity`. `inject_identity = false` is the *global* layer's value only — a `context_level` set on a group or session still overrides it (global < group < session precedence; the per-session `--no-identity` opt-out is the one thing that keeps winning over everything). |
 | `context_level` | string | `""` (falls back to `full`) | Global default for how much of the identity block a spawned session's harness receives (issue #2260): `none` (no injection, same as `inject_identity = false`), `primer` (short session-identity block: id/title/tool/parent), or `full` (the complete block `inject_identity` describes). Overridden per group (`[groups."<path>"].context_level`, ancestor-walking) or per session (`agent-deck session set <id> context-level <level>`). Precedence: `--no-identity` (session) > session `context_level` > group `context_level` (nearest ancestor) > global `context_level` > global `inject_identity=false` > default `full`. Inspect what a session actually resolves to with `agent-deck session primer [id]`. |
+| `nest_under_parent` | bool | `false` | What `add` and `launch` do when run from inside a sub-session without `--parent`. `false` keeps the long-standing behaviour: the new session starts top-level, in the group derived from its folder, with no parent link and no note. `true` links it under the calling sub-session's own parent (one hop, never further), picks its group by the same rules as any child of that parent (`add` takes the parent's group; `launch` keeps the folder-derived group unless `--inherit-group` or a worktree child), prints a one-line note on stderr, and records the calling sub-session in a `launched-by` hint next to the `parent` hint (`launch --json` shows both under `hints`; `parent_id` is the session it was actually linked to). With `true`, a caller whose parent no longer exists starts top-level with a note instead of failing, a caller whose parent is itself a sub-session is refused naming both ids, and `--no-parent` from a sub-session prints where the session would otherwise have landed. An explicit `--parent <sub-session>` is refused either way (single level only). The `--startup-query` capacity pre-check follows the same rule. |
 
 How each harness receives the block (`documentation/HARNESS_IDENTITY.md` has the details):
 
@@ -725,6 +735,7 @@ check_enabled = true          # Check on startup
 check_interval_hours = 24     # Legacy throttle for the byte-pushing sweep only
 check_interval = "90s"        # How often every daemon/TUI polls GitHub for a new release
 sweep_remotes = false         # Push bytes to remotes after an install (default: nudge instead)
+manage_timer = true           # Install and heal the update timer automatically
 notify_in_cli = true          # Show in CLI commands
 ```
 
@@ -738,11 +749,12 @@ notify_in_cli = true          # Show in CLI commands
 | `check_interval_hours` | int | `24` | Hours between runs of the legacy byte-pushing sweep (`auto_update_remotes`'s throttle). Unrelated to `check_interval` below. |
 | `check_interval` | duration string | `"90s"` | How often every agent-deck daemon/TUI polls the GitHub releases endpoint for a new release. The poll is a conditional GET (`If-None-Match` against the last seen `ETag`): when nothing has changed, GitHub answers `304 Not Modified`, which does not spend the caller's API rate limit, so a short interval stays cheap between releases. A release is normally installed within one interval of publishing (plus install time), not on the next restart or the next daily timer run. |
 | `sweep_remotes` | bool | `false` | Push the controller's binary bytes onto every configured remote after an unattended install (the pre-nudge model, see "Nudging remotes" below). Off by default: remotes are nudged instead and pull the release themselves. `agent-deck remote update <host>` is unaffected either way — it always pulls onto the named remote by hand. |
+| `manage_timer` | bool | `true` | Let agent-deck install and heal its own update timer (launchd on macOS, systemd `--user` on Linux) without a separate `update --install-timer`: `update --unattended` (the timer, the TUI's install run, a controller's nudge), the TUI's periodic check (once per process), the notify daemon at start (once) and `remote update` (the remote's `update --ensure-timer`) install it where none is active, re-enable an inactive one and migrate a hand-made `agentdeck-autoupdate.timer` (see "Timer" below). Skipped on a host without a systemd user session or launchd GUI domain, for a binary outside an install directory (a dev build), and in a test, CI or script-driven process; on macOS the automatic path never replaces a loaded plist. `false` leaves the timer to `update --install-timer` / `--uninstall-timer` by hand (an uninstall with this on says the next run puts it back). |
 | `notify_in_cli` | bool | `true` | Show updates in CLI (not just TUI). |
 
 **Nudging remotes instead of pushing bytes.** With `sweep_remotes` at its default of `false`, an unattended install (or a "nothing to install, already current" run) tells every configured remote to check for the release right now, over the same SSH connection `remote list`/`remote update` already use: `agent-deck update --check-now` runs on the remote, backgrounded (`nohup … & disown`) so the controller never waits on the remote's own download and never transfers any release bytes to it. A remote whose last known version predates `--check-now` (anything before this feature, e.g. v1.16.14/v1.16.15) gets the compatibility fallback instead — a blocking `agent-deck update --unattended` on that remote — so the bytes are still fetched BY the remote either way. Either path is best-effort: a remote that cannot be reached is reported (`agent-deck update`'s own output lists one line per remote) and never fails the local install. Set `sweep_remotes = true` to restore the old behavior of the controller pushing a verified binary onto every remote directly.
 
-**Timer.** `agent-deck update --install-timer` schedules `agent-deck update --unattended --trigger timer` once a day: a launchd agent (`~/Library/LaunchAgents/com.agentdeck.autoupdate.plist`, 07:MM local time with a minute drawn at random at install time, since launchd has no `RandomizedDelaySec`) on macOS, or a systemd user timer (`agent-deck-autoupdate.timer`, `OnCalendar=daily`, `RandomizedDelaySec=1h`, `Persistent=true`) on Linux. This daily run is now a backstop, not the primary path: any long-running agent-deck process (an open TUI, `web --no-tui`, `notify-daemon`) already polls every `check_interval` on its own and installs the moment a release appears. The unattended run honours `auto_install`, never runs Homebrew, takes `<cache dir>/update.lock` so it cannot collide with another run (single-flight; a run whose holder process has died is detected and the lock recovered automatically), and afterwards nudges every configured remote (falling back to a blocking pull for one that predates the nudge) and, only with `sweep_remotes` on, also runs the old push-based sweep. `--timer-status`, `--uninstall-timer` and `--dry-run` round it out; `agent-deck update --check --json` reports the timer state alongside these settings, plus `on_disk` (the version of the binary at the executable's path) and `running_tuis` (every open TUI's pid, version, `outdated`, `ticking`, `restart_state` and `block_reason`, from the heartbeat each TUI writes to `<cache dir>/tui/<pid>.json`). Every unattended run also appends to `<cache dir>/update.log` (trigger, pid, ppid, launchd service, version on each line). On macOS the run re-registers the `com.agentdeck.*` launch agents that run the binary, except the one it runs inside itself, which goes to `<cache dir>/launchd-rebootstrap-pending.json` for the next run outside it; an agent that was booted out and never came back is kept there too (with its attempts) and retried by every later run, and `agent-deck update --check --json` lists the marker as `pending_launch_agents` (label, reason, since, attempts, last_error).
+**Timer.** `agent-deck update --install-timer` schedules `agent-deck update --unattended --trigger timer` once a day: a launchd agent (`~/Library/LaunchAgents/com.agentdeck.autoupdate.plist`, 07:MM local time with a minute drawn at random at install time, since launchd has no `RandomizedDelaySec`) on macOS, or a systemd user timer (`agent-deck-autoupdate.timer`, `OnCalendar=daily`, `RandomizedDelaySec=1h`, `Persistent=true`) on Linux. This daily run is now a backstop, not the primary path: any long-running agent-deck process (an open TUI, `web --no-tui`, `notify-daemon`) already polls every `check_interval` on its own and installs the moment a release appears. The unattended run honours `auto_install`, never runs Homebrew, takes `<cache dir>/update.lock` so it cannot collide with another run (single-flight; a run whose holder process has died is detected and the lock recovered automatically), and afterwards nudges every configured remote (falling back to a blocking pull for one that predates the nudge) and, only with `sweep_remotes` on, also runs the old push-based sweep. A hand-made `agentdeck-autoupdate.timer`/`.service` pair (no hyphen, found in `~/.config/systemd/user` or wherever `systemctl --user cat` says it lives) is reported as kind `systemd-legacy` with `legacy_unit`, never as "not installed", and `--install-timer` or the automatic heal (`manage_timer`) migrates it: the canonical pair is written, enabled and verified first, then the legacy timer is disabled (`systemctl --user disable --now`) and both legacy files are moved to `<file>.bak-agentdeck-<UTC timestamp>` beside them; one line is printed (`migrated legacy timer agentdeck-autoupdate.timer -> agent-deck-autoupdate.timer`). An active timer whose unit files match what this binary would write is left alone, so `--install-timer` and `--ensure-timer` are idempotent (on macOS the plist's existing minute is kept). The automatic heal never rewrites an active canonical timer, so an owner's edit to it survives; it rewrites the pair only when the service is missing or pins a binary that is gone, and every rewrite moves the replaced file to a `.bak-agentdeck-<UTC timestamp>` backup first. A legacy unit in a directory this user cannot write is stopped if active and otherwise left in place with a note, and a lone legacy `.service` is backed up like the pair. `--timer-status [--json]`, `--ensure-timer [--json]`, `--uninstall-timer` and `--dry-run` round it out; `agent-deck update --check --json` reports the timer state alongside these settings, plus `remote_nudges` (each configured remote's latest nudge: `remote`, `asked_version`, `ok`, `outcome` nudged/fallback/failed, `error`, `at`, from `runtime/remote-nudges.json`; omitted on a host that never nudged), `on_disk` (the version of the binary at the executable's path) and `running_tuis` (every open TUI's pid, version, `outdated`, `ticking`, `restart_state` and `block_reason`, from the heartbeat each TUI writes to `<cache dir>/tui/<pid>.json`). Every unattended run also appends to `<cache dir>/update.log` (trigger, pid, ppid, launchd service, version on each line). On macOS the run re-registers the `com.agentdeck.*` launch agents that run the binary, except the one it runs inside itself, which goes to `<cache dir>/launchd-rebootstrap-pending.json` for the next run outside it; an agent that was booted out and never came back is kept there too (with its attempts) and retried by every later run, and `agent-deck update --check --json` lists the marker as `pending_launch_agents` (label, reason, since, attempts, last_error, and `disabled: true` with reason `disabled` for an agent launchd has disabled). An agent on launchd's disabled list (`launchctl print-disabled gui/<uid>`) is never booted out, bootstrapped or kept pending: the run prints one line with the `launchctl enable gui/<uid>/<label>` command that brings it back and drops any marker entry for it.
 
 **When the automatic paths stay quiet.** `auto_install` and `auto_restart` are for a person's deck. Neither fires, whatever the config says, when the process runs under `go test`, when `AGENTDECK_SKIP_UPDATE_CHECK` is set, when `CI` is truthy, when an `AGENTDECK_TEST_*` marker is in the environment, or (TUI only) when stdin or stdout is not a terminal. Headless daemons (`web --no-tui`, `remote-agent`) keep their idle-point restart for real deployments but honour the same environment markers. The reason is logged once at startup (`auto_update_suppressed`), the banner then offers the keys instead of promising a restart, and `ctrl+y` / `ctrl+t` and the explicit `agent-deck update` commands keep working. Scripts that drive `agent-deck` and must never see an unattended install set `AGENTDECK_SKIP_UPDATE_CHECK=1`; the repository's CI workflows do so once per workflow.
 
@@ -792,17 +804,26 @@ full_repaint = false                              # Force full screen clear ever
 default_filter = "active"                         # Initial status filter: "", "active", "running", "waiting", "idle", "error"
 active_filter_label = "Open"                      # Label for the active filter pill (default: "Open")
 active_filter_excludes = ["error", "stopped"]     # Statuses the % "Open" filter hides (default: ["error", "stopped"])
+hide_default_tool_badge = false                   # Hide the row tool badge for sessions running default_tool (claude when unset)
 show_pane_titles = false                          # Show the pane title (task description) on every row, not just the selected one
 include_cwd_prefix = true                         # Prefix titles with "[<cwd-basename>]"
 title_format = "{group}/{name}"                   # Template the terminal title (unset by default); placeholders {group} {project} {name}; overrides include_cwd_prefix
 ```
 
+These filter settings also support `config get/set/schema --json`. For example:
+
+```sh
+agent-deck config set display.active_filter_excludes error,stopped --json
+agent-deck config set display.default_filter active --json
+```
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `full_repaint` | bool | `false` | Force full redraws (fix for Ghostty 1.3+ drift). Also via `AGENTDECK_REPAINT=full`. |
-| `default_filter` | string | `""` | Status filter applied on TUI startup. `"active"` engages the configurable Open filter. Auto-clears if no sessions match. |
+| `default_filter` | string | `""` | Status filter applied on TUI startup. `"active"` engages the configurable Open filter. Concrete status filters auto-clear if no sessions match; `active` remains selected even when empty. |
 | `active_filter_label` | string | `"Open"` | Label shown on the filter pill when active filter is engaged (e.g., "Active", "Live", "Open"). |
-| `active_filter_excludes` | []string | `["error", "stopped"]` | Statuses hidden when the `%` "Open" filter is engaged. Default matches the original hardcoded behavior. Valid values: `running`, `waiting`, `idle`, `error`, `starting`, `stopped`. Unknown entries are dropped silently; if the resulting list is empty the default applies. **Set to `["error"]`** to keep stopped/closed sessions visible while still hiding errors — fixes the over-broad "Open" semantics where closed sessions disappeared from view. Extend with `idle` for an aggressive "show only running/waiting" definition of open. |
+| `active_filter_excludes` | []string | `["error", "stopped"]` | Statuses hidden when the `%` "Open" filter is engaged. Default matches the original hardcoded behavior. Valid values: `running`, `waiting`, `idle`, `error`, `starting`, `stopped`. Unknown entries are dropped silently; if the resulting list is empty the default applies. **Set to `["error"]`** to keep stopped/closed sessions visible while still hiding errors — fixes the over-broad "Open" semantics where closed sessions disappeared from view. Extend with `idle` for an aggressive "show only running/waiting" definition of open. When the list keeps `stopped` visible, `%` cycles All → Open → Open with stopped also hidden → All. The selected step is saved across TUI restarts. |
+| `hide_default_tool_badge` | bool | `false` | Drops the tool badge on session rows whose tool matches the top-level `default_tool` (or `claude` when `default_tool` is unset, the same tool new sessions start with), whatever the session's status or archive state. Sessions on any other tool keep their badge, so they stand out. Applies to local rows and to remote rows in the classic list (remote rows compare against this deck's `default_tool`); the embedded sidebar cards are unchanged. Changing `default_tool` in the Settings panel (`S`) takes effect on save. |
 | `show_pane_titles` | bool | `false` | Shows the dim tmux pane-title (task description) suffix on every session row instead of only the selected row. Also toggleable in the TUI Settings panel (`S`) under **DISPLAY**. |
 | `include_cwd_prefix` | bool | `true` | Show the working-directory prefix (`[<cwd-basename>]`) on session rows/titles. Set `false` to show only the session title. (v1.9.46) |
 | `title_format` | string | `""` | Template for the outer terminal window/tab title using `{group}`, `{project}`, and `{name}` placeholders (e.g. `"{group}/{name}"`). Re-renders live on rename and move-to-group. When unset, the historical `[<project>] <name>` format (and the `include_cwd_prefix` toggle) applies; when set, it takes precedence over `include_cwd_prefix`. |
@@ -820,6 +841,7 @@ hidden_tools = ["gemini", "opencode", "pi"]   # Denylist: hide these from the pi
 show_only_installed_tools = true              # Also hide tools not found on PATH
 new_session_enter_advances = false            # Opt OUT: restore Enter-submits behavior
 attach_on_create = true                       # Opt IN: instantly attach to a newly created session
+active_includes_idle = true                   # Opt IN: active-on-top view keeps idle sessions with a live pane on top
 ```
 
 | Key | Type | Default | Description |
@@ -831,6 +853,7 @@ attach_on_create = true                       # Opt IN: instantly attach to a ne
 | `show_only_installed_tools` | bool | `false` | When `true`, hides built-in and custom tools whose command does not resolve on the host `PATH`. `shell` stays visible. If nothing else resolves, the picker falls back to showing all tools with a one-line hint. Toggle in TUI Settings under **TOOL PICKER**. |
 | `new_session_enter_advances` | bool | `true` | Controls what **Enter** does in the new-session dialog. Default `true`: Enter **advances** to the next field on every row (Name, Tool, Model, Reasoning effort, Path, checkboxes, and each Claude Options row) and only the trailing **[ Create session ]** button creates, so walking the form with Enter never launches a session early. **Ctrl+S** is the explicit "create now" shortcut and submits from any field in both modes. Set `false` to restore the legacy behavior where Enter creates from any row. |
 | `attach_on_create` | bool | `false` | When `true`, creating a session in the TUI (`n` new-session dialog) **immediately attaches** to the new session's pane instead of only moving the cursor to it — "instantly open". Default `false`: today's select-only behavior (press **Enter** to attach). Does not affect the CLI; `agent-deck add` / `session start` attach only with an explicit `--attach`. |
+| `active_includes_idle` | bool | `false` | Changes what the active-on-top view (`t`) treats as active. Default `false`: running, waiting and starting sessions sit on top and idle sessions sink below the `idle / done` divider. When `true` (#2452), an idle session whose tmux pane is still alive stays on top too, so the sessions you are juggling no longer jump to the bottom each time one goes idle; only sessions without a live pane (stopped, error, queued) sink, the divider reads `stopped / done`, and a group repeated below it is suffixed `(stopped)`. Pins still win over the split, and the populated-on-top view is unaffected. Read at startup. TUI only: the CLI and web UI have no active-on-top view. |
 
 Filters compose: `hidden_tools` is applied first, then `show_only_installed_tools` (when enabled).
 
@@ -969,6 +992,65 @@ Notifications fire on the transition into `waiting` or `error`, once per transit
 Off by default because it is the only agent-deck signal that interrupts you outside the TUI.
 
 One thing to know before enabling it: the notification carries the session **title**. Titles can be generated by the agent itself (Claude's conversation-name sync), so a title derived from content the agent read is displayed in a banner, and on the cmux path it is also recorded in cmux's notification history. Nothing is executed: a title is escaped before it reaches the notifier, and is passed as a separate argument where the notifier supports one. But if you run sessions whose titles could echo sensitive strings, that text persists in the notification record. `agent-deck session set-title-lock <id> on` pins a title you chose and stops the sync from replacing it.
+
+## [inbox] Section
+
+What reaches a parent session from its children, and when (#2469). The notify-daemon classifies every finished child turn from the transcript: `urgent` (a completion sentinel, an error status, or an explicit question to the parent: a trailing `?` or a `NEED:` / `QUESTION:` / `ASK:` line), `info` (any other new text, whoever started the turn: a background task notification, a system injection, the child's own inbox prompt, a human, a `session send`) or noise (nothing changed; never recorded). Records carry the child's new text so the parent does not re-read the child.
+
+```toml
+[inbox]
+wake_on = ["urgent"]        # tiers that wake an idle parent immediately
+max_text_bytes = 600        # child text carried on a record (hard max 2048)
+info_digest_minutes = 15    # how long info may wait before a digest wakes an idle parent (0 = never)
+question_wakes = true       # a trailing "?" / NEED: / QUESTION: line is urgent
+journal_keep = 256          # per-child turn journal length (runtime/turn-journal/<child>.jsonl)
+
+[conductors.myconductor.inbox]   # per-conductor override, same keys
+wake_on = ["urgent", "info"]     # restores a wake per recorded turn for this conductor
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `wake_on` | []string | `["urgent"]` | Tiers that type a wake into an idle parent the moment a record lands. Records with no tier (older producers) always wake. `info` records never wake on their own: they stay in the durable inbox and are delivered on the parent's next Stop-hook drain or heartbeat. |
+| `max_text_bytes` | int | `600` | Bytes of the child's final assistant text carried on a record (`text`); clipped on a rune boundary with `…`. Hard ceiling 2048. |
+| `info_digest_minutes` | int | `15` | Reserved for the info digest: an idle parent with info waiting longer than this gets one digest wake. `0` disables the digest. |
+| `question_wakes` | bool | `true` | Treat a parent-facing question (last line ends with `?`, or a `NEED:`/`QUESTION:`/`ASK:` line) as urgent. |
+| `journal_keep` | int | `256` | Lines kept per child in the turn journal (`agent-deck inbox stats` reads the counters, the journal is the per-turn history). |
+
+Measure the effect with `agent-deck inbox stats self` (or `--all`): records by tier, turns suppressed as noise or duplicates, wakeups fired and withheld, bytes injected.
+
+## [comms] Section
+
+The Comms Ledger (docs/comms.md): one append-only message log per profile, written only by the notify-daemon, fed by the hooks agent-deck already installs. Off by default while it is canaried; with it on, every finished turn of a Claude or Codex child lands as one record with the child's text next to the `[inbox]` record, every other harness (Gemini, Cursor, pi, Hermes, OpenCode, shell) records its status edges only in this phase, `agent-deck events follow --bus comms` streams them and `agent-deck msg read|peek|ack|export|stats` reads them. `consumers` (needs `ledger = true`; Claude parents in this phase) leaves the inbox unchanged and adds ledger text at the next prompt, deduplicating exact transcript turns in both directions. Ledger wakes and Stop blocks apply only to ledger-only urgent records. P2b has no production producer for those urgent records, so this phase does not move the #2482 wake targets. `inbox stats` (`shadowed_by_ledger`, already shown by the other path) and `msg stats` measure the paths.
+
+```toml
+[comms]
+ledger = true   # default false
+consumers = ["conductor-ops"]   # Claude parents (id, unique title, or "*"): ledger prompt text plus unchanged inbox
+```
+
+## [send] Section
+
+Tunes `agent-deck session send` (comms redesign PR5).
+
+```toml
+[send]
+tag_sends = true   # prefix agent-originated sends with [agent-deck from:<id>]
+## [remotes.<name>] Talkback
+
+Remotes are added with `agent-deck remote add <name> <user@host>`; this key makes the notify-daemon pull a remote's child records on its own instead of waiting for a conductor to run `agent-deck remote drain`.
+
+```toml
+[remotes.boxb]
+host = "worker@box-b"
+talkback_interval_secs = 30   # 0 / unset = off
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `ledger` | bool | `false` | Spool hook text to `runtime/comms/spool/` and let the notify-daemon commit records to `comms/<profile>/`. `false`: no spool file, no ledger directory. |
+| `tag_sends` | bool | `true` | A `session send` from inside an agent-deck session (`AGENTDECK_INSTANCE_ID` set) to a Claude target starts with one `[agent-deck from:<sender-id>]` line, so the receiver's reply is classified as a send and, when the sender is not the receiver's parent, committed to the sender's inbox as an urgent `reply` record that wakes it (also when the receiver has no parent). `false` turns tagging off for every send (`--no-tag` does it per send). Human shells, senders that are not Claude-compatible sessions, `--draft`, bare slash commands, heartbeats, sends to oneself and non-Claude targets are never tagged. |
+| `talkback_interval_secs` | int | `0` (off) | Every N seconds the notify-daemon runs the same incremental drain as `agent-deck remote drain <name> --into <conductor>` for every local `conductor-*` session enrolled with that remote (it has a cursor for it, i.e. it drained it once, or it holds a pending record from it). 30 is a good value. The drain runs off the poll loop, bounded at 60 s, and a remote with a drain in flight is skipped. A failure backs off from 1 min to 10 min; after 3 consecutive failures each enrolled conductor gets ONE urgent record (`remote <name>: talkback failing for N min: <last error>`), and a success clears the streak. An ingested urgent record wakes an idle conductor exactly like a local one; info records ride its next turn. |
 
 ## [health] Section
 

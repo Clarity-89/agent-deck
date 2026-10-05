@@ -1,5 +1,6 @@
 // panes/FleetPane.js -- At-a-glance overview built from the live menu.
-// Renders four stat tiles + a single "Groups" grid of GroupCards. The bundle
+// Renders four stat tiles + a single "Groups" grid of GroupCards (or, when
+// the viewer opts in, the status kanban from FleetStatusBoard.js). The bundle
 // has additional sections (conductor graph, watcher strip) that depend on
 // fields the API does not expose; those render as informative empty hints.
 import { html } from 'htm/preact'
@@ -7,7 +8,9 @@ import { useEffect, useMemo, useState } from 'preact/hooks'
 import { apiFetch } from '../api.js'
 import { menuModelSignal } from '../dataModel.js'
 import { selectSession } from '../state.js'
-import { activeTabSignal } from '../uiState.js'
+import { activeTabSignal, fleetViewSignal } from '../uiState.js'
+import { AnnotationLine } from '../annotations.js'
+import { useLazyComponent } from '../lazyModule.js'
 
 const EMPTY_REMOTE_COUNTS = {
   remotesOnline: 0, remotesOffline: 0, sessions: 0,
@@ -98,6 +101,7 @@ function GroupCard({ name, items, onSelect }) {
             <span class=${`tdot ${s.status}`}/>
             <span class="tn">${s.title}</span>
             ${s.tool && html`<span class="ttool">${s.tool}</span>`}
+            <${AnnotationLine} s=${s} class="tile-annot"/>
           </button>
         `)}
       </div>
@@ -109,6 +113,15 @@ function GroupCard({ name, items, onSelect }) {
       </div>
     </div>
   `
+}
+
+// The Status view (panes/FleetStatusBoard.js) is opt-in, so its code is
+// fetched the first time a viewer picks it rather than shipped with the
+// default Groups view (see lazyModule.js; switching to Groups and back
+// retries a failed fetch).
+function useStatusBoard(needed) {
+  const board = useLazyComponent(needed, () => import('./FleetStatusBoard.js'), 'fleetStatusBoard', m => m)
+  return needed ? board : null
 }
 
 export function FleetPane() {
@@ -164,9 +177,24 @@ export function FleetPane() {
     selectSession(id)
     activeTabSignal.value = 'terminal'
   }
+  // Groups is the default; the status kanban is opt-in (agentdeck.fleetView).
+  // With no sessions the toggle is hidden, so a persisted Status choice falls
+  // back to the plain Groups empty state rather than strand the viewer there.
+  const view = sessions.length > 0 && fleetViewSignal.value === 'status' ? 'status' : 'groups'
+  const board = useStatusBoard(view === 'status')
+  // Conductors are pinned in a banner above the Status board, so its columns
+  // and tiles hold the workers only.
+  const conductors = board ? sessions.filter(board.isConductorSession) : []
+  const workers = board ? sessions.filter(s => !board.isConductorSession(s)) : []
+  // Leaf group name ("stride/ws1" -> "ws1"), as the group cards show it.
+  const groupLabels = useMemo(
+    () => Object.fromEntries(groups.map(g => [g.path, g.name || g.label])),
+    [groups],
+  )
 
   return html`
     <div class="fleet" data-testid="fleet-pane">
+      ${board && conductors.map(s => html`<${board.ConductorBanner} key=${s.id} s=${s} onSelect=${onSelect}/>`)}
       <div class="fleet-stats">
         <div class="stat" data-testid="fleet-stat-running"><div class="lbl">RUNNING</div><div class="num running">${counts.running}</div></div>
         <div class="stat" data-testid="fleet-stat-waiting"><div class="lbl">WAITING</div><div class="num waiting">${counts.waiting}</div></div>
@@ -181,6 +209,7 @@ export function FleetPane() {
           </div>`}
         </div>
       </div>
+      ${board && html`<${board.StatusTiles} sessions=${workers}/>`}
 
       ${(remoteTotal > 0 || remoteError) && html`
         <div class="fleet-section" data-testid="fleet-remotes-section">
@@ -197,11 +226,19 @@ export function FleetPane() {
       `}
 
       <div class="fleet-section">
-        <div class="fleet-section-head">
-          <span class="kicker">GROUPS</span>
+        <div class="fleet-section-head fleet-board-head">
+          <span class="kicker">${view === 'status' ? 'BY STATUS' : 'GROUPS'}</span>
+          ${sessions.length > 0 && html`<div class=${`fleet-view-toggle${view === 'status' ? ' on-status' : ''}`} role="group" aria-label="Board layout">
+            ${[['status', 'Status'], ['groups', 'Groups']].map(([id, label]) => html`
+              <button key=${id} class=${view === id ? 'on' : ''} aria-pressed=${view === id}
+                      data-testid=${`fleet-view-${id}`} onClick=${() => { fleetViewSignal.value = id }}>${label}</button>
+            `)}
+          </div>`}
           <span class="sub-kicker">${groups.length} group${groups.length === 1 ? '' : 's'} · ${sessions.length} ${remoteTotal > 0 ? 'local ' : ''}session${sessions.length === 1 ? '' : 's'}</span>
         </div>
-        ${groups.length === 0 || sessions.length === 0
+        ${view === 'status'
+          ? board && html`<${board.StatusKanban} sessions=${workers} groupLabels=${groupLabels} onSelect=${onSelect}/>`
+          : groups.length === 0 || sessions.length === 0
           ? html`<div style="font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 16px;">
               No sessions yet. Use the sidebar to create one.
             </div>`

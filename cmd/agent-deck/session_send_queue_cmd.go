@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/comms"
 	"github.com/asheshgoplani/agent-deck/internal/events"
 	"github.com/asheshgoplani/agent-deck/internal/recall/query"
 	"github.com/asheshgoplani/agent-deck/internal/send"
@@ -108,13 +109,57 @@ func sendQueueDir(storage *session.Storage) string {
 
 // publishSendState mirrors a queued send's state on the bus so a client
 // following `events follow --kind session.send` never polls send-status.
+// sender (additive) lets the sender pick out its own sends.
 func publishSendState(profile string, r *sendqueue.Record) {
-	events.PublishProfile(profile, "session.send", r.SessionID, map[string]string{"send_id": r.SendID, "state": r.State, "verdict": r.Verdict, "reason": r.Reason})
+	events.PublishProfile(profile, "session.send", r.SessionID, map[string]string{"send_id": r.SendID, "state": r.State, "verdict": r.Verdict, "reason": r.Reason, "sender": r.Sender})
+}
+
+// queuedSendChanged is every state change of a queued send after it is
+// written: the bus frame, and once the send is final its terminal journal
+// record and, for a failure, a notice to the sender (issue #2481).
+func queuedSendChanged(profile string, prev, r *sendqueue.Record) {
+	if r.State != prev.State || r.Reason != prev.Reason || r.Verdict != prev.Verdict {
+		publishSendState(profile, r)
+	}
+	if !prev.Final() && r.Final() {
+		finishQueuedSend(profile, r, true)
+	}
+}
+
+// ledgerQueuedSend mirrors a queued send's final state into the Comms
+// Ledger (P3), addressed back to the sender persisted in the queue record.
+func ledgerQueuedSend(r *sendqueue.Record, inboxOwned bool) {
+	if !r.Final() {
+		return
+	}
+	// Match the synchronous send evidence: confirmed submission is landed,
+	// while typed alone makes no claim about submission or transcript receipt.
+	var state string
+	switch r.State {
+	case sendqueue.StateLanded, sendqueue.StateSubmitted:
+		state = comms.StateLanded
+	case sendqueue.StateTyped:
+		state = comms.StateTyped
+	case sendqueue.StateFailed:
+		state = comms.StateFailed
+	default:
+		return // No final delivery evidence to publish.
+	}
+	reason := r.Reason
+	if r.Settled {
+		reason = strings.TrimSpace("settled: " + reason)
+	}
+	// Use the durable queue identity, never the worker's environment.
+	if inboxOwned {
+		session.SpoolCommsInboxFailure(r.Sender, r.SessionID, r.SendID, "queue", reason)
+	} else {
+		session.SpoolCommsDelivery(r.Sender, r.SessionID, r.SendID, state, "queue", reason, true)
+	}
 }
 
 // queueSend records the send and hands it to the target's worker. It never
 // types anything itself; it returns at once.
-func queueSend(profile string, storage *session.Storage, inst *session.Instance, message string, images []string, out *CLIOutput) {
+func queueSend(profile string, storage *session.Storage, inst *session.Instance, message string, images []string, tagged bool, ledgerSender string, out *CLIOutput) {
 	now := time.Now()
 	dir := sendQueueDir(storage)
 	status := "unknown"
@@ -128,6 +173,10 @@ func queueSend(profile string, storage *session.Storage, inst *session.Instance,
 		SessionID: inst.ID, SessionTitle: inst.Title, Tool: inst.Tool, Message: message, Images: images,
 		CreatedAt: now.UTC().Format(time.RFC3339Nano), UpdatedAt: now.UTC().Format(time.RFC3339Nano),
 		Deadline: now.Add(sendqueue.DefaultRetryBudget).UTC().Format(time.RFC3339Nano),
+		Sender:   ledgerSender,
+	}
+	if rec.Sender == "" {
+		rec.Sender = sendSenderCLI
 	}
 	if session.IsClaudeCompatible(inst.Tool) {
 		rec.ClaudeSessionID = inst.ClaudeSessionID
@@ -139,9 +188,15 @@ func queueSend(profile string, storage *session.Storage, inst *session.Instance,
 		out.Error(fmt.Sprintf("cannot queue send: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+	// Comms Ledger (P3): reuse the queue's durable sender identity.
+	if ledgerSendAllowed() {
+		session.SpoolCommsSend(rec.Sender, inst.ID, message, "queue", rec.SendID)
+	}
 	publishSendState(profile, rec)
 	if rec.State == sendqueue.StateFailed {
 		out.ErrorWithData(fmt.Sprintf("send %s failed: %s", rec.SendID, rec.Reason), ErrCodeDeliveryFailed, queuedSendFields(rec))
+		// After the verdict; the exit code already tells the sender.
+		finishQueuedSend(profile, rec, false)
 		os.Exit(1)
 	}
 	if err := spawnSendWorker(profile, inst.ID); err != nil {
@@ -149,7 +204,11 @@ func queueSend(profile string, storage *session.Storage, inst *session.Instance,
 		// this target starts a worker again.
 		fmt.Fprintf(os.Stderr, "Warning: could not start the delivery worker yet: %v\n", err)
 	}
-	out.Success(fmt.Sprintf("Queued %s for '%s' (%s)", rec.SendID, inst.Title, status), queuedSendFields(rec))
+	fields := queuedSendFields(rec)
+	fields["tagged"] = tagged
+	summary := fmt.Sprintf("Queued %s for '%s' (%s)", rec.SendID, inst.Title, status)
+	out.Success(summary, fields)
+	out.QuietNotice(summary + "; not delivered yet, see session send-status")
 }
 
 // queuedSendFields is the immediate --json reply for a queued send: the
@@ -188,6 +247,10 @@ func spawnSendWorker(profile, sessionID string) error {
 	if err != nil {
 		return err
 	}
+	// #nosec G702 -- exe is this binary (os.Executable), argv is passed as
+	// separate arguments with no shell, and sessionID was checked against
+	// validInstanceID above. gosec's taint analysis does not treat that check
+	// as a sanitizer and reaches this call through unrelated flows (#2411).
 	cmd := exec.Command(exe, profileArgs(profile, "session", "send-worker", "--target", sessionID)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -270,6 +333,12 @@ func sendWorkerPoll() time.Duration {
 	return envDuration("AGENTDECK_SEND_WORKER_POLL", time.Second)
 }
 
+// sendRetryBackoffMax caps the wait between attempts of a send refused
+// before typing; AGENTDECK_SEND_RETRY_BACKOFF_MAX overrides it.
+func sendRetryBackoffMax() time.Duration {
+	return envDuration("AGENTDECK_SEND_RETRY_BACKOFF_MAX", sendqueue.DefaultRetryBackoffMax)
+}
+
 // sendLandWindow is how long a delivered send is watched for in the
 // transcript before it is settled without a landed row.
 func sendLandWindow() time.Duration {
@@ -310,7 +379,7 @@ func handleSessionSendWorker(profile string, args []string) {
 			deliverQueuedAsync(profile, dir, rec)
 		}
 		startPendingWatchers(profile, dir, *target)
-		lock.Release()
+		releaseQueueLock(lock)
 		// A send queued while this worker was finishing: pick it up.
 		if nextPending(dir, *target) == nil {
 			return
@@ -355,12 +424,19 @@ func spawnSendWatcher(profile, sendID string) error {
 	return cmd.Process.Release()
 }
 
+// releaseQueueLock drops a worker lock, reporting a failed close.
+func releaseQueueLock(lock *sendqueue.Lock) {
+	if err := lock.Release(); err != nil {
+		fmt.Fprintln(os.Stderr, "agent-deck: release send queue lock:", err)
+	}
+}
+
 func watchQueuedSend(profile, dir, sendID string) {
 	lock, ok, err := sendqueue.TryLock(dir, "watch-"+sendID)
 	if err != nil || !ok {
 		return
 	}
-	defer lock.Release()
+	defer releaseQueueLock(lock)
 	rec, err := sendqueue.Load(dir, sendID)
 	if err != nil || rec.Final() || (rec.State != sendqueue.StateTyped && rec.State != sendqueue.StateSubmitted) {
 		return
@@ -370,9 +446,7 @@ func watchQueuedSend(profile, dir, sendID string) {
 		if err != nil {
 			return err
 		}
-		if r.State != rec.State || r.Reason != rec.Reason || r.Verdict != rec.Verdict {
-			publishSendState(profile, r)
-		}
+		queuedSendChanged(profile, rec, r)
 		*rec = *r
 		return nil
 	}
@@ -445,9 +519,7 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 		if err != nil {
 			return err
 		}
-		if r.State != rec.State || r.Reason != rec.Reason || r.Verdict != rec.Verdict {
-			publishSendState(profile, r)
-		}
+		queuedSendChanged(profile, rec, r)
 		*rec = *r
 		return nil
 	}
@@ -494,12 +566,18 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 			return
 		}
 		if rec.State == sendqueue.StateQueued {
-			// Refused before typing: safe to try again once the target settles.
+			// Refused before typing: safe to try again once the target settles,
+			// within the retry budget. The wait doubles per refusal (capped),
+			// so a composer a human is typing into is not hit every second.
 			if pastDeadline() {
-				fail("not delivered before the retry budget ran out: " + strings.TrimPrefix(rec.Reason, "retrying: "))
+				fail(fmt.Sprintf("not delivered before the retry budget ran out (%d attempts): %s", rec.Attempts, strings.TrimPrefix(rec.Reason, "retrying: ")))
 				return
 			}
-			time.Sleep(poll)
+			wait := sendqueue.RetryDelay(poll, sendRetryBackoffMax(), rec.Attempts)
+			if left := time.Until(deadline); !deadline.IsZero() && left < wait {
+				wait = left // one last attempt at the end of the budget
+			}
+			time.Sleep(wait)
 		}
 	}
 	if rec.Final() {
@@ -736,14 +814,24 @@ func startChildSend(profile, id, message, resultPath string) (int, func() int, e
 		return 0, nil, err
 	}
 	cmd := exec.Command(exe, profileArgs(profile, "session", "send", id, "--message-file", msgPath, "--json", "--queue-worker")...)
+	// The send id rides in the environment, not argv: a binary that predates
+	// it ignores the variable instead of refusing an unknown flag. The rest
+	// of the environment is passed through unchanged, exactly as before
+	// (cmd.Env was nil): this child is agent-deck itself delivering the
+	// send, not a harness, and it resolves the target's transcript through
+	// the same CLAUDE_CONFIG_DIR its parent sees.
+	cmd.Env = append(os.Environ(), queueSendIDEnv+"="+strings.TrimSuffix(filepath.Base(resultPath), ".result")) //nolint:forbidigo // verbatim pass-through, see above
 	cmd.Stdout = out
 	if err := cmd.Start(); err != nil {
-		out.Close()
-		return 0, nil, err
+		return 0, nil, errors.Join(err, out.Close())
 	}
 	wait := func() int {
 		err := cmd.Wait()
-		out.Close()
+		// The child wrote the result through its own descriptor; the next
+		// step reads the file, so a failed close here is only reported.
+		if cerr := out.Close(); cerr != nil {
+			fmt.Fprintln(os.Stderr, "agent-deck: close send result:", cerr)
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode()

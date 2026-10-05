@@ -35,29 +35,72 @@ corpus in `internal/tmux/testdata/status_corpus` by `pane_corpus_test.go`.
 2. Pane title carries a Braille spinner → `active` (every tool, no capture).
 3. Capture the visible pane (no scrollback). Claude frames drop the agent
    roster and artifact rows drawn under the footer (`prepareFrame`, also in
-   `GetSubstate` and the Stop-hook `BackgroundWorkPending`), so a turn handed
-   to many background agents keeps its `Waiting for N background agents`
-   line inside the 20-line background-work window, and the prompt (8) and
-   menu (15) windows see the input box.
+   `GetSubstate` and the Stop-hook `BackgroundWorkSince`), so the prompt (8)
+   and menu (15) windows see the input box. Before the trim, `prepareFrame`
+   records the frame's background work (`tmux.ParseClaudeBackgroundWork`):
+   the workflow row under the footer is drawn with a roster glyph and the
+   trim would remove it.
 4. Model-unavailable no-op → `error`; tool error banner → `error`.
 5. Open Claude menu at the tail with no live busy cue near it → not busy.
 6. Busy indicator (tool patterns over the last 25 lines, spinner scan, 6 s
    spinner grace) → `active`.
-7. Claude awaiting a background agent → `active`.
+7. Claude background work in flight → `active` (issue #2473): a workflow row
+   short of its last step (`○ name ▰▰▱ 3/5 · 18m32s`; a finished row stays at
+   n/n), `Waiting for N background agents / dynamic workflows to finish` as
+   the last turn line above the input box (an older one further up is
+   history), or the live `· N shells, M monitors ·` counter on the footer.
+   Never over an open menu, an error banner or the model-unavailable no-op
+   (`backgroundWorkOutrankedLocked`): a menu blocks the turn on the operator
+   and an error means no progress, so such a frame keeps its waiting / error
+   verdict while a workflow runs under it. An open menu means menu chrome
+   (`Enter to select`, `Esc to cancel`, `Allow once`, `No, and tell Claude
+   what to do differently`, `Enter to confirm`, `0: Dismiss`, ...); a dialog
+   question (`Do you want`, `Would you like`) counts only with a selected
+   numbered option (`❯ 1.`) after it, because Claude often ends a reply with
+   the same words in prose and that opens no menu.
 8. Prompt indicator → `waiting` (or `idle` once the operator attached).
 9. Otherwise history: `starting` inside the 2 min startup window, else the
    previous stable status / `waiting`.
 
-Instance layer on top: a fresh hook verdict short-circuits the pane; the
-hook-lag rule flips a stale `running` hook to `waiting` after two completed
-turn samples; a purely pane-derived flip away from running is held for one
-sample (`debounceFlipFromRunning`) when this process saw running itself;
-Codex completion evidence bypasses that hold.
+Instance layer on top: a fresh hook verdict short-circuits the pane, except
+that a `waiting` hook (the Stop that ends every foreground turn) never
+overrides background work in flight: the pane (captured for the hook path,
+never reusing a probe older than the hook event) OR the transcript (pending
+Workflow / background Agent / background Bash / Monitor launch with no
+terminal `<task-notification>` yet, or Claude Code's `pendingWorkflowCount`
+/ `pendingBackgroundAgentCount` on the last `turn_duration`) keeps the
+session `running` with substate `background-work`. Transcript-only evidence
+holds for 3 minutes after its newest sighting (redraws, resizes, a capture
+that missed the footer); a workflow row whose task already reported back is
+vetoed. The same merge runs on the tmux path, and the notify daemon's hook
+candidate path skips a Stop that handed off to background work, so no
+`running -> waiting` record is written until the work ends (session/
+background_work.go). A menu or an error outranks background work on every
+path: a frame showing an open menu, an error banner or the
+model-unavailable no-op is never promoted to `running`, and a
+`PermissionRequest` / `Notification(permission_prompt|elicitation_dialog)`
+hook holds `waiting` without looking at the pane for its first 5 s (the
+dialog is drawn just after the hook fires); after that the frame decides,
+because a dialog dismissed with Esc fires no further hook. The daemon still
+emits that event's `waiting` record (the child is blocked on input). The
+record written when the work ends keeps its tier under the urgent rule: a
+plain summary is `info`; only a sentinel, an error or a question to the
+parent is `urgent`. The whole lifecycle (launch, running / background-work
+with task and n/m on every poll, the notification turn, `waiting` on the
+first poll after it, `idle` once acknowledged) is pinned end to end by
+`TestAcceptance2473_SmallWorkflowLifecycle` (cmd/agent-deck) through the
+`session show --json` and `list --json` code paths. The hook-lag rule flips
+a stale `running` hook to `waiting` after two completed turn samples; a
+purely pane-derived flip away from running is held for one sample
+(`debounceFlipFromRunning`) when this process saw running itself; Codex
+completion evidence bypasses that hold.
 
 ## Substates (additive, never change the colour except model-unavailable)
 
 `running`, `idle-at-empty-prompt`, `interactive-menu`, `background-work`
-(Claude at the prompt with `N shells still running` / `· N shells ·`),
+(Claude at the prompt with a workflow, background agents, shells or a monitor
+still in flight; pairs with `running`, detail in `substate_detail` and the
+`background_work` JSON object),
 `auth-401`, `usage-limit`, `model-unavailable`, `unknown-exit`, `hook-lag`.
 
 ## Who computes, how often, what persists

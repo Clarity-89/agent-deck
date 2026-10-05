@@ -56,3 +56,18 @@
 - [x] Build and vet on the host; verify fixed live requests.
 - [x] Complete the G14 race gate and inspect its exact result.
 - [x] Refresh the patch and final RESULTS.md receipt.
+
+# PR #2498 verifier round 4
+
+- [x] Reproduce the focused Docker failures and trace the missing inbox turn.
+- [x] Update legacy delivery tests, production-shaped turn fixtures and docs.
+- [x] Pass focused session and CLI race tests, gofmt and Docker vet.
+- [x] Commit once locally and write codex-pr2/DONE.md.
+
+# PR #2496 item 7, Round 2
+
+- [x] Read brief, verifier, report and current main; rebase with same-turn retry support.
+- [x] Reproduce digest escalation, wake gating, rotation failure and stats reset with Docker red tests.
+- [x] Fix digest handling and retention; review touched code using code-simplifier.
+- [x] Run Docker green and affected race packages; format, vet and build. Session race exits 1 only on the four brief-listed permission failures; tmux and focused update race tests pass.
+- [x] Prepare sanitized PR update; final push, CI and report receipts are tracked in the shared board reports/item7.md.

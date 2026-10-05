@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/comms"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -55,8 +56,11 @@ func handleInbox(profile string, args []string) {
 func printInboxUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage: agent-deck inbox <session-id>")
 	fmt.Fprintln(w, "       agent-deck inbox drain [--json] <session-id>")
-	fmt.Fprintln(w, "       agent-deck inbox export [--json]")
+	fmt.Fprintln(w, "       agent-deck inbox export [--json] [--after '<cursor-json>' [--with-writer]]")
+	fmt.Fprintln(w, "       agent-deck inbox cursor [--json] [<remote>]")
 	fmt.Fprintln(w, "       agent-deck inbox writer-status [--json]")
+	fmt.Fprintln(w, "       agent-deck inbox peek [--json] [<session-id>|self]")
+	fmt.Fprintln(w, "       agent-deck inbox stats [--json] [--all] [<session-id>|self]")
 	fmt.Fprintln(w, "       agent-deck inbox dead-letter <list|show|retry|purge>")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Drain pending completion events from the parent's durable outbox.")
@@ -74,8 +78,13 @@ func printInboxUsage(w io.Writer) {
 }
 
 func printInboxExportUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: agent-deck inbox export [--json]")
+	fmt.Fprintln(w, "Usage: agent-deck inbox export [--json] [--after '<cursor-json>' [--with-writer]]")
 	fmt.Fprintln(w, "Print this host's completion/transition records without consuming them.")
+	fmt.Fprintln(w, "--after (requires --json) returns only what the cursor does not hold yet:")
+	fmt.Fprintln(w, "turn-journal lines past each child's seq, changed completion-ledger entries")
+	fmt.Fprintln(w, "and _unowned records past its read position, as")
+	fmt.Fprintln(w, "{\"records\":[...],\"cursor_next\":{...}}; --with-writer adds \"writer\".")
+	fmt.Fprintln(w, "The cursor is the cursor_next of the previous call; \"-\" reads it from stdin.")
 }
 
 func printInboxWriterStatusUsage(w io.Writer) {
@@ -195,6 +204,15 @@ func runInboxWithProfile(stdout io.Writer, args []string, explicitProfile string
 	if len(args) > 0 && args[0] == "writer-status" {
 		return runInboxWriterStatus(stdout, args[1:])
 	}
+	if len(args) > 0 && args[0] == "cursor" {
+		return runInboxCursor(stdout, args[1:])
+	}
+	if len(args) > 0 && args[0] == "stats" {
+		return runInboxStats(stdout, args[1:], explicitProfile)
+	}
+	if len(args) > 0 && args[0] == "peek" {
+		return runInboxPeek(stdout, args[1:], explicitProfile)
+	}
 
 	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
 	fs.Usage = func() { printInboxUsage(stdout) }
@@ -311,6 +329,9 @@ func runInboxDrain(stdout io.Writer, args []string, explicitProfile string) erro
 	sessionID, err = resolveInboxDrainSessionInProfile(sessionID, explicitProfile)
 	if err != nil {
 		return err
+	}
+	if caller := callerSessionID(); caller != "" {
+		session.SpoolCommsCall(caller, comms.CallInboxDrain, sessionID)
 	}
 
 	events, err := session.DrainInboxForParent(sessionID)
@@ -515,9 +536,19 @@ func resolveSelfSessionID() (string, error) {
 // Non-destructive is the contract, not a side effect: two conductors draining
 // this host must both get the records, and this host's own conductor must still
 // find its inbox exactly as it left it.
+// inboxExportStdin is where `inbox export --after -` reads its cursor; a test
+// seam.
+var inboxExportStdin = func() io.Reader { return os.Stdin }
+
+// maxInboxExportCursorBytes bounds the cursor read from stdin (one entry per
+// remote child active within the talkback horizon, about 80 bytes each).
+const maxInboxExportCursorBytes = 64 << 20
+
 func runInboxExport(stdout io.Writer, args []string) error {
 	fs := flag.NewFlagSet("inbox export", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "emit the records as a JSON array")
+	after := fs.String("after", "", "incremental export: only records past this cursor JSON, or - to read it from stdin (wrapped with cursor_next)")
+	withWriter := fs.Bool("with-writer", false, "with --after: include the writer status in the reply")
 	fs.Usage = func() { printInboxExportUsage(stdout) }
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		return err
@@ -525,6 +556,41 @@ func runInboxExport(stdout io.Writer, args []string) error {
 	if fs.NArg() != 0 {
 		fs.Usage()
 		return fmt.Errorf("inbox export takes no positional arguments")
+	}
+	afterSet := false
+	fs.Visit(func(f *flag.Flag) { afterSet = afterSet || f.Name == "after" })
+	if afterSet {
+		if !*asJSON {
+			return fmt.Errorf("inbox export --after requires --json")
+		}
+		raw := *after
+		if raw == "-" {
+			// The cursor grows with the remote's fleet; stdin has no argv cap.
+			b, err := io.ReadAll(io.LimitReader(inboxExportStdin(), maxInboxExportCursorBytes+1))
+			if err != nil {
+				return fmt.Errorf("inbox export --after -: read cursor from stdin: %w", err)
+			}
+			if len(b) > maxInboxExportCursorBytes {
+				return fmt.Errorf("inbox export --after -: cursor larger than %d bytes", maxInboxExportCursorBytes)
+			}
+			raw = string(b)
+		}
+		cursor, err := session.ParseRemoteCursor(raw)
+		if err != nil {
+			return err
+		}
+		exp, err := session.ExportRecordsAfter(cursor)
+		if err != nil {
+			return fmt.Errorf("export inbox records: %w", err)
+		}
+		if *withWriter {
+			ws := session.ReadWriterStatus()
+			exp.Writer = &ws
+		}
+		return json.NewEncoder(stdout).Encode(exp)
+	}
+	if *withWriter {
+		return fmt.Errorf("inbox export --with-writer requires --after")
 	}
 
 	records, err := session.ExportPendingRecords()
@@ -611,6 +677,20 @@ func printInboxEventLines(stdout io.Writer, events []session.TransitionNotificat
 		if ev.SourceRemote != "" {
 			fmt.Fprintf(stdout, " remote=%s", ev.SourceRemote)
 		}
+		if ev.Tier != "" {
+			fmt.Fprintf(stdout, " tier=%s trigger=%s", ev.Tier, ev.Trigger)
+		}
+		// Comms redesign PR5: a reply to the drainer's own tagged send.
+		if ev.TargetKind == session.InboxTargetKindReply {
+			fmt.Fprintf(stdout, " reply from=%s", ev.ChildSessionID)
+		}
 		fmt.Fprintln(stdout)
+		// Issue #2469: the record carries the child's text so the reader
+		// (a conductor's heartbeat drain) does not re-read the child.
+		if text := strings.TrimSpace(ev.Text); text != "" {
+			for _, line := range strings.Split(text, "\n") {
+				fmt.Fprintf(stdout, "    %s\n", line)
+			}
+		}
 	}
 }

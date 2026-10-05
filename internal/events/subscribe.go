@@ -2,9 +2,11 @@ package events
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,9 +15,15 @@ import (
 // follow` feels live; long enough not to busy-loop.
 const pollInterval = 15 * time.Millisecond
 
+// subscribeActiveHook is a test seam called between a poll's segment
+// listing and its read of the active file. nil in production.
+var subscribeActiveHook atomic.Pointer[func()]
+
 // Subscription streams Frames with Cursor > the `after` value passed to
 // Subscribe, oldest first, never skipping and never repeating one, for as
-// long as ctx is not cancelled. Cancelling ctx (or the process dying) is the
+// long as ctx is not cancelled and the Bus is not closed. Bus.Close stops
+// every subscription and waits for it before releasing the bus's files.
+// Cancelling ctx (or the process dying) is the
 // "kill the follower" half of the durability proof: a fresh Subscribe(ctx,
 // after) with the last Cursor seen resumes exactly where it left off.
 type Subscription struct {
@@ -24,7 +32,8 @@ type Subscription struct {
 }
 
 // Frames returns the channel of frames in cursor order. It is closed when
-// ctx is cancelled or a read error occurs (check Err() after it closes).
+// ctx is cancelled, the Bus is closed, or a read error occurs (check Err()
+// after it closes; it is nil for a cancel or a close).
 func (s *Subscription) Frames() <-chan Frame { return s.frames }
 
 // Err returns the error that stopped the subscription, if any (non-blocking;
@@ -39,9 +48,11 @@ func (s *Subscription) Err() error {
 }
 
 // Subscribe streams every frame with Cursor > after, then keeps streaming
-// newly published frames until ctx is cancelled. after=0 replays the whole
-// retained log. Returns ErrCursorTooOld (via Subscription.Err after the
-// channel closes) if `after` predates every retained segment.
+// newly published frames until ctx is cancelled or the Bus is closed.
+// after=0 replays the whole retained log. Returns ErrCursorTooOld (via
+// Subscription.Err after the channel closes) if `after` predates every
+// retained segment. Subscribe on a closed Bus returns a subscription whose
+// channel is already closed.
 func (b *Bus) Subscribe(ctx context.Context, after Cursor) (*Subscription, error) {
 	sub := &Subscription{
 		frames: make(chan Frame, 64),
@@ -51,7 +62,20 @@ func (b *Bus) Subscribe(ctx context.Context, after Cursor) (*Subscription, error
 		close(sub.frames)
 		return sub, nil
 	}
-	go sub.run(ctx, b, after)
+	// Register under the lock Close takes to set closed, so no subscription
+	// is added once Close has started waiting for them.
+	b.publishMu.RLock()
+	if b.closed.Load() {
+		b.publishMu.RUnlock()
+		close(sub.frames)
+		return sub, nil
+	}
+	b.subWg.Add(1)
+	b.publishMu.RUnlock()
+	go func() {
+		defer b.subWg.Done()
+		sub.run(ctx, b, after)
+	}()
 	return sub, nil
 }
 
@@ -78,7 +102,7 @@ func (b *Bus) listAllSegments() ([]segRef, error) {
 
 	activePath := b.dir + string(os.PathSeparator) + activeSegmentName
 	if _, err := os.Stat(activePath); err == nil {
-		activeStart, _, _, err := activeBounds(activePath)
+		activeStart, _, _, err := b.activeBounds(activePath)
 		if err != nil {
 			return nil, err
 		}
@@ -101,8 +125,19 @@ func (b *Bus) listAllSegments() ([]segRef, error) {
 	return out, nil
 }
 
-func (s *Subscription) run(ctx context.Context, b *Bus, after Cursor) {
+func (s *Subscription) run(parent context.Context, b *Bus, after Cursor) {
 	defer close(s.frames)
+	// ctx ends with the caller's context or with Bus.Close, so every ctx
+	// check and every blocked frame send below also gives way to Close.
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	go func() {
+		select {
+		case <-b.closeCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	emitted := after
 	var lastActiveStart Cursor = 0
@@ -142,11 +177,21 @@ func (s *Subscription) run(ctx context.Context, b *Bus, after Cursor) {
 			}
 
 			// active (unsealed) segment
+			if hook := subscribeActiveHook.Load(); hook != nil {
+				(*hook)()
+			}
 			if seg.start != lastActiveStart {
 				lastActiveStart = seg.start
 				activeOffset = 0
 			}
-			ok, newOffset, n, err := s.streamActive(ctx, seg.path, &emitted, activeOffset)
+			var ok bool
+			var newOffset int64
+			var n int
+			if b.keepCorrupt {
+				ok, newOffset, n, err = s.streamActiveCommitted(ctx, b, seg, &emitted, activeOffset)
+			} else {
+				ok, newOffset, n, err = s.streamActive(ctx, seg.path, &emitted, activeOffset)
+			}
 			if err != nil {
 				s.errCh <- err
 				return
@@ -263,4 +308,79 @@ func (s *Subscription) streamActive(ctx context.Context, path string, emitted *C
 		}
 	}
 	return true, offset, n, nil
+}
+
+// streamActiveCommitted is streamActive for a ledger bus: the new bytes are
+// read under the writer lock, so a frame is visible only once the Commit
+// that wrote it has returned (its fsync done, or rolled back). Under the
+// same lock it checks that the active file is still the one listed: if a
+// rotation sealed it since the listing, nothing is read and the next poll
+// re-lists, so the sealed frames are streamed first and none is skipped.
+// The frames are emitted after the lock is released: a follower that is
+// slow to drain its channel never holds the lock.
+func (s *Subscription) streamActiveCommitted(ctx context.Context, b *Bus, seg segRef, emitted *Cursor, fromOffset int64) (ok bool, newOffset int64, n int, err error) {
+	if err := b.lockDisk(); err != nil {
+		return false, fromOffset, 0, err
+	}
+	sealed, err := listSealedSegments(b.dir)
+	if err != nil {
+		b.unlockDisk()
+		return false, fromOffset, 0, err
+	}
+	if len(sealed) > 0 && sealed[len(sealed)-1].start >= seg.start {
+		b.unlockDisk()
+		return true, fromOffset, 0, nil // rotated since the listing
+	}
+	data, err := readFrom(seg.path, fromOffset)
+	b.unlockDisk()
+	if err != nil {
+		return false, fromOffset, 0, err
+	}
+	offset := fromOffset
+	for {
+		i := bytes.IndexByte(data, '\n')
+		if i < 0 {
+			break // no complete line left: the next poll starts here
+		}
+		line := data[:i]
+		data = data[i+1:]
+		offset += int64(i + 1)
+		if len(line) == 0 {
+			continue
+		}
+		frame, perr := ParseFrameLine(line)
+		if perr != nil || frame.Cursor <= *emitted {
+			continue
+		}
+		select {
+		case s.frames <- frame:
+			*emitted = frame.Cursor
+			n++
+		case <-ctx.Done():
+			return false, offset, n, nil
+		}
+	}
+	return true, offset, n, nil
+}
+
+// readFrom returns the bytes of path from offset to its end (nil when the
+// file is missing or not longer than offset).
+func readFrom(path string, offset int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.Size() <= offset {
+		return nil, err
+	}
+	data := make([]byte, info.Size()-offset)
+	if _, err := f.ReadAt(data, offset); err != nil && err != io.EOF {
+		return nil, err
+	}
+	return data, nil
 }

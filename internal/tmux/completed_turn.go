@@ -137,7 +137,8 @@ func hasClaudeEmptyPromptLine(content string) bool {
 // picker, an awaited background agent, or any spinner all return false —
 // those panes may legitimately still be working or blocked, and this verdict
 // is used to overrule a hook, so it must only fire on the unambiguous frame.
-// Background shells left alive at the prompt do NOT keep the turn open.
+// Background work still in flight (a workflow, background agents, live shells
+// or monitors) keeps the turn open (issue #2473).
 func (d *PromptDetector) CompletedTurnAtIdlePrompt(content string) bool {
 	if d.tool != "claude" {
 		return false
@@ -159,9 +160,9 @@ func (d *PromptDetector) CompletedTurnAtIdlePrompt(content string) bool {
 
 // CompletedTurnSampleInterval is the minimum spacing between two pane
 // samples for the hook-lag rule to count them as independent: a single frame
-// can never flip the light. Same ceiling as the background-work probe on the
-// waiting path.
-const CompletedTurnSampleInterval = bgWorkCacheTTL
+// can never flip the light. This is deliberately longer than the foreground
+// work probe cache, which must notice new spinners promptly.
+const CompletedTurnSampleInterval = 3 * time.Second
 
 // recordCompletedTurnSampleLocked stores the completed-turn verdict for a pane
 // frame that a status or substate read has ALREADY captured and classified
@@ -171,7 +172,11 @@ const CompletedTurnSampleInterval = bgWorkCacheTTL
 // classifySubstate leaves the detector nil only when the tool cannot be
 // inferred, which is not a Claude pane.
 func (s *Session) recordCompletedTurnSampleLocked(content string) {
-	s.completedTurnIdle = s.cachedPromptDetector != nil && s.cachedPromptDetector.CompletedTurnAtIdlePrompt(content)
+	// Background work in flight (issue #2473) keeps the turn open even when
+	// the trimmed frame no longer shows it (the workflow row lives under the
+	// footer): a hook that still says running over such a frame is not lagging.
+	s.completedTurnIdle = s.cachedPromptDetector != nil && s.cachedPromptDetector.CompletedTurnAtIdlePrompt(content) &&
+		!s.lastBackgroundWork.InFlight()
 	s.completedTurnSampledAt = time.Now()
 }
 

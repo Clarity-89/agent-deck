@@ -38,6 +38,27 @@ const (
 // DefaultRetryBudget is how long a send may wait for a busy target.
 const DefaultRetryBudget = 30 * time.Minute
 
+// DefaultRetryBackoffMax caps the wait between two attempts of a send
+// refused before typing (composer_blocked, target_busy). The wait doubles
+// from the worker poll up to this cap, so a composer held by a human typing
+// is retried a few times a minute at first and then once a minute until the
+// retry budget ends, not every second (issue #2481: 19 and 15 attempts
+// within five minutes measured).
+const DefaultRetryBackoffMax = time.Minute
+
+// RetryDelay is the wait before the next attempt of a send that has been
+// refused attempts times: base doubled per refusal, capped at max.
+func RetryDelay(base, max time.Duration, attempts int) time.Duration {
+	d := base
+	for i := 1; i < attempts && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
 // RetainFinished is how long finished records stay readable by send-status.
 const RetainFinished = 7 * 24 * time.Hour
 
@@ -58,6 +79,9 @@ type Record struct {
 	Deadline     string   `json:"deadline"`
 	Attempts     int      `json:"attempts"`
 	SentAt       string   `json:"sent_at,omitempty"`
+	// Sender is who queued the send: the calling session's id, or "cli".
+	// The delivering child journals it as the send's sender.
+	Sender string `json:"sender,omitempty"`
 	// ChildPID is the `session send` process delivering a typing record;
 	// its result lands in ResultPath(dir, send_id).
 	ChildPID       int    `json:"child_pid,omitempty"`
@@ -116,7 +140,7 @@ func NewID(now time.Time) string {
 // NextID returns a new id that sorts after every id NextID handed out
 // before in dir, even for callers in the same millisecond or with a clock
 // that stepped back: send order is id order.
-func NextID(dir string, now time.Time) (string, error) {
+func NextID(dir string, now time.Time) (_ string, err error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -124,7 +148,11 @@ func NextID(dir string, now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		return "", err
 	}
@@ -292,7 +320,7 @@ func TryLock(dir, sessionID string) (*Lock, bool, error) {
 		return nil, false, err
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
+		_ = f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return nil, false, nil
 		}
@@ -301,11 +329,14 @@ func TryLock(dir, sessionID string) (*Lock, bool, error) {
 	return &Lock{f: f}, true, nil
 }
 
-// Release drops the lock.
-func (l *Lock) Release() {
-	if l != nil && l.f != nil {
-		_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
-		l.f.Close()
-		l.f = nil
+// Release drops the lock and reports a failure to close the lock file.
+// Releasing a nil or already released lock is a no-op.
+func (l *Lock) Release() error {
+	if l == nil || l.f == nil {
+		return nil
 	}
+	_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
+	err := l.f.Close()
+	l.f = nil
+	return err
 }

@@ -301,6 +301,33 @@ body[data-rail="hidden"] .rightrail { display: none; }
 .sess .subline .att-count.skill { background: rgba(187,154,247,0.10); color: var(--tn-purple); }
 .sess .subline .att-count.warn  { background: rgba(224,175,104,0.14); color: var(--tn-yellow); }
 .sess .subline .b { color: var(--text-dim); }
+/* Recall annotation line (session annotate hints): status chip, ticket badge,
+   then the headline taking whatever width is left. */
+.annot {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 3px 6px; min-width: 0;
+  font-size: 12px; line-height: 1.4; color: var(--text);
+}
+.sess .annot { grid-column: 2 / -1; }
+/* The headline gets its own line, ellipsized to one line (full text in the
+   tooltip) so a long purpose or summary never grows the row (#2446). */
+.annot .hint-headline {
+  flex: 1 1 100%; min-width: 0;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.tile .tile-annot { grid-column: 2 / -1; font-family: var(--sans, inherit); }
+.hint-status,
+.hint-ticket {
+  flex: 0 0 auto;
+  font-family: var(--mono); font-size: 9.5px; line-height: 14px;
+  padding: 0 5px; border-radius: 2px;
+  background: rgba(120,124,153,0.14); color: var(--muted);
+}
+.hint-status.err  { background: rgba(247,118,142,0.14); color: var(--tn-red); }
+.hint-status.warn { background: rgba(224,175,104,0.14); color: var(--tn-yellow); }
+.hint-status.info { background: rgba(122,162,247,0.12); color: var(--tn-blue); }
+.hint-status.ok   { background: rgba(115,218,202,0.12); color: var(--tn-green); }
+.hint-status.muted { background: rgba(120,124,153,0.18); color: var(--text-dim); }
+.hint-ticket { border: 1px solid var(--border); background: transparent; color: var(--text-dim); }
 .sess .subline .atts { display: inline-flex; gap: 4px; }
 .sess .subline .att {
   padding: 0 5px; border-radius: 2px;
@@ -1167,6 +1194,22 @@ body[data-rail="hidden"] .rightrail { display: none; }
   border: 1px solid var(--tn-red); border-radius: 5px; padding: 0 5px;
   font-family: var(--mono);
 }
+/* Conductor-written fleet summary (markdown) above the two columns. */
+.cc-summary { display: grid; gap: 10px; margin-bottom: 16px; }
+.cc-summary-card { border: 1px solid var(--border); border-left: 2px solid var(--accent); border-radius: 6px; padding: 10px 14px; background: var(--panel-2); }
+.cc-summary-head { font-size: 12px; font-weight: 600; color: var(--text-hi); margin-bottom: 6px; }
+.cc-summary-src { font-weight: 400; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.cc-md { font-size: 12.5px; color: var(--text); line-height: 1.5; }
+.cc-md h3, .cc-md h4, .cc-md h5 { margin: 8px 0 4px; color: var(--text-hi); font-size: 13px; }
+.cc-md h3 { font-size: 14px; }
+.cc-md p { margin: 4px 0; }
+.cc-md ul, .cc-md ol { margin: 4px 0; padding-left: 18px; }
+.cc-md ul { list-style: disc; }
+.cc-md ol { list-style: decimal; }
+.cc-md li { margin: 1px 0; }
+.cc-md code { font-family: var(--mono); font-size: 11.5px; padding: 0 3px; border-radius: 2px; background: rgba(120,124,153,0.14); }
+.cc-md a { color: var(--accent); }
+.cc-shl { font-size: 11px; color: var(--muted); padding: 0 0 3px 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cc-sdone { font-size: 11px; color: var(--muted-2); padding: 3px 0; }
 
 /* two-way input bar */
@@ -1250,3 +1293,121 @@ body[data-rail="hidden"] .rightrail { display: none; }
   color: var(--muted); border: 1px solid var(--border);
   border-radius: 3px; padding: 0 4px;
 }
+
+/* Fleet board: status kanban (opt-in view) and the Status | Groups toggle. */
+/* The toggle sits between the kicker and the right-aligned sub-kicker, so
+   neither moves. Its 22px box with -6px margins leaves a 10px margin box,
+   shorter than the kicker line: the head keeps its height with any font and
+   the group grid below stays where it was. */
+.fleet-board-head { container-type: inline-size; }
+.fleet-view-toggle {
+  display: inline-flex; flex: none; box-sizing: border-box; height: 22px; margin: -6px 0;
+  border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+}
+.fleet-view-toggle button {
+  border: 0; background: transparent; color: var(--muted); cursor: pointer;
+  font-family: var(--mono); font-size: 11px; line-height: 16px; padding: 2px 10px;
+}
+/* A board too narrow to fit kicker, toggle and sub-kicker on one line (about
+   320px; tablet width with the rail open) keeps the head as it was instead
+   of wrapping the sub-kicker onto extra lines. The toggle stays while Status
+   is on, so a viewer can always switch back. */
+@container (max-width: 339px) {
+  .fleet-view-toggle:not(.on-status) { display: none; }
+}
+.fleet-view-toggle button.on { background: var(--accent-soft); color: var(--text-hi); }
+.kanban {
+  display: grid; gap: 12px; align-items: start;
+  grid-template-columns: repeat(var(--kb-cols, 5), minmax(240px, 1fr));
+  overflow-x: auto; padding-bottom: 6px;
+}
+.kb-col { min-width: 0; background: var(--panel-2); border: 1px solid var(--border); border-top: 3px solid var(--muted); border-radius: 6px; }
+.kb-col.err  { border-top-color: var(--tn-red); }
+.kb-col.warn { border-top-color: var(--tn-yellow); }
+.kb-col.info { border-top-color: var(--tn-blue); }
+.kb-col.ok   { border-top-color: var(--tn-green); }
+.kb-col-head { display: flex; align-items: baseline; gap: 8px; padding: 9px 12px 7px; }
+.kb-col-name { font-size: 13px; font-weight: 600; color: var(--text-hi); }
+.kb-col-count { font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin-left: auto; }
+.kb-stack { display: flex; flex-direction: column; gap: 8px; padding: 0 8px 10px; }
+.kb-empty { color: var(--muted); font-size: 12px; padding: 4px 6px; }
+.kb-card {
+  display: flex; flex-direction: column; gap: 6px; text-align: left; cursor: pointer;
+  padding: 10px 12px; border-radius: 5px; background: var(--card); border: 1px solid var(--border);
+  color: var(--text); font: inherit; transition: border-color 120ms, background 120ms;
+}
+.kb-card:hover { border-color: var(--accent); background: var(--card-hi); }
+.kb-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.kb-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.kb-card .tdot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
+.kb-card .tdot.running { background: var(--tn-green); box-shadow: 0 0 6px var(--tn-green); }
+.kb-card .tdot.waiting { background: var(--tn-yellow); box-shadow: 0 0 6px var(--tn-yellow); }
+.kb-card .tdot.error   { background: var(--tn-red); box-shadow: 0 0 6px var(--tn-red); }
+.kb-title { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--text-hi); flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.kb-headline { font-size: 13.5px; line-height: 1.45; color: var(--text-hi); overflow-wrap: anywhere; }
+.kb-note { font-size: 12.5px; line-height: 1.45; color: var(--text-dim); overflow-wrap: anywhere;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.kb-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.kb-meta .hint-status, .kb-meta .hint-ticket { font-size: 10.5px; line-height: 16px; }
+/* Labeled body: Goal / Current state / Decision, each label bold on
+   its own line with the full value below it. */
+.kb-fields { margin: 2px 0 0; display: flex; flex-direction: column; gap: 7px; }
+.kb-field dt { font-size: 11.5px; font-weight: 700; color: var(--text-hi); letter-spacing: 0.01em; }
+.kb-field dd { margin: 1px 0 0; font-size: 13.5px; line-height: 1.45; color: var(--text); overflow-wrap: anywhere; white-space: pre-line; }
+.kb-group, .kb-proc {
+  font-family: var(--mono); font-size: 10.5px; padding: 1px 6px; border-radius: 3px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.kb-group { color: var(--tn-purple); border-color: rgba(187,154,247,0.35); }
+.kb-proc-warn { flex: none; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+.kb-proc-warn.severe { color: var(--tn-red); }
+
+/* Pinned conductor banner: the orchestrator sits above the stats and the
+   worker kanban, full width, styled apart from worker cards. */
+.conductor-banner {
+  border: 1px solid rgba(187,154,247,0.45); border-left: 4px solid var(--tn-purple);
+  border-radius: 8px; padding: 12px 16px;
+  background: linear-gradient(90deg, rgba(187,154,247,0.12), rgba(187,154,247,0.03) 60%), var(--panel-2);
+  box-shadow: 0 2px 14px rgba(0,0,0,0.25);
+}
+.cb-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.cb-kicker { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.14em; color: var(--tn-purple); font-weight: 700; }
+.conductor-banner .tdot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+.conductor-banner .tdot.running { background: var(--tn-green); box-shadow: 0 0 8px var(--tn-green); }
+.conductor-banner .tdot.waiting { background: var(--tn-yellow); box-shadow: 0 0 8px var(--tn-yellow); }
+.conductor-banner .tdot.error   { background: var(--tn-red); box-shadow: 0 0 8px var(--tn-red); }
+.cb-name {
+  border: 0; background: transparent; padding: 0; cursor: pointer;
+  font-family: var(--mono); font-size: 17px; font-weight: 700; color: var(--text-hi);
+}
+.cb-name:hover { color: var(--tn-purple); text-decoration: underline; }
+.cb-proc { font-family: var(--mono); font-size: 11.5px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
+.cb-proc.running { color: var(--tn-green); border-color: rgba(115,218,202,0.5); }
+.cb-proc.waiting { color: var(--tn-yellow); border-color: rgba(224,175,104,0.5); }
+.cb-proc.error   { color: var(--tn-red); border-color: rgba(247,118,142,0.5); }
+.cb-headline { flex: 1 1 240px; min-width: 0; font-size: 13.5px; color: var(--text); }
+.cb-toggle {
+  margin-left: auto; border: 1px solid var(--border); background: transparent; color: var(--text-dim);
+  font-family: var(--mono); font-size: 11px; padding: 3px 10px; border-radius: 4px; cursor: pointer;
+}
+.cb-toggle:hover { color: var(--text-hi); border-color: var(--tn-purple); }
+.conductor-banner .cb-body { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(187,154,247,0.25); font-size: 13.5px; max-height: 45vh; overflow: auto; }
+.cb-empty { margin-top: 8px; font-size: 12px; color: var(--muted); }
+.cb-empty code { font-family: var(--mono); font-size: 11.5px; }
+
+/* Semantic stat tiles (Status view): their own row under the runtime tiles,
+   one per kanban column, coloured like its column. The tone classes override
+   the positional (nth-child) colours the runtime row uses. */
+.fleet-status-stats { grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); }
+.fleet-stats .stat.tone-err::after   { background: var(--tn-red); }
+.fleet-stats .stat.tone-warn::after  { background: var(--tn-yellow); }
+.fleet-stats .stat.tone-info::after  { background: var(--tn-blue); }
+.fleet-stats .stat.tone-muted::after { background: var(--muted); }
+.fleet-stats .stat.tone-ok::after    { background: var(--tn-green); }
+.fleet-stats .stat.tone-none::after  { background: var(--border); }
+.fleet-stats .stat.tone-err .num  { color: var(--tn-red); }
+.fleet-stats .stat.tone-warn .num { color: var(--tn-yellow); }
+.fleet-stats .stat.tone-info .num { color: var(--tn-blue); }
+.fleet-stats .stat.tone-ok .num   { color: var(--tn-green); }
+.fleet-stats .stat.tone-muted .num { color: var(--text-dim); }
+.kb-col.muted { border-top-color: var(--muted); }

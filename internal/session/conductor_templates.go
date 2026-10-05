@@ -6,6 +6,26 @@ import "strings"
 // generated template. Installers compare its fully rendered form byte-for-byte
 // before migrating, so any user customization is preserved.
 func previousConductorInstructionsTemplate(template string) string {
+	template = preBackgroundWorkConductorInstructionsTemplate(template)
+	// Issue #2469 (comms redesign): the heartbeat section gained the
+	// prompt-time drain wording and the record tiers paragraph. Revert them so
+	// a conductor written by v1.16.23 and earlier is recognised as generated.
+	template = strings.Replace(template,
+		`Your hooks drain the same queue
+automatically when your agent supports hooks (Claude Code): at the start of every turn
+(records appear in your context under `+"`"+`[agent-deck inbox]`+"`"+`) and at each turn boundary
+for urgent records, so this heartbeat drain is the fallback — together they guarantee no
+completion is missed. Agents without hooks (Codex, Hermes) get the records only from this drain.
+
+Records are tiered and carry the child's own text (issue #2469): `+"`"+`urgent`+"`"+` (a completion
+sentinel, an error, or an explicit question to you) wakes you;
+`+"`"+`info`+"`"+` (progress in a turn a background task started) waits for your next turn or a
+digest. Act on the text in the record. Do NOT run `+"`"+`session output`+"`"+` on a child whose
+record you already have unless the text is clipped and you need the rest.`,
+		`Your Stop hook drains the same queue
+automatically at each turn boundary, so this heartbeat drain is the idle-conductor
+fallback — together they guarantee no completion is missed whether you are busy or idle.`, 1)
+	template = preHumanTierConductorInstructionsTemplate(template)
 	template = strings.Replace(template,
 		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | **Always triage with this compact count summary first:** `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`,
 		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | Get counts: `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`, 1)
@@ -31,6 +51,18 @@ func previousConductorInstructionsTemplate(template string) string {
 	return template
 }
 
+// conductorBackgroundWorkGuidance is the sentence issue #2473 added to the
+// shared template's substate paragraph.
+const conductorBackgroundWorkGuidance = " `background-work` (shown as coarse status `running`) means the child's turn ended but a Workflow, background agents, shells or a Monitor it started are still in flight (`background_work` in `session show --json` names the task and its n/m progress); leave it alone, it reports back and settles to `waiting` by itself."
+
+// preBackgroundWorkConductorInstructionsTemplate reconstructs the template as
+// v1.16.24 shipped it, before #2473 added the background-work sentence, so a
+// conductor written by v1.16.24 is recognised as generated and migrated.
+// Per-name templates carry no substate paragraph, so this is a no-op there.
+func preBackgroundWorkConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorBackgroundWorkGuidance, "", 1)
+}
+
 // preSubstateGuidanceConductorInstructionsTemplate reconstructs the shared
 // template's shape from before #1814 added the substate-guidance row: the
 // plain "crashed or missing" error row with no paragraph after it. This is
@@ -45,6 +77,30 @@ func preSubstateGuidanceConductorInstructionsTemplate(template string) string {
 		`| `+"`"+`error`+"`"+` (red) | Session crashed or missing | Try `+"`"+`session restart`+"`"+`. If that fails, escalate. |`, 1)
 }
 
+// preStrictUrgentRuleConductorInstructionsTemplate restores the urgent-tier
+// sentence v1.16.24 shipped ("or a reply to something you or a human sent").
+func preStrictUrgentRuleConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template,
+		`sentinel, an error, or an explicit question to you) wakes you;`,
+		`sentinel, an error, a question, or a reply to something you or a human sent) wakes you;`, 1)
+}
+
+// preHumanTierConductorInstructionsTemplate reconstructs what v1.16.24
+// shipped: the current template minus the #2469 human-tier reply format
+// ([urgent]/[info] markers, conductor notify). Per-name templates never
+// carried it, so this is a no-op for them.
+func preHumanTierConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorHeartbeatReplyDoc, conductorHeartbeatReplyDocV0, 1)
+}
+
+// conductorHeartbeatReplyDoc is the tail of the heartbeat reply-format
+// example as of #2469 (urgent/info markers, conductor notify);
+// conductorHeartbeatReplyDocV0 is the wording v1.11.0-v1.16.24 shipped.
+const (
+	conductorHeartbeatReplyDoc   = "[info] docs-lane merged its PR\n```\n\nYour response is parsed by tier: `NEED:` / `[urgent]` lines reach the user now (retired after 3 unanswered cycles), `[info]` lines are batched into a digest, everything else (`[STATUS]`, `AUTO:`) stays local.\n\nOutside a heartbeat (a wake-nudge or Stop-block turn) nothing you write reaches the user, so for a decision the user must act on now run `agent-deck conductor notify --tier urgent \"<one line>\"`, and `--tier info \"<one line>\"` for progress worth a digest. At most one urgent per decision."
+	conductorHeartbeatReplyDocV0 = "```\n\nYour response is parsed: if it contains `NEED:` lines, those get forwarded to the user (via remote channels if configured, or visible in the TUI/task-log)."
+)
+
 // conductorInstructionsGenerations reconstructs every prior generated-template
 // generation for the given template, newest first, that
 // writeGeneratedFileOrMigrate should recognise as a migratable predecessor of
@@ -54,14 +110,32 @@ func preSubstateGuidanceConductorInstructionsTemplate(template string) string {
 //
 // Verified against fixtures rendered from the actual shipped source
 // (testdata/conductor_templates_shipped.tsv): this reconstructs the
+// v1.16.24 generation (only the heartbeat reply format differs), the
 // v1.11.0-v1.16.10 generation and the v1.10.9-v1.10.11 generation. It does
 // NOT reconstruct v1.9.73 or v1.9.70, which shipped further template
 // changes (Codex `session approve` docs, the local-first rewrite) that are
 // not reverted here; a conductor instructions file last written by one of
 // those releases is treated as user-edited and left alone.
 func conductorInstructionsGenerations(template string) []string {
+	var gens []string
+	// Chain: current -> minus the #2473 background-work sentence (unreleased
+	// main builds) -> minus the strict urgent rule (unreleased main builds)
+	// -> exactly what v1.16.24 shipped. The intermediate "new sentence with the
+	// old reply format" was never released, so it is not a generation.
+	base := template
+	if noBG := preBackgroundWorkConductorInstructionsTemplate(template); noBG != template {
+		gens = append(gens, noBG)
+		base = noBG
+	}
+	prevRule := preStrictUrgentRuleConductorInstructionsTemplate(base)
+	if prevRule != base {
+		gens = append(gens, prevRule)
+	}
+	if v11624 := preHumanTierConductorInstructionsTemplate(prevRule); v11624 != prevRule {
+		gens = append(gens, v11624)
+	}
 	previous := previousConductorInstructionsTemplate(template)
-	gens := []string{previous}
+	gens = append(gens, previous)
 	if older := preSubstateGuidanceConductorInstructionsTemplate(previous); older != previous {
 		gens = append(gens, older)
 	}
@@ -123,7 +197,7 @@ Commands accept: **exact title**, **ID prefix** (e.g., first 4 chars), **path**,
 | ` + "`" + `idle` + "`" + ` (gray) | Waiting, but user acknowledged | User knows about it. Skip unless asked. |
 | ` + "`" + `error` + "`" + ` (red) | Crashed, missing, or wedged (auth/model failure) | Check the substate first. Then try ` + "`" + `session restart` + "`" + `; if that fails, escalate. |
 
-**Substate (Claude sessions only; refines status in ` + "`" + `list` + "`" + `/` + "`" + `show` + "`" + ` JSON):** ` + "`" + `auth-401` + "`" + ` covers two different pane banners. A credential banner (` + "`" + `Please run /login` + "`" + `, ` + "`" + `API Error: 401` + "`" + `) means the fleet is HOLDING the session; restarting will NOT fix it. Check ` + "`" + `session show --json <id>` + "`" + ` for the ` + "`" + `auth_hold` + "`" + ` object (the authoritative source, present even after the pane exits) and escalate for re-login. A dropped-socket banner (` + "`" + `socket connection closed` + "`" + `) also classifies as ` + "`" + `auth-401` + "`" + ` but is NOT held and IS restart-recoverable: restart it. ` + "`" + `model-unavailable` + "`" + ` means the selected model is down (shows as error, not running); self-heal currently only observes this and takes no action, so switch it yourself with ` + "`" + `agent-deck -p <PROFILE> session set <id> model <model>` + "`" + ` then ` + "`" + `agent-deck -p <PROFILE> session restart <id>` + "`" + `. ` + "`" + `idle-at-empty-prompt` + "`" + ` (shown as coarse status ` + "`" + `idle` + "`" + ` or ` + "`" + `waiting` + "`" + `) means the session is genuinely sitting at its prompt with nothing happening. Never restart-loop an ` + "`" + `error` + "`" + ` session that ` + "`" + `auth_hold` + "`" + ` confirms is credential-held.
+**Substate (Claude sessions only; refines status in ` + "`" + `list` + "`" + `/` + "`" + `show` + "`" + ` JSON):** ` + "`" + `auth-401` + "`" + ` covers two different pane banners. A credential banner (` + "`" + `Please run /login` + "`" + `, ` + "`" + `API Error: 401` + "`" + `) means the fleet is HOLDING the session; restarting will NOT fix it. Check ` + "`" + `session show --json <id>` + "`" + ` for the ` + "`" + `auth_hold` + "`" + ` object (the authoritative source, present even after the pane exits) and escalate for re-login. A dropped-socket banner (` + "`" + `socket connection closed` + "`" + `) also classifies as ` + "`" + `auth-401` + "`" + ` but is NOT held and IS restart-recoverable: restart it. ` + "`" + `model-unavailable` + "`" + ` means the selected model is down (shows as error, not running); self-heal currently only observes this and takes no action, so switch it yourself with ` + "`" + `agent-deck -p <PROFILE> session set <id> model <model>` + "`" + ` then ` + "`" + `agent-deck -p <PROFILE> session restart <id>` + "`" + `. ` + "`" + `idle-at-empty-prompt` + "`" + ` (shown as coarse status ` + "`" + `idle` + "`" + ` or ` + "`" + `waiting` + "`" + `) means the session is genuinely sitting at its prompt with nothing happening. ` + "`" + `background-work` + "`" + ` (shown as coarse status ` + "`" + `running` + "`" + `) means the child's turn ended but a Workflow, background agents, shells or a Monitor it started are still in flight (` + "`" + `background_work` + "`" + ` in ` + "`" + `session show --json` + "`" + ` names the task and its n/m progress); leave it alone, it reports back and settles to ` + "`" + `waiting` + "`" + ` by itself. Never restart-loop an ` + "`" + `error` + "`" + ` session that ` + "`" + `auth_hold` + "`" + ` confirms is credential-held.
 
 ## Heartbeat Protocol
 
@@ -143,9 +217,17 @@ This pulls any child completions that landed in your durable outbox while you we
 busy (issue #1225/#1226). Delivery is pull, not push: a child that finished mid-turn
 committed its completion to ` + "`" + `~/.agent-deck/inboxes/<your-id>.jsonl` + "`" + ` rather than typing
 into your pane. The drain marks records consumed (exactly-once effects) and prints
-them; act on each before composing your status. Your Stop hook drains the same queue
-automatically at each turn boundary, so this heartbeat drain is the idle-conductor
-fallback — together they guarantee no completion is missed whether you are busy or idle.
+them; act on each before composing your status. Your hooks drain the same queue
+automatically when your agent supports hooks (Claude Code): at the start of every turn
+(records appear in your context under ` + "`" + `[agent-deck inbox]` + "`" + `) and at each turn boundary
+for urgent records, so this heartbeat drain is the fallback — together they guarantee no
+completion is missed. Agents without hooks (Codex, Hermes) get the records only from this drain.
+
+Records are tiered and carry the child's own text (issue #2469): ` + "`" + `urgent` + "`" + ` (a completion
+sentinel, an error, or an explicit question to you) wakes you;
+` + "`" + `info` + "`" + ` (progress in a turn a background task started) waits for your next turn or a
+digest. Act on the text in the record. Do NOT run ` + "`" + `session output` + "`" + ` on a child whose
+record you already have unless the text is clipped and you need the rest.
 
 For child work still in flight, wait with one blocking ` + "`" + `agent-deck -p <PROFILE> session children --follow --until-done` + "`" + ` call. Do not spend turns repeatedly calling ` + "`" + `list --json` + "`" + ` or ` + "`" + `session children --json` + "`" + `.
 
@@ -162,9 +244,7 @@ or:
 
 AUTO: frontend - told it to use the existing auth middleware
 NEED: api-fix - asking whether to run integration tests against staging or prod
-` + "```" + `
-
-Your response is parsed: if it contains ` + "`" + `NEED:` + "`" + ` lines, those get forwarded to the user (via remote channels if configured, or visible in the TUI/task-log).
+` + conductorHeartbeatReplyDoc + `
 
 ## State Management
 

@@ -274,7 +274,7 @@ For a new one-shot session, use `agent-deck launch . -c claude --account <name>`
 Run `agent-deck accounts` (or `agent-deck accounts --json`) to list named slots
 configured under `[profiles.<name>.claude].config_dir`.
 
-`agent-deck session switch-account <session> <account>` moves an existing session to another Claude account — **conversation included**. The session stops, its conversation file is migrated into the target account's config dir (copy-only, with a destination backup and size verification), the account is set, and the session restarts with `--resume`. `session set <session> account <name>` auto-migrates too.
+`agent-deck session switch-account <session> <account>` moves an existing session to another Claude account — **conversation included**. The session stops, its conversation file is migrated into the target account's config dir (copy-only, with a destination backup and size verification), the account is set, and the session restarts with `--resume`. `session set <session> account <name>` auto-migrates too. Claude Code may key one working directory under several project directories (the path as typed, its macOS `/private` form, its realpath); every copy of the conversation under those keys in both accounts is considered, the newest by last event wins (tie: longest), it is installed under every key in the target, each copy it replaces is backed up next to it, and a newer target copy is never overwritten. The receipt names the chosen copy; `--json` lists every candidate under `transcript`.
 
 The TUI exposes the same two moments. The **New Session** dialog's Claude options
 carry an `Account` row (`←`/`→` or `Space` to cycle, `inherit` = today's
@@ -708,7 +708,7 @@ Suppression only affects dispatch — the parent link itself is unchanged. Defer
 
 **Heartbeat-driven monitoring**: heartbeats still run on the configured interval (default 15 minutes) as a secondary safety net. If a conductor response includes `NEED:`, the bridge forwards that alert to Telegram and/or Slack.
 
-**Telegram conductor topology (v1.7.22+)**: each conductor bot must own exactly one channel-owning session. Activate telegram per-session via `--channels plugin:telegram@claude-plugins-official` and inject `TELEGRAM_STATE_DIR` via `[conductors.<name>.claude].env_file` in `$XDG_CONFIG_HOME/agent-deck/config.toml`. Do NOT set `enabledPlugins."telegram@claude-plugins-official"=true` in a profile's `settings.json` — that leaks a poller to every claude session under the profile. agent-deck emits warnings (`GLOBAL_ANTIPATTERN`, `DOUBLE_LOAD`, `WRAPPER_DEPRECATED`) when it detects these setups. Full guidance: [Telegram conductor topology](skills/agent-deck/SKILL.md#telegram-conductor-topology-v1722).
+**Telegram conductor topology (v1.7.22+)**: each conductor bot must own exactly one channel-owning session. Activate telegram per-session via `--channels plugin:telegram@claude-plugins-official` and inject `TELEGRAM_STATE_DIR` via `[conductors.<name>.claude].env_file` in `$XDG_CONFIG_HOME/agent-deck/config.toml`. Do NOT set `enabledPlugins."telegram@claude-plugins-official"=true` in a profile's `settings.json` — that leaks a poller to every claude session under the profile. agent-deck emits warnings (`GLOBAL_ANTIPATTERN`, `DOUBLE_LOAD`, `WRAPPER_DEPRECATED`) when it detects these setups. Full guidance: [Telegram conductor topology](skills/agent-deck/references/gotchas.md#telegram-conductor-topology-v1722).
 
 **Permission prompts during automation**: if a conductor keeps pausing on permission requests, set `[claude].allow_dangerous_mode = true` (or `dangerous_mode = true`) in `$XDG_CONFIG_HOME/agent-deck/config.toml`, then run `agent-deck session restart conductor-<name>`. See [Troubleshooting](skills/agent-deck/references/troubleshooting.md#conductor-keeps-asking-for-permissions).
 
@@ -1044,12 +1044,12 @@ Feedback posts to a public GitHub Discussion at [Feedback Hub](https://github.co
 
 ### Usage telemetry (opt-in, off by default)
 
-Anonymous usage data (tools and features used, session counts and lengths, active hours, error types, version and OS; never prompts, paths, titles or names) is shared with the maintainer via PostHog EU **only after you say yes** to the one-time TUI question; `agent-deck telemetry preview` shows exactly what would be sent, and `agent-deck telemetry off` or `DO_NOT_TRACK=1` turns it off. Details and the full field list: [TELEMETRY.md](TELEMETRY.md).
+Anonymous usage data (tools and features used, session counts and lengths, active hours, error types, version and OS; never prompts, paths, titles or names) is shared with the maintainer via PostHog EU **only after you say yes** to the one-time TUI question; `agent-deck telemetry preview` shows exactly what would be sent, and `agent-deck telemetry off` or `DO_NOT_TRACK=1` turns it off. Details and the full field list: [TELEMETRY.md](TELEMETRY.md). A separate `install.tick` uses a fresh daily nonce to count reporting installs, checked by the interactive TUI after the consent day; retries reuse that nonce. Owner installs suppress it with `[telemetry] owner = true` or `AGENTDECK_TELEMETRY_OWNER=1`. Status and TUI Settings show the last acknowledged tick day. Schema 3 asks existing opt-ins to accept the updated disclosure; schema-2 refusals remain final.
 
 ```bash
 agent-deck telemetry status      # on/off, why, and what is waiting in the local spool
 agent-deck telemetry preview     # the exact request bodies the next upload would send
-agent-deck telemetry off         # off; install id and local data deleted
+agent-deck telemetry off         # off; install id, spool and counters deleted
 ```
 
 ### Remote Instances
@@ -1164,6 +1164,39 @@ without `--push` or the browser has no Push API. Push needs a secure context:
 
 The browser UI includes the live Command Center, session terminal, costs, archive, and settings views. See [Command Center](docs/COMMAND-CENTER.md) for the fleet view; use `--read-only` when browser clients should not mutate sessions.
 
+### Fleet board: semantic status
+
+The web UI's **Fleet** tab shows one card per group by default. Its
+**Status | Groups** toggle switches to a kanban of what each session's *work*
+is doing, taken from its `status` annotation; the browser remembers the
+choice. The kanban is not grouped by whether the agent process is running: a
+second row of tiles counts its columns, the Running / Waiting / Error / Idle
+tiles stay, and runtime state appears on each card as a small dot (hover for
+`process: running` etc.).
+
+```bash
+agent-deck session annotate <id> --hint status=needs-input \
+  --hint goal="…" --hint state="…" --decision "…" --ticket ENG-123
+```
+
+| Column | `status` value | Also accepted |
+|---|---|---|
+| Needs input | `needs-input` | `needs-you`, `needs-human`, `blocked`, `waiting`, `waiting-on-you`, `waiting-for-input` |
+| Ready for review | `ready-for-review` | `review`, `in-review`, `needs-review` |
+| In progress | `in-progress` | `working`, `active`, `wip`, `in-flight` |
+| Parked | `parked` | `paused`, `on-hold`, `hold`, `deferred`, `backlog` |
+| Done | `done` | `complete`, `completed`, `finished`, `closed`, `merged`, `shipped` |
+| Untriaged | *(unset or any other value)* | |
+
+Values are case-insensitive, and spaces or underscores count as hyphens. A set
+status always wins over runtime state. A parked or done session whose process
+has stopped shows only a quiet "process not running" note. Cards show the
+`goal`, `state` and `decision` hints as **Goal / Current state / Decision**
+(`decision` is a decision already taken, as `--decision` records it), falling
+back to `headline`. In the Status view, conductor sessions
+are pinned above the board, and their `note` (or `summary`) hint is rendered
+there as markdown.
+
 ## Documentation
 
 **Onboarding** — five-minute walkthroughs for new users:
@@ -1210,15 +1243,17 @@ Then ask: *"How do I set up MCP pooling?"*
 **Option 2: OpenCode** (has built-in Claude skill compatibility)
 ```bash
 # Create skill directory
-mkdir -p ~/.claude/skills/agent-deck/references
+mkdir -p ~/.claude/skills/agent-deck/references ~/.claude/skills/agent-deck/recall
 
 # Download skill and references
 curl -sL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/skills/agent-deck/SKILL.md \
   > ~/.claude/skills/agent-deck/SKILL.md
-for f in cli-reference config-reference tui-reference troubleshooting; do
+for f in cli-reference config-reference tui-reference troubleshooting capabilities session-communication sub-agents conductors session-workflows autonomy gotchas goal sandbox self-improvement; do
   curl -sL "https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/skills/agent-deck/references/${f}.md" \
     > ~/.claude/skills/agent-deck/references/${f}.md
 done
+curl -sL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/skills/agent-deck/recall/SKILL.md \
+  > ~/.claude/skills/agent-deck/recall/SKILL.md
 ```
 OpenCode will auto-discover the skill from `~/.claude/skills/`.
 
@@ -1236,7 +1271,7 @@ Agent Deck checks for updates automatically.
 - Unattended: `[updates] auto_install` is on by default, so the TUI installs an available update without asking (and restarts itself when `auto_restart` is on). For machines where the TUI is not open every day, `agent-deck update --install-timer` adds a daily run (launchd on macOS, systemd user timer on Linux); `--timer-status` and `--uninstall-timer` manage it and `--dry-run` shows what would be written. Set `auto_install = false` in [config.toml](skills/agent-deck/references/config-reference.md) to go back to installing by hand.
 - Optional: set `auto_update = true` for a Y/n prompt before the TUI opens.
 - Scripts, tests and CI: the automatic install and restart never fire under `go test`, with `CI=true`, with `AGENTDECK_SKIP_UPDATE_CHECK=1`, or when the TUI has no terminal; set the variable in any script that drives `agent-deck` and must not be interrupted by a release.
-- macOS note: launchd agents that run the agent-deck binary (`notify-daemon`, `web --no-tui`) crash-loop with `EX_CONFIG` after the binary is replaced, because macOS ties their identity to the file. Every install re-registers the `com.agentdeck.*` agents automatically (retrying the bootstrap with backoff, and once more from the plist when the agent is registered but not running) and prints the `launchctl bootout`/`bootstrap` commands if one does not come back. An updater that runs inside one of those services (the web daemon's own unattended run) never boots that service out: it is left in `<cache dir>/launchd-rebootstrap-pending.json` for the next update run outside it (the timer, or the TUI's). The same marker remembers an agent that was booted out but never accepted back by launchd (with the attempts so far); every update run retries it until it is running again, and `agent-deck update --check` (`--json`: `pending_launch_agents`) shows what is still waiting.
+- macOS note: launchd agents that run the agent-deck binary (`notify-daemon`, `web --no-tui`) crash-loop with `EX_CONFIG` after the binary is replaced, because macOS ties their identity to the file. Every install re-registers the `com.agentdeck.*` agents automatically (retrying the bootstrap with backoff, and once more from the plist when the agent is registered but not running) and prints the `launchctl bootout`/`bootstrap` commands if one does not come back. An updater that runs inside one of those services (the web daemon's own unattended run) never boots that service out: it is left in `<cache dir>/launchd-rebootstrap-pending.json` for the next update run outside it (the timer, or the TUI's). The same marker remembers an agent that was booted out but never accepted back by launchd (with the attempts so far); every update run retries it until it is running again, and `agent-deck update --check` (`--json`: `pending_launch_agents`) shows what is still waiting. An agent on launchd's disabled list (`launchctl print-disabled gui/<uid>`, for example after `launchctl disable`) is left alone: no bootout, no bootstrap, one line naming the `launchctl enable` command that brings it back, and it is never kept in the marker (an older entry for it is dropped; `--check` shows such an entry as `disabled`).
 - Audit trail: every unattended run writes `<cache dir>/update.log` (append-only) as well as `debug.log`, each line with the trigger, pid, ppid, launchd service and binary version. Every open TUI writes `<cache dir>/tui/<pid>.json`; `agent-deck update --check` lists TUIs still running an older image than the binary on disk and why they have not restarted (`--json`: `running_tuis`), and a TUI that has waited two hours logs `tui_restart_overdue` with the reason and says so in its banner.
 
 ## FAQ

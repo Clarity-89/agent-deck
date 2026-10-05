@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
+	"github.com/asheshgoplani/agent-deck/internal/comms"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
@@ -1809,6 +1810,30 @@ func handleSessionViewers(profile string, args []string) {
 	out.Print(human.String(), data)
 }
 
+// sessionShowStatusFields is the status pass `session show` makes and the
+// status keys it reports: status, substate, substate_detail and
+// background_work (issue #2473). It warms the tmux pane-title cache and loads
+// the hook status so the result matches the TUI and /api/menu (issue #610),
+// updates the status, then reads the substate (the pass's pane capture, which
+// can settle the status under hook lag, session/hook_lag.go). Optional keys
+// are omitted when empty so existing consumers see byte-stable output.
+func sessionShowStatusFields(inst *session.Instance) map[string]interface{} {
+	session.RefreshInstancesForCLIStatus([]*session.Instance{inst})
+	_ = inst.UpdateStatus()
+	substate := string(inst.Substate())
+	fields := map[string]interface{}{"status": StatusString(inst.Status)}
+	if substate != "" {
+		fields["substate"] = substate
+	}
+	if detail := inst.SubstateDetail(); detail != "" {
+		fields["substate_detail"] = detail
+	}
+	if work := inst.BackgroundWorkJSON(); work != nil {
+		fields["background_work"] = work
+	}
+	return fields
+}
+
 // handleSessionShow shows session details
 func handleSessionShow(profile string, args []string) {
 	fs := flag.NewFlagSet("session show", flag.ExitOnError)
@@ -1879,13 +1904,7 @@ func handleSessionShow(profile string, args []string) {
 		}
 	}
 
-	// Warm tmux pane-title cache + load hook status so `session show --json`
-	// reports the same Status the TUI and /api/menu do (issue #610).
-	session.RefreshInstancesForCLIStatus([]*session.Instance{inst})
-	// Update status, then the substate read (the pass's pane capture, which
-	// can settle the status under hook lag — session/hook_lag.go).
-	_ = inst.UpdateStatus()
-	substate := string(inst.Substate())
+	statusFields := sessionShowStatusFields(inst)
 
 	// #2080: surface the raw hook-driven status and its freshness alongside
 	// the derived "status" field. `--defer-if-busy` and the send verification
@@ -1913,7 +1932,6 @@ func handleSessionShow(profile string, args []string) {
 		"id":                   inst.ID,
 		"title":                inst.Title,
 		"profile":              profile,
-		"status":               StatusString(inst.Status),
 		"path":                 inst.ProjectPath,
 		"group":                inst.GroupPath,
 		"order":                groupTree.SessionPosition(inst),
@@ -1931,13 +1949,8 @@ func handleSessionShow(profile string, args []string) {
 		"hook_status":       hookStatus,
 		"hook_status_fresh": hookStatusFresh,
 	}
-	// Honest Status v2: additive substate refinement (omit when none so the
-	// existing keys stay byte-stable for consumers that don't expect it).
-	if substate != "" {
-		jsonData["substate"] = substate
-	}
-	if detail := inst.SubstateDetail(); detail != "" {
-		jsonData["substate_detail"] = detail
+	for k, v := range statusFields {
+		jsonData[k] = v
 	}
 	modelInfo := inst.LaunchModelInfo()
 	addModelInfoJSON(jsonData, modelInfo)
@@ -3054,7 +3067,7 @@ func handleSessionSend(profile string, args []string) {
 	fs := flag.NewFlagSet("session send", flag.ExitOnError)
 	fs.SetOutput(os.Stdout)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
-	quiet := fs.Bool("q", false, "Quiet mode")
+	quiet := fs.Bool("q", false, "Quiet mode: nothing on a confirmed delivery; one stderr line when delivery is unconfirmed or queued; errors as usual")
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready (send immediately)")
 	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output (on a socket send, first waits up to 30s for the turn to start; returns immediately with wait_outcome=unverified_busy_target/unverified_busy_probe_failed if the target could not be shown idle)")
 	stream := fs.Bool("stream", false, "Stream JSONL events (Claude only) to stdout instead of returning a snapshot")
@@ -3069,6 +3082,7 @@ func handleSessionSend(profile string, args []string) {
 	codexComposerFallback := fs.Bool("codex-composer-fallback", false, "Codex only: when the session's Codex identity is provably unavailable (fresh composer, rollout re-created after the trust prompt), send through the verified composer path instead of refusing. Never used for --json --wait; every other acceptance error still refuses")
 	queue := fs.Bool("queue", false, "Return at once with a send_id; a background worker delivers when the target is idle, at most once; every send ends landed, failed or settled with a reason (see session send-status)")
 	queueWorker := fs.Bool("queue-worker", false, "Internal: deliver a durable queued send directly")
+	noTag := fs.Bool("no-tag", false, "Do not prefix the [agent-deck from:<id>] envelope a send from inside a session gets by default ([send] tag_sends)")
 	var images imageList
 	fs.Var(&images, "image", "Attach an image (repeatable): Claude Code and Gemini get @<copy under .agentdeck-images/>; Codex and other harnesses exit 2")
 
@@ -3104,8 +3118,14 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  send_id with verdict queued. Claude accepts input while busy; other harnesses wait")
 		fmt.Println("  for idle. send-status and delivery events upgrade the verdict when evidence arrives.")
 		fmt.Println("  The send is watched until its text lands in")
-		fmt.Println("  the transcript (state landed, landed_row_id). Retry budget 30m, then failed with a reason.")
+		fmt.Println("  the transcript (state landed, landed_row_id). A refusal before typing (composer_blocked,")
+		fmt.Println("  target_busy) is retried with a doubling wait capped at 1m; after the 30m budget the send")
+		fmt.Println("  fails with a reason, and a sender session gets the failure in its inbox.")
 		fmt.Println("  Exit 0 queued, 1 failed at once (e.g. target not running).")
+		fmt.Println("From inside an agent-deck session, a send to a Claude target starts with one")
+		fmt.Println("  [agent-deck from:<your session id>] line so the reply is routed back to you")
+		fmt.Println("  (urgent in your inbox). --no-tag or [send] tag_sends = false turns it off;")
+		fmt.Println("  slash commands, --draft and heartbeats are never tagged. --json reports tagged.")
 		fmt.Println("--image: Claude Code and Gemini receive @path; Codex takes images only at launch (-i), so a")
 		fmt.Println("  running Codex session exits 2, as does any other harness. Exit codes: 0 sent/queued,")
 		fmt.Println("  1 delivery failed, 2 usage error, unknown session or unsupported image.")
@@ -3190,6 +3210,17 @@ func handleSessionSend(profile string, args []string) {
 		}
 		telemetry.MessageSent(inst.Tool, via, messageChars, *queue)
 	}
+	// PR5 of the comms redesign: tag an agent-originated send with the
+	// sender's id. The queue worker delivers a message tagged when queued.
+	senderID := sendSenderID()
+	message, tagged := tagSendMessage(message, sendTagInputs{
+		senderID:   senderID,
+		senderTool: sendSenderTool(senderID, instances),
+		targetID:   inst.ID,
+		targetTool: inst.Tool,
+		enabled:    !*noTag && !*queueWorker && sendTagsEnabled(),
+		draft:      *draft,
+	})
 	if len(images) > 0 || *queue || asyncJSON {
 		if *queue && (*wait || *stream || *draft || *noWait || *deferIfBusy) {
 			out.Error("--queue is incompatible with --wait, --stream, --draft, --no-wait and --defer-if-busy", ErrCodeInvalidOperation)
@@ -3207,7 +3238,11 @@ func handleSessionSend(profile string, args []string) {
 				out.Error(err.Error(), ErrCodeInvalidOperation)
 				os.Exit(1)
 			}
-			queueSend(profile, storage, inst, message, copies, out) // exits on failure
+			ledgerSender := senderID
+			if *noTag {
+				ledgerSender = "" // --no-tag: never attributed to an inherited session
+			}
+			queueSend(profile, storage, inst, message, copies, tagged, ledgerSender, out) // exits on failure
 			recordSent()
 			return
 		}
@@ -3245,6 +3280,7 @@ func handleSessionSend(profile string, args []string) {
 			"session_id":    inst.ID,
 			"session_title": inst.Title,
 			"message":       message,
+			"tagged":        tagged,
 		})
 		return
 	}
@@ -3396,6 +3432,7 @@ func handleSessionSend(profile string, args []string) {
 			"session_id":    inst.ID,
 			"session_title": inst.Title,
 			"message":       message,
+			"tagged":        tagged,
 		})
 		return
 	}
@@ -3459,11 +3496,30 @@ func handleSessionSend(profile string, args []string) {
 	// on, so it needs the same lookup closure. performSend only calls it
 	// under --wait, which is the only caller that acts on the answer.
 	hookStatus := func() (string, error) { return fetchHookDrivenStatus(profile, sessionRef) }
+	// Comms Ledger (P3): the send's receipt is recorded before the action,
+	// its transport outcome after. A queued send is recorded by the queue
+	// (queueSend, publishSendState), so its worker does not record it twice,
+	// and a machine wake line (a nudge typed by the daemon) is a wake record,
+	// never a send.
+	ledgerReq, ledgerSender := "", ""
+	if !*queueWorker && ledgerSendAllowed() {
+		// --no-tag: the caller opted out of being the sender (a web or
+		// script send that only inherited a session's environment): recorded
+		// as from a person at a shell, never attributed to that session.
+		ledgerSender = senderID
+		if *noTag {
+			ledgerSender = ""
+		}
+		ledgerReq = session.SpoolCommsSend(ledgerSender, inst.ID, message, ledgerSendVia(inst), "")
+	}
 	sendRes, sendErr := performSend(inst, tmuxSess, message, *noWait || busyAcceptsInput, tun, sendTransportValue, *wait, hookStatus, nil, nil)
+	if ledgerReq != "" {
+		session.SpoolCommsDelivery(ledgerSender, inst.ID, ledgerReq, ledgerDeliveryState(sendRes.delivery, sendErr), sendRes.transport, ledgerDeliveryReason(sendErr), false)
+	}
 	// Computed now (accurate ack_ms), journaled after the verdict at every
 	// exit path below — never before it, per the same rule applied to
 	// handleSessionStop/handleSessionRestart.
-	sendDetail := sendEventDetail(sendRes, sendErr, sentAt)
+	sendDetail := sendEventDetail(sendRes, sendErr, sentAt, sendJournalMetaFor(profile, storage, *queueWorker, message))
 	if acceptanceGuard != nil {
 		if markerErr := acceptanceGuard.RecordTransportOutcome(sendRes.delivery, time.Now()); markerErr != nil {
 			acceptanceGuard.Release()
@@ -3540,6 +3596,7 @@ func handleSessionSend(profile string, args []string) {
 	}
 
 	sendData := sendSuccessData(inst, message, sendRes, *wait)
+	sendData["tagged"] = tagged
 	if session.IsCodexCompatible(inst.Tool) {
 		sendData["accepted_turn_kind"] = "codex_rollout"
 	}
@@ -3620,6 +3677,9 @@ func handleSessionSend(profile string, args []string) {
 				summary = fmt.Sprintf("Wrote message to '%s' inbox (unacknowledged: Claude's inbox never confirms delivery)", inst.Title)
 			}
 			out.Success(summary, sendData)
+			if journalSendOutcome(sendRes.delivery, nil) != health.SendConfirmed {
+				out.QuietNotice(summary)
+			}
 			recordSendEventOnce()
 		}
 	}
@@ -5388,6 +5448,7 @@ func captureArrivalBaseline(target sendRetryTarget, message string) sendArrivalB
 func newSendObserver(tool, message string, baseline sendArrivalBaseline, claudeLike, hookBusyBeforeSend bool) *send.Observer {
 	obs := send.NewObserver(tool, message, send.PaneCapture{Raw: baseline.raw, OK: baseline.paneOK})
 	obs.ClaudeLike = claudeLike
+	obs.CodexLike = session.IsCodexCompatible(tool)
 	obs.BusyBeforeSend = hookBusyBeforeSend
 	return obs
 }
@@ -6199,6 +6260,10 @@ func handleSessionOutput(profile string, args []string) {
 	paneFlag := fs.Bool("pane", false, "Return tmux capture-pane content (ANSI stripped in default text mode)")
 	primaryPane := fs.Bool("primary", false, "With --pane, capture the managed first window")
 	maxTokens := fs.Int("max-tokens", defaultOutputMaxTokens, "Maximum default text-output budget in approximate tokens (head+tail; full text retained on disk)")
+	// #2481: conditional read for pollers. With the content_version of an
+	// earlier --json read, an unchanged transcript answers {"unchanged":true}
+	// from one stat: no transcript parse, no content, no read-log entry.
+	ifVersion := fs.String("if-version", "", "With --json: answer {\"unchanged\":true} without content when the response source still has this content_version")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session output [id|title] [options]")
@@ -6213,6 +6278,10 @@ func handleSessionOutput(profile string, args []string) {
 			"around an explicit \"output omitted\" seam and ends with the path of the full output retained on\n"+
 			"disk. --json, -q/--quiet and --copy always carry the complete, unstripped source.\n",
 			defaultOutputMaxTokens, outputBytesPerToken)
+		fmt.Println()
+		fmt.Println("Change detection: --json carries content_version when the response is parsed from one\n" +
+			"transcript file. Pass it back with --if-version to get {\"unchanged\":true} (no content, not a\n" +
+			"logged read) while that file is unchanged; any change returns the full response and a new version.")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -6229,6 +6298,10 @@ func handleSessionOutput(profile string, args []string) {
 	out := NewCLIOutput(*jsonOutput, quietMode)
 	if *primaryPane && !*paneFlag {
 		out.Error("--primary requires --pane", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if *ifVersion != "" && (!*jsonOutput || quietMode || *paneFlag || *copyFlag) {
+		out.Error("--if-version requires --json and cannot be combined with -q, --pane or --copy", ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -6251,6 +6324,11 @@ func handleSessionOutput(profile string, args []string) {
 		}
 		os.Exit(1)
 		return // unreachable, satisfies staticcheck SA5011
+	}
+	// Comms Ledger measurement: a session re-reading another one is the
+	// call a ledger-fed parent should not need (#2482 target).
+	if caller := callerSessionID(); caller != "" && caller != inst.ID {
+		session.SpoolCommsCall(caller, comms.CallSessionOutput, inst.ID)
 	}
 
 	// Refresh session ID from tmux env before reading output.
@@ -6307,8 +6385,21 @@ func handleSessionOutput(profile string, args []string) {
 	// claude_session_id resolve to the SAME transcript, so the parsed "last
 	// response" (-q / --json / default / --copy) would be byte-identical for
 	// all of them. Refuse the read instead — the same guard `session output
-	// --stream` got in #1352.
-	response, err := inst.GetLastResponseBestEffortChecked(instances)
+	// --stream` got in #1352. A colliding transcript has no content version,
+	// so the #2481 stat-only shortcut below never bypasses that guard.
+	version := inst.ResponseContentVersion(instances)
+	if version != "" && version == *ifVersion {
+		out.Print("unchanged", map[string]interface{}{
+			"success":         true,
+			"session_id":      inst.ID,
+			"session_title":   inst.Title,
+			"tool":            inst.Tool,
+			"unchanged":       true,
+			"content_version": version,
+		})
+		return
+	}
+	response, versioned, err := inst.GetLastResponseAtVersion(instances, version)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to get response: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
@@ -6357,6 +6448,9 @@ func handleSessionOutput(profile string, args []string) {
 	}
 	if response.CodexTurnGeneration != "" {
 		jsonData["codex_turn_generation"] = response.CodexTurnGeneration
+	}
+	if versioned {
+		jsonData["content_version"] = version
 	}
 	// Add tool-specific conversation session ID
 	if response.SessionID != "" {

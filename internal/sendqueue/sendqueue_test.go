@@ -1,6 +1,9 @@
 package sendqueue
 
 import (
+	"encoding/json"
+	"errors"
+	"os"
 	"sort"
 	"testing"
 	"time"
@@ -80,6 +83,38 @@ func TestTryLockIsExclusivePerTarget(t *testing.T) {
 	l3.Release()
 }
 
+// TestLockReleaseReportsCloseError: Release surfaces a failed close of the
+// lock file, and a second Release is a no-op.
+func TestLockReleaseReportsCloseError(t *testing.T) {
+	dir := t.TempDir()
+	l, ok, err := TryLock(dir, "sess-close")
+	if err != nil || !ok {
+		t.Fatalf("lock: %v %v", ok, err)
+	}
+	if err := l.Release(); err != nil {
+		t.Fatalf("clean release: %v", err)
+	}
+	if err := l.Release(); err != nil {
+		t.Fatalf("second release: %v", err)
+	}
+
+	l, ok, err = TryLock(dir, "sess-close")
+	if err != nil || !ok {
+		t.Fatalf("relock: %v %v", ok, err)
+	}
+	// Close the descriptor behind the lock's back so its own close fails.
+	if err := l.f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Release(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("release after external close = %v, want os.ErrClosed", err)
+	}
+	var nilLock *Lock
+	if err := nilLock.Release(); err != nil {
+		t.Fatalf("nil release: %v", err)
+	}
+}
+
 // TestNextIDIsMonotonicWithinAMillisecond: callers in the same millisecond,
 // or behind a clock that stepped back, still get ids in call order.
 func TestNextIDIsMonotonicWithinAMillisecond(t *testing.T) {
@@ -134,5 +169,37 @@ func TestPendingTargetsAndPrune(t *testing.T) {
 		if r.SendID == oldLanded || r.SendID == oldSettled {
 			t.Fatalf("old finished record kept: %+v", r)
 		}
+	}
+}
+
+// TestRecordSenderIsAdditive: a record written before the sender field
+// existed still parses; a new record keeps its sender (issue #2481).
+func TestRecordSenderIsAdditive(t *testing.T) {
+	var old Record
+	if err := json.Unmarshal([]byte(`{"send_id":"x","state":"queued","attempts":2}`), &old); err != nil || old.Sender != "" || old.Attempts != 2 {
+		t.Fatalf("old record: %+v %v", old, err)
+	}
+	b, _ := json.Marshal(Record{SendID: "y", Sender: "cli"})
+	var cur Record
+	if err := json.Unmarshal(b, &cur); err != nil || cur.Sender != "cli" {
+		t.Fatalf("new record round trip: %+v %v", cur, err)
+	}
+}
+
+// TestRetryDelayDoublesToCap: the wait after a refusal doubles from the base
+// and stops at the cap.
+func TestRetryDelayDoublesToCap(t *testing.T) {
+	base, max := time.Second, time.Minute
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, time.Minute, time.Minute}
+	for i, w := range want {
+		if got := RetryDelay(base, max, i+1); got != w {
+			t.Errorf("RetryDelay(attempts=%d) = %v, want %v", i+1, got, w)
+		}
+	}
+	if got := RetryDelay(base, max, 0); got != base {
+		t.Errorf("RetryDelay(0) = %v, want %v", got, base)
+	}
+	if got := RetryDelay(base, max, 1000); got != max {
+		t.Errorf("RetryDelay(1000) = %v, want %v", got, max)
 	}
 }

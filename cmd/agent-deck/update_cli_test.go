@@ -69,6 +69,21 @@ func TestBuildUpdateCheckJSON(t *testing.T) {
 	assert.Equal(t, float64(3), p["attempts"])
 	assert.Equal(t, "Input/output error", p["last_error"])
 
+	_, hasDisabled := p["disabled"]
+	assert.False(t, hasDisabled, "an enabled agent carries no disabled field")
+
+	// A pending agent launchd has disabled says so (#2457).
+	buf.Reset()
+	require.NoError(t, printUpdateCheckJSON(&buf, buildUpdateCheckJSON(&update.UpdateInfo{}, session.UpdateSettings{}, update.TimerStatus{}, "", nil,
+		[]update.PendingAgent{{Label: "com.agentdeck.web", Reason: update.PendingReasonDisabled, Since: time.Date(2026, 9, 28, 8, 25, 3, 0, time.UTC), Attempts: 158, Disabled: true}})))
+	var gotDisabled struct {
+		Pending []map[string]any `json:"pending_launch_agents"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &gotDisabled))
+	require.Len(t, gotDisabled.Pending, 1)
+	assert.Equal(t, true, gotDisabled.Pending[0]["disabled"])
+	assert.Equal(t, "disabled", gotDisabled.Pending[0]["reason"])
+
 	// No TUI reporting, nothing pending: empty lists, never null.
 	buf.Reset()
 	require.NoError(t, printUpdateCheckJSON(&buf, buildUpdateCheckJSON(&update.UpdateInfo{}, session.UpdateSettings{}, update.TimerStatus{}, "", nil, nil)))
@@ -315,6 +330,9 @@ func TestRunTimerCommand_InstallStatusUninstall(t *testing.T) {
 	assert.Equal(t, []string{
 		"launchctl bootout gui/501/com.agentdeck.autoupdate",
 		"launchctl bootstrap gui/501 " + cfg.PlistPath(),
+		"launchctl print gui/501/com.agentdeck.autoupdate",
+		// #2472: the result reports the timer's state after the install
+		// (a read, like the verify step before it).
 		"launchctl print gui/501/com.agentdeck.autoupdate",
 	}, r.calls)
 	out.Reset()

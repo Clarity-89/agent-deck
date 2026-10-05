@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -42,8 +43,8 @@ const wakeNudgeMessage = "[INBOX] A child just committed a completion to your in
 type wakeNudgeWiring struct {
 	nudger *WakeNudger
 	now    func() time.Time
-	isIdle func(parent *Instance) bool
-	send   func(parent *Instance, profile string) error
+	isIdle func(target *Instance, targetKind string) bool
+	send   func(parent *Instance, profile, message string) error
 }
 
 // defaultWakeNudgeWiring is the production wiring: a debounced nudger, the wall
@@ -56,6 +57,25 @@ func defaultWakeNudgeWiring() *wakeNudgeWiring {
 		isIdle: parentIsNudgeableIdle,
 		send:   sendWakeNudge,
 	}
+}
+
+// nudge runs one debounced, idle-gated wake send of message to parent through
+// the wiring's injected clock, idle probe and sender. targetKind is the
+// record's TargetKind ("parent" or "reply"); the idle gate admits a
+// non-conductor target only for a reply.
+func (w *wakeNudgeWiring) nudge(parent *Instance, targetKind, profile, message string) (bool, error) {
+	now := time.Now()
+	if w.now != nil {
+		now = w.now()
+	}
+	isIdle := func() bool { return w.isIdle != nil && w.isIdle(parent, targetKind) }
+	send := func() error {
+		if w.send == nil {
+			return nil
+		}
+		return w.send(parent, profile, message)
+	}
+	return w.nudger.Nudge(parent.ID, now, isIdle, send)
 }
 
 // fireWakeNudge invokes the Tier-2 wake-nudge for a parent that just had a
@@ -76,31 +96,34 @@ func (n *TransitionNotifier) fireWakeNudge(parent *Instance, event TransitionNot
 		}
 	}()
 
-	now := time.Now()
-	if w.now != nil {
-		now = w.now()
-	}
-	profile := event.Profile
-	isIdle := func() bool { return w.isIdle != nil && w.isIdle(parent) }
-	send := func() error {
-		if w.send == nil {
-			return nil
-		}
-		return w.send(parent, profile)
-	}
-	if _, err := w.nudger.Nudge(parent.ID, now, isIdle, send); err != nil {
+	// Issue #2469: the wake line names the record it is for; the record
+	// itself (text included) is injected by the parent's prompt-time drain
+	// into the turn this line starts.
+	line := NudgeHeadline(event)
+	sent, err := w.nudge(parent, event.TargetKind, event.Profile, line)
+	if err != nil {
 		// Best-effort: a failed wake is harmless. Log once at debug-ish level so
 		// the operator can see WHY a pane wasn't woken without it being an error.
 		commsLog.Warn("wake_nudge_send_failed",
 			slog.String("parent", parent.ID), slog.String("error", err.Error()))
+		return
+	}
+	if sent {
+		// Comms Ledger measurement: one wake record per machine wake, so
+		// `msg stats` compares this path with the ledger's own.
+		SpoolCommsWake(parent.ID, "inbox", "tmux", line, "")
 	}
 }
 
 // parentIsNudgeableIdle reports whether parent is safe to wake with a send-keys
 // nudge: it must be a conductor (only conductors drain an inbox on Stop, so a
 // nudge to a non-conductor leaf would be pure noise) AND currently idle/waiting,
-// NOT mid-turn. A send-keys into a RUNNING pane only queues the keystroke
-// (issue #36326) — the exact failure the pull model was built to avoid — so a
+// NOT mid-turn. A "reply" target (comms redesign PR5) is the session whose
+// tagged send the child just answered (a sibling sender, or the child's own
+// parent when it asked; see parentWakeEvent): it asked, so it is woken
+// whatever its title, but only when it is Claude-compatible (its prompt-time
+// drain injects the reply). A send-keys into a RUNNING pane only queues the
+// keystroke (issue #36326) — the exact failure the pull model was built to avoid — so a
 // busy conductor is left to drain at its own turn boundary.
 //
 // The status is re-probed here, under the daemon's probe budget, through the
@@ -110,8 +133,8 @@ func (n *TransitionNotifier) fireWakeNudge(parent *Instance, event TransitionNot
 // registry row as last persisted: a stale `running` withheld the wake and the
 // completion waited for the next heartbeat. A probe that overruns the budget
 // counts as not idle (the record still drains on the parent's next turn).
-func parentIsNudgeableIdle(parent *Instance) bool {
-	if parent == nil || !isConductorSessionTitle(parent.Title) {
+func parentIsNudgeableIdle(parent *Instance, targetKind string) bool {
+	if parent == nil || !isWakeTarget(parent, targetKind) {
 		return false
 	}
 	if refreshStatusBounded(parent, statusProbeBudget) {
@@ -125,22 +148,56 @@ func parentIsNudgeableIdle(parent *Instance) bool {
 	}
 }
 
+// isWakeTarget reports whether target may be woken at all for a record of
+// targetKind. A reply wake is typed into the pane and carries the child's
+// text: only a Claude-compatible pane drains it at prompt time, and a shell
+// would execute it. Any other record wakes only a conductor.
+func isWakeTarget(target *Instance, targetKind string) bool {
+	if targetKind == InboxTargetKindReply {
+		return IsClaudeCompatible(target.Tool)
+	}
+	return isConductorSessionTitle(target.Title)
+}
+
 // sendWakeNudge fires one best-effort wake into the parent conductor's pane and
 // returns immediately. The actual `session send --no-wait` runs detached so a
 // slow/stuck send never blocks the producer commit path; the gate that this is
 // only reached for an IDLE pane means the send won't sit in tmux's busy-queue.
 // A failed send is harmless (the record still drains on the next turn).
-func sendWakeNudge(parent *Instance, profile string) error {
+func sendWakeNudge(parent *Instance, profile, message string) error {
 	if parent == nil {
 		return nil
 	}
-	go func(profile, ref string) {
-		if err := sendWakeNudgeNoWait(profile, ref); err != nil {
+	if strings.TrimSpace(message) == "" {
+		message = wakeNudgeMessage
+	}
+	go func(profile, ref, message string) {
+		if err := sendWakeNudgeNoWait(profile, ref, message); err != nil {
 			commsLog.Warn("wake_nudge_dispatch_failed",
 				slog.String("parent", ref), slog.String("error", err.Error()))
 		}
-	}(profile, parent.ID)
+	}(profile, parent.ID, message)
 	return nil
+}
+
+// fireDigestNudge wakes an idle parent once for info that waited past the
+// digest window (issue #2469). Same gate and debounce as the urgent wake;
+// the records themselves arrive through the prompt-time drain.
+func (n *TransitionNotifier) fireDigestNudge(parent *Instance, profile, message string) bool {
+	w := n.wake
+	if w == nil || w.nudger == nil || parent == nil {
+		return false
+	}
+	sent, err := w.nudge(parent, "parent", profile, message)
+	if err != nil {
+		commsLog.Warn("digest_nudge_send_failed",
+			slog.String("parent", parent.ID), slog.String("error", err.Error()))
+		return false
+	}
+	if sent {
+		SpoolCommsWake(parent.ID, "inbox", "tmux", message, "")
+	}
+	return sent
 }
 
 // wakeNudgeDeliveryBudget is the time the nudge subprocess gets for the send
@@ -163,15 +220,22 @@ const wakeNudgeSendTimeout = SendTargetLockWait + wakeNudgeDeliveryBudget
 // test can substitute a spy and assert the deadline/args without spawning a real
 // process; production runs the real bounded subprocess.
 var wakeNudgeExec = func(ctx context.Context, bin string, args ...string) error {
-	return exec.CommandContext(ctx, bin, args...).Run()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(cmd.Environ(), MachineSendEnv+"=1")
+	return cmd.Run()
 }
+
+// MachineSendEnv marks a `session send` agent-deck itself runs to type a
+// wake line: the Comms Ledger records it as a wake, never as a send. An
+// environment variable, not a flag, so an older binary simply ignores it.
+const MachineSendEnv = "AGENTDECK_SEND_MACHINE"
 
 // sendWakeNudgeNoWait shells out to `agent-deck [-p profile] session send <ref>
 // <msg> --no-wait -q`. --no-wait keeps it fire-and-forget: it neither blocks for
 // the agent's ready state nor waits for a reply, so it returns fast even if the
 // pane is wedged. The context deadline is a belt-and-suspenders backstop for the
 // case where even the subprocess itself hangs.
-func sendWakeNudgeNoWait(profile, ref string) error {
+func sendWakeNudgeNoWait(profile, ref, message string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), wakeNudgeSendTimeout)
 	defer cancel()
 	bin := agentDeckBinaryPath()
@@ -179,6 +243,8 @@ func sendWakeNudgeNoWait(profile, ref string) error {
 	if profile != "" {
 		args = append(args, "-p", profile)
 	}
-	args = append(args, "session", "send", ref, wakeNudgeMessage, "--no-wait", "-q")
+	// --no-tag: the daemon may have inherited a session's AGENTDECK_INSTANCE_ID;
+	// a wake line is never a send from that session.
+	args = append(args, "session", "send", ref, message, "--no-wait", "--no-tag", "-q")
 	return wakeNudgeExec(ctx, bin, args...)
 }
