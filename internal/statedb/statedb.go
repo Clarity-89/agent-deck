@@ -120,6 +120,9 @@ type StateDB struct {
 	// large DELETE+re-insert sweep (S2 data-loss safeguard, 2026-06-04
 	// incident). Empty for in-memory databases (no file to back up).
 	path string
+	// profile is the profile BindProfile confirmed this database belongs to;
+	// empty when the handle was never bound.
+	profile string
 }
 
 // newOwnerToken builds a claim-ownership token unique to this process
@@ -327,6 +330,11 @@ func GetGlobal() *StateDB {
 	return globalDB
 }
 
+// BeforeCreate, when set, runs before Open creates a database file that does
+// not exist yet. The session package uses it to record a new install
+// (install_kind.go) before this release creates its first state.db.
+var BeforeCreate func(dbPath string)
+
 // Open creates or opens a SQLite database at dbPath with WAL mode and busy timeout.
 //
 // busy_timeout and foreign_keys are PER-CONNECTION pragmas in SQLite, so they
@@ -337,6 +345,11 @@ func GetGlobal() *StateDB {
 // level. journal_mode=WAL is persistent on the database file, so it can stay
 // as a one-shot Exec.
 func Open(dbPath string) (*StateDB, error) {
+	if BeforeCreate != nil {
+		if _, err := os.Lstat(dbPath); errors.Is(err, os.ErrNotExist) {
+			BeforeCreate(dbPath)
+		}
+	}
 	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
 		return nil, fmt.Errorf("statedb: mkdir: %w", err)
@@ -396,6 +409,9 @@ func openReadOnlyDatabase(dbPath string, immutable bool) (*StateDB, error) {
 	pid := os.Getpid()
 	return &StateDB{db: db, pid: pid, path: dbPath, token: newOwnerToken(pid), readOnly: true}, nil
 }
+
+// Path is the on-disk path of the database file; empty for an in-memory one.
+func (s *StateDB) Path() string { return s.path }
 
 // Close checkpoints WAL and closes the database.
 func (s *StateDB) Close() error {
@@ -567,6 +583,9 @@ func (s *StateDB) Migrate() error {
 	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_cost_events_timestamp ON cost_events(timestamp)`); err != nil {
 		return fmt.Errorf("statedb: create cost_events timestamp index: %w", err)
 	}
+	if err := foldLegacyHookCostRows(tx); err != nil {
+		return fmt.Errorf("statedb: fold legacy hook cost rows: %w", err)
+	}
 
 	// watchers table (v5)
 	if _, err := tx.Exec(`
@@ -617,6 +636,20 @@ func (s *StateDB) Migrate() error {
 		return err
 	}
 
+	// Triggers view (#2702): additive tables, SchemaVersion unchanged.
+	if err := migrateTriggerTables(tx); err != nil {
+		return err
+	}
+
+	// Watcher delivery refusals: additive table, SchemaVersion unchanged.
+	if err := migrateWatcherDeliveryRefusals(tx); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(claudeStatuslineSchema); err != nil {
+		return fmt.Errorf("statedb: create Claude statusline cache: %w", err)
+	}
+
 	// ALTER TABLE migrations for existing databases.
 	// CREATE TABLE IF NOT EXISTS won't add new columns to tables that already exist.
 	// Each migration is idempotent: errors from "duplicate column" are silently ignored.
@@ -658,6 +691,9 @@ func (s *StateDB) Migrate() error {
 		// deliberate-idle (never a self-heal candidate). Additive + targeted-write
 		// only (WriteLastSentAt); never part of a whole-row REPLACE/SaveInstances.
 		"ALTER TABLE instances ADD COLUMN last_sent_at INTEGER NOT NULL DEFAULT 0",
+		// Triggers view (#2702): unit_kind arrived after the first build of the
+		// triggers table; a DB made by that build lacks it.
+		"ALTER TABLE triggers ADD COLUMN unit_kind TEXT NOT NULL DEFAULT ''",
 	}
 	for _, stmt := range alterMigrations {
 		if _, err := tx.Exec(stmt); err != nil {
@@ -1624,6 +1660,13 @@ func (s *StateDB) WriteGeminiSessionBinding(id, sessionID string, detectedAt tim
 	return s.writeHarnessSessionBinding(id, sessionID, "gemini", detectedAt)
 }
 
+// WriteHermesSessionBinding records the Hermes session id an entry's own hook
+// events reported (issue #2582), so restart resumes that id rather than the
+// newest conversation in a shared workspace. Empty sessionID clears it.
+func (s *StateDB) WriteHermesSessionBinding(id, sessionID string, detectedAt time.Time) error {
+	return s.writeHarnessSessionBinding(id, sessionID, "hermes", detectedAt)
+}
+
 // WriteGenericSessionBinding persists a custom-tool conversation id
 // (tools configured via [tools.*] with resume_flag) into tool_data.
 // Mirrors WriteClaudeSessionBinding's json_set / withBusyRetry shape so a
@@ -1945,11 +1988,17 @@ func (s *StateDB) ElectPrimary(timeout time.Duration) (bool, error) {
 			}
 		}
 
-		// No live primary exists: claim it
-		if _, err := tx.Exec(
-			"UPDATE instance_heartbeats SET is_primary = 1 WHERE pid = ?",
-			s.pid,
-		); err != nil {
+		// No live primary exists: claim it. Upsert rather than UPDATE: our
+		// heartbeat row can be missing (RegisterInstance failed, or another
+		// instance's CleanDeadInstances deleted it after a missed heartbeat),
+		// and an UPDATE matching zero rows would report us primary without
+		// recording it, letting the next instance win too.
+		now := time.Now().Unix()
+		if _, err := tx.Exec(`
+			INSERT INTO instance_heartbeats (pid, started, heartbeat, is_primary)
+			VALUES (?, ?, ?, 1)
+			ON CONFLICT(pid) DO UPDATE SET is_primary = 1
+		`, s.pid, now, now); err != nil {
 			return fmt.Errorf("statedb: claim primary: %w", err)
 		}
 
@@ -2170,6 +2219,35 @@ func (s *StateDB) GetMeta(key string) (string, error) {
 		return "", nil
 	}
 	return value, err
+}
+
+// DeleteMeta removes a key from the metadata table. A missing key is not an
+// error.
+func (s *StateDB) DeleteMeta(key string) error {
+	_, err := s.db.Exec("DELETE FROM metadata WHERE key = ?", key)
+	return err
+}
+
+// ListMetaPrefix returns every metadata key-value pair whose key starts with
+// prefix (compared literally, not as a LIKE pattern).
+func (s *StateDB) ListMetaPrefix(prefix string) (map[string]string, error) {
+	rows, err := s.db.Query(
+		"SELECT key, value FROM metadata WHERE substr(key, 1, ?) = ?",
+		len(prefix), prefix,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
 }
 
 // TakeMeta reads a metadata value and clears it (sets to "") for consume-once
@@ -2434,6 +2512,19 @@ func (s *StateDB) LookupWatcherEventSessionByDedupKey(watcherID, dedupKey string
 		return "", nil
 	}
 	return sessionID, err
+}
+
+// HasWatcherEvent reports whether the event (watcherID, dedupKey) is stored.
+func (s *StateDB) HasWatcherEvent(watcherID, dedupKey string) (bool, error) {
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM watcher_events WHERE watcher_id = ? AND dedup_key = ?`,
+		watcherID, dedupKey,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // UpdateWatcherEventSessionID sets the session_id on an existing watcher event.

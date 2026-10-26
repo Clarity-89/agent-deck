@@ -10,8 +10,9 @@ package ui
 //
 //	UPDATE_GOLDEN=1 go test ./internal/ui/ -run 'TestNewDialog_DarkThemeViewGolden_Issue2449'
 //
-// and review the diff like any other test change. It pins the dark theme as
-// byte-identical: the #2449 fix is light-theme only.
+// and review the diff like any other test change. The #2449 fix was light-theme
+// only; the later inter-option gap fix intentionally adds surface backgrounds
+// to dark-theme pill separators without changing visible content.
 
 import (
 	"os"
@@ -237,7 +238,8 @@ func TestNewDialog_LightThemeSurfaceFillIsUniform_Issue2449(t *testing.T) {
 			sawName, sawPath := false, false
 			for i, row := range strings.Split(view, "\n") {
 				plain := stripAnsi(row)
-				if strings.Contains(plain, "> session-name") {
+				// The empty name previews the folder name (ASK-110).
+				if strings.Contains(plain, "> project") {
 					sawName = true
 				}
 				if strings.Contains(plain, "> /work/project") {
@@ -255,6 +257,10 @@ func TestNewDialog_LightThemeSurfaceFillIsUniform_Issue2449(t *testing.T) {
 }
 
 func TestNewDialog_DarkThemeViewGolden_Issue2449(t *testing.T) {
+	// Snapshot the default picker, independent of user config and installed
+	// Cursor entrypoints (which change the label from "cursor agent" to "agent").
+	setXDGTestHome(t)
+	t.Setenv("PATH", t.TempDir())
 	forceTrueColorProfile()
 	useThemeForTest(t, "dark")
 

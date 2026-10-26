@@ -61,15 +61,14 @@ func (d *EditPathsDialog) Show(inst *session.Instance, pathSuggestions []string)
 		}
 	}
 	// Collapse home dir to ~ for readability
-	home, _ := os.UserHomeDir()
 	for i, p := range realPaths {
-		if home != "" && strings.HasPrefix(p, home) {
-			realPaths[i] = "~" + p[len(home):]
-		}
+		realPaths[i] = collapseHome(p)
 	}
 
 	d.paths = realPaths
-	d.originalPaths = append([]string{}, realPaths...)
+	// Snapshot in the same canonical (resolved, absolute) form that
+	// HasChanged compares against, not the "~/..." display form.
+	d.originalPaths = d.cleanedPaths()
 	d.pathCursor = 0
 	d.editing = false
 	d.pathInput.Blur()
@@ -77,6 +76,22 @@ func (d *EditPathsDialog) Show(inst *session.Instance, pathSuggestions []string)
 	d.pathSuggestions = nil
 	d.pathSuggestionCursor = 0
 	d.suggestionNavigated = false
+}
+
+// collapseHome shortens a path under $HOME to "~/..." for display. It only
+// matches at a path boundary, so HOME=/home/ash leaves /home/ashesh alone.
+func collapseHome(p string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if p == home {
+		return "~"
+	}
+	if strings.HasPrefix(p, home+string(os.PathSeparator)) {
+		return "~" + p[len(home):]
+	}
+	return p
 }
 
 func (d *EditPathsDialog) Hide() {
@@ -153,11 +168,7 @@ func (d *EditPathsDialog) Validate() string {
 	}
 	for _, p := range cleaned {
 		if info, err := os.Stat(p); err != nil || !info.IsDir() {
-			short := p
-			if home, hErr := os.UserHomeDir(); hErr == nil {
-				short = strings.Replace(p, home, "~", 1)
-			}
-			return fmt.Sprintf("Path not found: %s", short)
+			return fmt.Sprintf("Path not found: %s", collapseHome(p))
 		}
 	}
 	return ""
@@ -287,9 +298,7 @@ func (d *EditPathsDialog) Update(msg tea.Msg) (*EditPathsDialog, tea.Cmd) {
 			if p := strings.TrimSpace(d.paths[i]); p != "" {
 				defaultPath = filepath.Dir(session.ExpandPath(p))
 				if defaultPath != "" && defaultPath != "." {
-					if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(defaultPath, home) {
-						defaultPath = "~" + defaultPath[len(home):]
-					}
+					defaultPath = collapseHome(defaultPath)
 					defaultPath += string(os.PathSeparator)
 				} else {
 					defaultPath = ""
@@ -357,9 +366,7 @@ func (d *EditPathsDialog) View() string {
 	content.WriteString(titleStyle.Render("Edit Multi-Repo Paths"))
 	content.WriteString("\n")
 	sessionLabel := fmt.Sprintf("  session: %s", d.sessionTitle)
-	if len(sessionLabel) > innerWidth {
-		sessionLabel = sessionLabel[:innerWidth-1] + "…"
-	}
+	sessionLabel = truncateDisplay(sessionLabel, innerWidth, "…")
 	content.WriteString(dimStyle.Render(sessionLabel))
 	content.WriteString("\n\n")
 
@@ -375,7 +382,7 @@ func (d *EditPathsDialog) View() string {
 		labelPrefix := fmt.Sprintf("%s%d. ", prefix, i+1)
 		if isSelected && d.editing {
 			// Constrain textinput width to fit inside the dialog frame
-			inputWidth := innerWidth - len(labelPrefix)
+			inputWidth := innerWidth - lipgloss.Width(labelPrefix)
 			if inputWidth < 10 {
 				inputWidth = 10
 			}
@@ -389,10 +396,7 @@ func (d *EditPathsDialog) View() string {
 				display = "(empty)"
 			}
 			// Truncate path to fit within the dialog frame
-			maxPathLen := innerWidth - len(labelPrefix)
-			if maxPathLen > 0 && len(display) > maxPathLen {
-				display = "…" + display[len(display)-maxPathLen+1:]
-			}
+			display = truncateDisplayLeft(display, innerWidth-lipgloss.Width(labelPrefix), "…")
 			if isSelected {
 				content.WriteString(lipgloss.NewStyle().Foreground(ColorCyan).Bold(true).Render(
 					labelPrefix + display))
@@ -404,9 +408,7 @@ func (d *EditPathsDialog) View() string {
 		}
 	}
 	hint := "    [a: add, d: remove, enter: edit, ↑↓: navigate]"
-	if len(hint) > innerWidth {
-		hint = hint[:innerWidth]
-	}
+	hint = truncateDisplay(hint, innerWidth, "")
 	content.WriteString(dimStyle.Render(hint))
 	content.WriteString("\n")
 

@@ -206,8 +206,8 @@ func TestSettingsPanel_LoadConfig_CustomTools(t *testing.T) {
 
 	panel.LoadConfig(config)
 
-	wantNames := []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi", "Openclaw", "Zeta", "None"}
-	wantValues := []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp", "openclaw", "zeta", ""}
+	wantNames := []string{"Claude", "Gemini", "OpenCode", "OpenCode 2", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi", "Openclaw", "Zeta", "None"}
+	wantValues := []string{"claude", "gemini", "opencode", "opencode2", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp", "openclaw", "zeta", ""}
 
 	if !reflect.DeepEqual(panel.toolNames, wantNames) {
 		t.Fatalf("toolNames = %#v, want %#v", panel.toolNames, wantNames)
@@ -1091,7 +1091,9 @@ func TestSettingsPanel_Tmux_GetConfigPreservesHiddenFields(t *testing.T) {
 
 func TestSettingsPanel_PreviewSettings_ViewContains(t *testing.T) {
 	panel := NewSettingsPanel()
-	panel.SetSize(80, 50)
+	// Tall enough for the PREVIEW section to sit inside the unscrolled
+	// window (the Claude "Default account" row, #2895, added a line above it).
+	panel.SetSize(80, 60)
 	panel.Show()
 
 	view := panel.View()

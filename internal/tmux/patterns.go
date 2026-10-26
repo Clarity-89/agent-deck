@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
@@ -183,6 +185,9 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 			BusyPatterns: []string{
 				"ctrl+c to interrupt",
 				"esc to interrupt",
+				// Pi 1.0.x renders this shortcut bar above the composer, outside
+				// the bottom-three-line window used for plain interrupt strings.
+				`re:(?m)^[ \t]*escape interrupt(?:[ \t]+·[ \t]+ctrl\+c/ctrl\+d clear/exit)?[ \t]*$`,
 				// Subagent activity: pi writes task markers to the pane
 				// when subagents are actively running. These patterns are
 				// specific enough to NOT match the idle status bar or
@@ -210,6 +215,9 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 				// the idle-prompt marker (busy is checked first, so a live pi
 				// spinner banner still wins).
 				`re:(?m)^↑[\d.]+[kMG]?\s+↓[\d.]+[kMG]?\s`,
+				// Pi 1.0.x replaced the arrow-token footer with context usage,
+				// e.g. "0.0%/1.0M (auto) (provider) model • max" (#2521).
+				`re:(?m)^[ \t]*\d+(?:\.\d+)?%/\d+(?:\.\d+)?[kMG]?[ \t]+\(auto\)(?:[ \t]|$)`,
 			},
 			SpinnerChars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
 		}
@@ -472,11 +480,60 @@ func SpinnerRuneSet() []rune {
 // CompilePatterns compiles raw string patterns into ready-to-use ResolvedPatterns.
 // Patterns prefixed with "re:" are compiled as regex. Invalid regex patterns are
 // logged as warnings and skipped (never crash).
+//
+// Results are memoized by pattern content: every Instance of a tool compiles
+// the same defaults+config set, and a fresh `list --json` process otherwise
+// recompiled the ~100-word thinking regexes once per session (about a tenth
+// of the listing's CPU). A ResolvedPatterns is read-only after compilation
+// and *regexp.Regexp is safe for concurrent use, so sharing one is safe.
 func CompilePatterns(raw *RawPatterns) (*ResolvedPatterns, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("nil RawPatterns")
 	}
+	key := compiledPatternsKey(raw)
+	compiledPatternsMu.Lock()
+	cached, ok := compiledPatterns[key]
+	compiledPatternsMu.Unlock()
+	if ok {
+		return cached, nil
+	}
+	resolved, err := compilePatterns(raw)
+	if err != nil || resolved == nil {
+		return resolved, err
+	}
+	compiledPatternsMu.Lock()
+	if len(compiledPatterns) >= compiledPatternsMax {
+		clear(compiledPatterns)
+	}
+	compiledPatterns[key] = resolved
+	compiledPatternsMu.Unlock()
+	return resolved, nil
+}
 
+// compiledPatternsMax bounds the memo; a config reload that changes patterns
+// adds a key, so a long-lived process could otherwise grow it forever.
+const compiledPatternsMax = 64
+
+var (
+	compiledPatternsMu sync.Mutex
+	compiledPatterns   = make(map[string]*ResolvedPatterns)
+)
+
+// compiledPatternsKey encodes every field CompilePatterns reads.
+func compiledPatternsKey(raw *RawPatterns) string {
+	var b strings.Builder
+	for _, field := range [][]string{raw.BusyPatterns, raw.PromptPatterns, raw.SpinnerChars, raw.WhimsicalWords} {
+		for _, p := range field {
+			b.WriteString(strconv.Itoa(len(p)))
+			b.WriteByte(':')
+			b.WriteString(p)
+		}
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+func compilePatterns(raw *RawPatterns) (*ResolvedPatterns, error) {
 	resolved := &ResolvedPatterns{}
 
 	// Split busy patterns into strings vs regex

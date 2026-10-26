@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -19,20 +20,60 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
-// envVarFlags implements flag.Value for repeatable -env KEY=VALUE flags
-type envVarFlags map[string]string
+// envVarFlags implements flag.Value for repeatable -env KEY=VALUE flags.
+//
+// The flag package prints a rejected value verbatim ("invalid value %q for
+// flag -env"), and a malformed entry ('API_KEY sk-…' with no '=') is the
+// secret itself. So Set never rejects: it records the first problem, with no
+// value in it, and the caller reports it after parsing (exitOnEnvFlagError).
+type envVarFlags struct {
+	vals map[string]string
+	err  error
+}
+
+func newEnvVarFlags() *envVarFlags { return &envVarFlags{vals: make(map[string]string)} }
 
 func (e *envVarFlags) String() string { return "" }
+
 func (e *envVarFlags) Set(val string) error {
-	parts := strings.SplitN(val, "=", 2)
-	if len(parts) != 2 || parts[0] == "" {
-		return fmt.Errorf("invalid env format %q, expected KEY=VALUE", val)
+	if err := e.add(val); err != nil && e.err == nil {
+		e.err = err
 	}
-	if !session.IsValidEnvKey(parts[0]) {
-		return fmt.Errorf("invalid environment variable name %q", parts[0])
-	}
-	(*e)[parts[0]] = parts[1]
 	return nil
+}
+
+// add validates and stores one KEY=VALUE. Its errors never quote any part of
+// the entry: without an '=' the whole entry may be a bare token ('ghp_…'), and
+// a rejected name may be one too, so they carry only a reason.
+func (e *envVarFlags) add(val string) error {
+	key, value, ok := strings.Cut(val, "=")
+	if !ok {
+		return fmt.Errorf("invalid env format: missing '=' (expected KEY=VALUE)")
+	}
+	if reason := session.EnvKeyRejectReason(key); reason != "" {
+		return fmt.Errorf("invalid environment variable name (%s, %d bytes), expected KEY=VALUE", reason, len(key))
+	}
+	e.vals[key] = value
+	return nil
+}
+
+// Err reports the first rejected -env entry, or nil.
+func (e *envVarFlags) Err() error { return e.err }
+
+// Map returns the accepted KEY=VALUE pairs.
+func (e *envVarFlags) Map() map[string]string { return e.vals }
+
+// exitOnEnvFlagError reports a rejected -env entry the way a flag parse error
+// is reported (message, usage, exit 2) but without echoing the value.
+func exitOnEnvFlagError(fs *flag.FlagSet, e *envVarFlags) {
+	if e == nil || e.Err() == nil {
+		return
+	}
+	fmt.Fprintf(fs.Output(), "invalid value for flag -env: %v\n", e.Err())
+	if fs.Usage != nil {
+		fs.Usage()
+	}
+	exitCLI(2)
 }
 
 // handleConductor dispatches conductor subcommands
@@ -69,7 +110,7 @@ func handleConductor(profile string, args []string) {
 		fmt.Fprintf(os.Stderr, "Unknown conductor command: %s\n", args[0])
 		fmt.Fprintln(os.Stderr)
 		printConductorHelp()
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -168,7 +209,7 @@ func resolveConductorSetupAgent(fs *flag.FlagSet, name string) (string, error) {
 
 // handleConductorSetup sets up a named conductor with directories, sessions, and optionally the Telegram bridge
 func handleConductorSetup(profile string, args []string) {
-	fs := flag.NewFlagSet("conductor setup", flag.ExitOnError)
+	fs := flag.NewFlagSet("conductor setup", flag.ContinueOnError)
 	fs.String("agent", session.ConductorAgentClaude, "Conductor agent runtime (claude, codex, hermes, or pi); a re-run without it keeps the conductor's current agent")
 	noClearOnCompact := fs.Bool("no-clear-on-compact", false, "Claude-only: allow normal compaction instead of /clear when context fills up (the /clear only arms on an established context window: AGENTDECK_CONTEXT_WINDOW or a harness-reported size)")
 	description := fs.String("description", "", "Description for this conductor")
@@ -183,8 +224,8 @@ func handleConductorSetup(profile string, args []string) {
 	sharedClaudeMD := fs.String("shared-claude-md", "", "Custom path for shared CLAUDE.md (e.g., ~/docs/conductor-shared.md)")
 	sharedPolicyMD := fs.String("shared-policy-md", "", "Custom path for shared POLICY.md (e.g., ~/docs/conductor-policy.md)")
 	envFile := fs.String("env-file", "", "Path to .env file to source before conductor starts (e.g., ~/.conductor.env)")
-	envFlags := make(envVarFlags)
-	fs.Var(&envFlags, "env", "Environment variable in KEY=VALUE format (can be repeated)")
+	envFlags := newEnvVarFlags()
+	fs.Var(envFlags, "env", "Environment variable in KEY=VALUE format (can be repeated)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 
 	fs.Usage = func() {
@@ -243,41 +284,40 @@ func handleConductorSetup(profile string, args []string) {
 	}
 
 	name, extras, err := parseConductorSetupArgs(fs, args)
-	if err != nil {
-		os.Exit(1)
-	}
+	exitOnFlagError(err)
+	exitOnEnvFlagError(fs, envFlags)
 
 	if name == "" {
 		fmt.Fprintln(os.Stderr, "Error: conductor name is required")
 		fmt.Fprintln(os.Stderr, "Usage: agent-deck [-p profile] conductor setup <name>")
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if len(extras) > 0 {
 		fmt.Fprintf(os.Stderr, "Error: unexpected arguments: %s\n", strings.Join(extras, " "))
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if err := session.ValidateConductorName(name); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	resolvedAgent, err := resolveConductorSetupAgent(fs, name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	spec, err := session.GetConductorAgentSpec(resolvedAgent)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if *instructionsMD != "" && *claudeMD != "" {
 		fmt.Fprintln(os.Stderr, "Error: use only one of -instructions-md or -claude-md")
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if *sharedInstructionsMD != "" && *sharedClaudeMD != "" {
 		fmt.Fprintln(os.Stderr, "Error: use only one of -shared-instructions-md or -shared-claude-md")
-		os.Exit(1)
+		exitCLI(1)
 	}
 	resolvedInstructionsMD := *instructionsMD
 	if resolvedInstructionsMD == "" {
@@ -289,7 +329,7 @@ func handleConductorSetup(profile string, args []string) {
 	}
 	if spec.Agent != session.ConductorAgentClaude && (*claudeMD != "" || *sharedClaudeMD != "") {
 		fmt.Fprintln(os.Stderr, "Error: -claude-md and -shared-claude-md are only valid with --agent=claude")
-		os.Exit(1)
+		exitCLI(1)
 	}
 	// #1790/#1822 F2: route through the guarded resolver, not a bare
 	// GetEffectiveProfile — this value goes on to SetupConductorWithAgent
@@ -301,7 +341,7 @@ func handleConductorSetup(profile string, args []string) {
 	resolvedProfile, err := session.ResolveProfileForStorage(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to resolve profile: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Auto-migrate legacy conductors
@@ -314,7 +354,7 @@ func handleConductorSetup(profile string, args []string) {
 	config, err := session.LoadUserConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	settings := config.Conductor
@@ -323,6 +363,7 @@ func handleConductorSetup(profile string, args []string) {
 	telegramConfigured := settings.Telegram.Token != ""
 	slackConfigured := settings.Slack.BotToken != ""
 	discordConfigured := settings.Discord.BotToken != ""
+	mattermostConfigured := settings.Mattermost.BotToken != ""
 
 	// v1.7.22: warn on the "global telegram enabled in profile settings.json"
 	// anti-pattern that silently leaks pollers to every claude session under
@@ -355,15 +396,21 @@ func handleConductorSetup(profile string, args []string) {
 		fmt.Println("monitor and orchestrate all your agent-deck sessions.")
 		fmt.Println()
 		fmt.Println("Conductors work locally by default — interact via the TUI or CLI.")
-		fmt.Println("You can optionally connect remote channels (Telegram, Slack, Discord)")
+		fmt.Println("You can optionally connect remote channels (Telegram, Slack, Discord, Mattermost)")
 		fmt.Println("for mobile and remote access.")
 		fmt.Println()
+	}
+
+	// An install from before the Slack allow-list was required: the wizard
+	// below skips configured channels, so say here why the bot refuses.
+	if msg := slackAccessWarning(settings.Slack); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
 	}
 
 	// Step 2b: Offer channel configuration for any unconfigured channels.
 	// Runs on first setup and on re-runs, so users can add channels later.
 	// Skipped in --json mode: interactive prompts would hang on stdin.
-	if !*jsonOutput && (!telegramConfigured || !slackConfigured || !discordConfigured) {
+	if !*jsonOutput && (!telegramConfigured || !slackConfigured || !discordConfigured || !mattermostConfigured) {
 		reader := bufio.NewReader(os.Stdin)
 
 		fmt.Print("Add remote channels for mobile/remote access? (y/N): ")
@@ -389,7 +436,7 @@ func handleConductorSetup(profile string, args []string) {
 					token = strings.TrimSpace(token)
 					if token == "" {
 						fmt.Fprintln(os.Stderr, "Error: token is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
 					fmt.Print("Your Telegram user ID: ")
@@ -398,7 +445,7 @@ func handleConductorSetup(profile string, args []string) {
 					userID, err := strconv.ParseInt(userIDStr, 10, 64)
 					if err != nil || userID == 0 {
 						fmt.Fprintln(os.Stderr, "Error: valid user ID is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
 					settings.Telegram = session.TelegramSettings{Token: token, UserID: session.NewConductorID(userID)}
@@ -426,7 +473,7 @@ func handleConductorSetup(profile string, args []string) {
 					botToken = strings.TrimSpace(botToken)
 					if botToken == "" {
 						fmt.Fprintln(os.Stderr, "Error: bot token is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
 					fmt.Print("Slack app token (xapp-...): ")
@@ -434,7 +481,7 @@ func handleConductorSetup(profile string, args []string) {
 					appToken = strings.TrimSpace(appToken)
 					if appToken == "" {
 						fmt.Fprintln(os.Stderr, "Error: app token is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
 					fmt.Print("Slack channel ID (C01234...): ")
@@ -442,10 +489,18 @@ func handleConductorSetup(profile string, args []string) {
 					channelID = strings.TrimSpace(channelID)
 					if channelID == "" {
 						fmt.Fprintln(os.Stderr, "Error: channel ID is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
-					settings.Slack = session.SlackSettings{BotToken: botToken, AppToken: appToken, ChannelID: channelID}
+					settings.Slack = withSlackCredentials(settings.Slack, botToken, appToken, channelID)
+					if len(settings.Slack.AllowedUserIDs) == 0 && !settings.Slack.AllowAllUsers {
+						slack, err := promptSlackAccess(reader, os.Stdout, settings.Slack)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+							exitCLI(1)
+						}
+						settings.Slack = slack
+					}
 					configChanged = true
 				}
 			}
@@ -470,7 +525,7 @@ func handleConductorSetup(profile string, args []string) {
 					dcBotToken = strings.TrimSpace(dcBotToken)
 					if dcBotToken == "" {
 						fmt.Fprintln(os.Stderr, "Error: bot token is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
 					fmt.Print("Discord guild (server) ID: ")
@@ -479,7 +534,7 @@ func handleConductorSetup(profile string, args []string) {
 					dcGuildID, err := strconv.ParseInt(dcGuildIDStr, 10, 64)
 					if err != nil || dcGuildID == 0 {
 						fmt.Fprintln(os.Stderr, "Error: valid guild ID is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
 					fmt.Print("Discord channel ID: ")
@@ -488,7 +543,7 @@ func handleConductorSetup(profile string, args []string) {
 					dcChannelID, err := strconv.ParseInt(dcChannelIDStr, 10, 64)
 					if err != nil || dcChannelID == 0 {
 						fmt.Fprintln(os.Stderr, "Error: valid channel ID is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
 					fmt.Print("Your Discord user ID: ")
@@ -497,10 +552,26 @@ func handleConductorSetup(profile string, args []string) {
 					dcUserID, err := strconv.ParseInt(dcUserIDStr, 10, 64)
 					if err != nil || dcUserID == 0 {
 						fmt.Fprintln(os.Stderr, "Error: valid user ID is required")
-						os.Exit(1)
+						exitCLI(1)
 					}
 
 					settings.Discord = session.DiscordSettings{BotToken: dcBotToken, GuildID: session.NewConductorID(dcGuildID), ChannelID: session.NewConductorID(dcChannelID), UserID: session.NewConductorID(dcUserID)}
+					configChanged = true
+				}
+			}
+
+			if !mattermostConfigured {
+				fmt.Print("Connect Mattermost bot for chat-based control? (y/N): ")
+				mmAnswer, _ := reader.ReadString('\n')
+				mmAnswer = strings.TrimSpace(strings.ToLower(mmAnswer))
+
+				if yesAnswer(mmAnswer) {
+					mm, err := promptMattermostSettings(reader, os.Stdout)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+						exitCLI(1)
+					}
+					settings.Mattermost = mm
 					configChanged = true
 				}
 			}
@@ -515,10 +586,11 @@ func handleConductorSetup(profile string, args []string) {
 				telegramConfigured = settings.Telegram.Token != ""
 				slackConfigured = settings.Slack.BotToken != ""
 				discordConfigured = settings.Discord.BotToken != ""
+				mattermostConfigured = settings.Mattermost.BotToken != ""
 
 				if err := session.SaveUserConfig(config); err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				fmt.Println()
 				fmt.Println("[ok] Conductor config saved to config.toml")
@@ -533,14 +605,14 @@ func handleConductorSetup(profile string, args []string) {
 		config.Conductor = settings
 		if err := session.SaveUserConfig(config); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 
 	// Step 3: Install/update shared instructions file for the selected agent
 	if err := session.InstallSharedConductorInstructions(spec.Agent, resolvedSharedInstructionsMD); err != nil {
 		fmt.Fprintf(os.Stderr, "Error installing shared %s: %v\n", spec.InstructionsFileName, err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if !*jsonOutput {
 		fmt.Printf("[ok] Shared %s installed/updated\n", spec.InstructionsFileName)
@@ -549,7 +621,7 @@ func handleConductorSetup(profile string, args []string) {
 	// Step 3b: Install/update shared POLICY.md
 	if err := session.InstallPolicyMD(*sharedPolicyMD); err != nil {
 		fmt.Fprintf(os.Stderr, "Error installing POLICY.md: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if !*jsonOutput {
 		fmt.Println("[ok] Shared POLICY.md installed/updated")
@@ -558,7 +630,7 @@ func handleConductorSetup(profile string, args []string) {
 	// Step 3c: Install shared LEARNINGS.md (don't overwrite existing)
 	if err := session.InstallLearningsMD(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error installing LEARNINGS.md: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if !*jsonOutput {
 		fmt.Println("[ok] Shared LEARNINGS.md installed")
@@ -574,12 +646,12 @@ func handleConductorSetup(profile string, args []string) {
 		clearOnCompact = false
 	}
 	var envMap map[string]string
-	if len(envFlags) > 0 {
-		envMap = map[string]string(envFlags)
+	if len(envFlags.Map()) > 0 {
+		envMap = envFlags.Map()
 	}
 	if err := session.SetupConductorWithAgent(name, resolvedProfile, spec.Agent, heartbeatEnabled, clearOnCompact, *description, resolvedInstructionsMD, *policyMD, *heartbeatRulesMD, envMap, *envFile, *heartbeatIdleMinutes); err != nil {
 		fmt.Fprintf(os.Stderr, "Error setting up conductor %s: %v\n", name, err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if !*jsonOutput {
 		fmt.Printf("  [ok] Directory, %s, and meta.json created\n", spec.InstructionsFileName)
@@ -590,50 +662,22 @@ func handleConductorSetup(profile string, args []string) {
 	storage, err := session.NewStorageWithProfile(resolvedProfile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading storage for %s: %v\n", resolvedProfile, err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading sessions for %s: %v\n", resolvedProfile, err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
-	// Check if session already exists
-	var existingID string
-	for _, inst := range instances {
-		if inst.Title == sessionTitle {
-			existingID = inst.ID
-			break
-		}
-	}
-
-	var sessionID string
-	existed := false
-	if existingID != "" {
-		sessionID = existingID
-		existed = true
-		for _, inst := range instances {
-			if inst.ID != existingID {
-				continue
-			}
-			inst.Tool = spec.Agent
-			inst.Command = spec.DefaultCommand
-			break
-		}
-		if !*jsonOutput {
-			fmt.Printf("  [ok] Session '%s' already registered and synced to %s (ID: %s)\n", sessionTitle, spec.Agent, existingID[:8])
-		}
-	} else {
-		dir, _ := session.ConductorNameDir(name)
-		newInst := session.NewInstanceWithGroupAndTool(sessionTitle, dir, "conductor", spec.Agent)
-		newInst.Command = spec.DefaultCommand
-		newInst.IsConductor = true
-		instances = append(instances, newInst)
-
-		sessionID = newInst.ID
-		if !*jsonOutput {
-			fmt.Printf("  [ok] Session '%s' registered as %s (ID: %s)\n", sessionTitle, spec.Agent, newInst.ID[:8])
+	instances, conductorInst, existed := registerConductorSession(instances, name, spec)
+	sessionID := conductorInst.ID
+	if !*jsonOutput {
+		if existed {
+			fmt.Printf("  [ok] Session '%s' already registered and synced to %s (ID: %s)\n", conductorInst.Title, spec.Agent, sessionID[:8])
+		} else {
+			fmt.Printf("  [ok] Session '%s' registered as %s (ID: %s)\n", sessionTitle, spec.Agent, sessionID[:8])
 		}
 	}
 
@@ -645,7 +689,7 @@ func handleConductorSetup(profile string, args []string) {
 
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving session for %s: %v\n", resolvedProfile, err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	// Recall phase 1: a conductor session carries its purpose as a durable
 	// hint from the start (docs/recall.md), so the hint corpus does not
@@ -674,9 +718,9 @@ func handleConductorSetup(profile string, args []string) {
 		}
 	}
 
-	// Step 7: Install bridge (if Telegram, Slack, or Discord is configured)
+	// Step 7: Install bridge (if Telegram, Slack, Discord, or Mattermost is configured)
 	var plistPath string
-	if telegramConfigured || slackConfigured || discordConfigured {
+	if telegramConfigured || slackConfigured || discordConfigured || mattermostConfigured {
 		if !*jsonOutput {
 			fmt.Println()
 			fmt.Println("Installing bridge...")
@@ -686,7 +730,7 @@ func handleConductorSetup(profile string, args []string) {
 
 		if err := session.InstallBridgeScript(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error installing bridge.py: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if !*jsonOutput {
 			fmt.Println("[ok] bridge.py installed")
@@ -742,6 +786,7 @@ func handleConductorSetup(profile string, args []string) {
 			"telegram":                telegramConfigured,
 			"slack":                   slackConfigured,
 			"discord":                 discordConfigured,
+			"mattermost":              mattermostConfigured,
 			"notifier_daemon_running": session.IsTransitionNotifierDaemonRunning(),
 		}
 		if plistPath != "" {
@@ -767,7 +812,7 @@ func handleConductorSetup(profile string, args []string) {
 	}
 	fmt.Println()
 	fmt.Println("Next steps:")
-	if telegramConfigured || slackConfigured || discordConfigured {
+	if telegramConfigured || slackConfigured || discordConfigured || mattermostConfigured {
 		condDir, _ := session.ConductorDir()
 		fmt.Printf("  agent-deck -p %s session start %s\n", resolvedProfile, sessionTitle)
 		fmt.Println()
@@ -780,6 +825,9 @@ func handleConductorSetup(profile string, args []string) {
 		if discordConfigured {
 			fmt.Println("  Test from Discord: post a message in the configured channel or use /ad-status")
 		}
+		if mattermostConfigured {
+			fmt.Println("  Test from Mattermost: send !status to the bot (in its DM, or the configured channel)")
+		}
 		fmt.Printf("  View bridge logs:   tail -f %s/bridge.log\n", condDir)
 	} else {
 		fmt.Printf("  1. Start the conductor:  agent-deck -p %s session start %s\n", resolvedProfile, sessionTitle)
@@ -790,9 +838,31 @@ func handleConductorSetup(profile string, args []string) {
 	}
 }
 
+// registerConductorSession finds the named conductor's session in instances
+// (by stable name, then title, tolerating decoration; see
+// session.FindConductorInstance) or creates it, syncing its tool/command to
+// spec. Either way it stamps the stable conductor identity so settings keep
+// resolving after the title is decorated or renamed. Returns the (possibly
+// extended) slice, the conductor's instance, and whether it already existed.
+func registerConductorSession(instances []*session.Instance, name string, spec session.ConductorAgentSpec) ([]*session.Instance, *session.Instance, bool) {
+	if inst := session.FindConductorInstance(instances, name); inst != nil {
+		inst.Tool = spec.Agent
+		inst.Command = spec.DefaultCommand
+		inst.IsConductor = true
+		inst.ConductorName = name
+		return instances, inst, true
+	}
+	dir, _ := session.ConductorNameDir(name)
+	newInst := session.NewInstanceWithGroupAndTool(session.ConductorSessionTitle(name), dir, "conductor", spec.Agent)
+	newInst.Command = spec.DefaultCommand
+	newInst.IsConductor = true
+	newInst.ConductorName = name
+	return append(instances, newInst), newInst, false
+}
+
 // handleConductorTeardown stops conductors and optionally removes directories
 func handleConductorTeardown(_ string, args []string) {
-	fs := flag.NewFlagSet("conductor teardown", flag.ExitOnError)
+	fs := flag.NewFlagSet("conductor teardown", flag.ContinueOnError)
 	removeAll := fs.Bool("remove", false, "Remove conductor directories and sessions")
 	allConductors := fs.Bool("all", false, "Teardown all conductors")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
@@ -823,14 +893,14 @@ func handleConductorTeardown(_ string, args []string) {
 		}
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, flagArgs)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, flagArgs)); err != nil {
+		exitCLI(1)
 	}
 
 	if !*allConductors && name == "" {
 		fmt.Fprintln(os.Stderr, "Error: conductor name or --all is required")
 		fmt.Fprintln(os.Stderr, "Usage: agent-deck conductor teardown <name> or --all")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Auto-migrate before teardown so we can find legacy conductors
@@ -843,7 +913,7 @@ func handleConductorTeardown(_ string, args []string) {
 		targets, err = session.ListConductors()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error listing conductors: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if len(targets) == 0 {
 			if *jsonOutput {
@@ -857,7 +927,7 @@ func handleConductorTeardown(_ string, args []string) {
 		meta, err := session.LoadConductorMeta(name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: conductor %q not found: %v\n", name, err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		targets = []session.ConductorMeta{*meta}
 	}
@@ -897,16 +967,14 @@ func handleConductorTeardown(_ string, args []string) {
 		if err == nil {
 			instances, _, err := storage.LoadWithGroups()
 			if err == nil {
-				for _, inst := range instances {
-					if inst.Title == sessionTitle {
-						if inst.Exists() {
-							// KillAndWait: short-lived CLI, async reaping would be aborted on exit.
-							_ = inst.KillAndWait()
-						}
-						if !*jsonOutput {
-							fmt.Printf("  [ok] %s stopped\n", sessionTitle)
-						}
-						break
+				if inst := session.FindConductorInstance(instances, meta.Name); inst != nil {
+					sessionTitle = inst.Title
+					if inst.Exists() {
+						// KillAndWait: short-lived CLI, async reaping would be aborted on exit.
+						_ = inst.KillAndWait()
+					}
+					if !*jsonOutput {
+						fmt.Printf("  [ok] %s stopped\n", sessionTitle)
 					}
 				}
 			}
@@ -915,7 +983,7 @@ func handleConductorTeardown(_ string, args []string) {
 		// Remove heartbeat timer
 		if err := session.UninstallHeartbeatDaemon(meta.Name); err != nil {
 			fmt.Fprintf(os.Stderr, "Error disabling heartbeat for %s: %v\n", meta.Name, err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 
 		// Optionally remove directory and session
@@ -934,14 +1002,16 @@ func handleConductorTeardown(_ string, args []string) {
 			if storage != nil {
 				instances, groups, err := storage.LoadWithGroups()
 				if err == nil {
+					removedIDs := conductorRowIDsToRemove(instances, meta.Name)
+					remove := make(map[string]bool, len(removedIDs))
+					for _, id := range removedIDs {
+						remove[id] = true
+					}
 					var filtered []*session.Instance
-					var removedIDs []string
 					for _, inst := range instances {
-						if inst.Title == sessionTitle {
-							removedIDs = append(removedIDs, inst.ID)
-							continue
+						if !remove[inst.ID] {
+							filtered = append(filtered, inst)
 						}
-						filtered = append(filtered, inst)
 					}
 					if len(removedIDs) > 0 {
 						groupTree := session.NewGroupTreeWithGroups(filtered, groups)
@@ -952,7 +1022,10 @@ func handleConductorTeardown(_ string, args []string) {
 								if !*jsonOutput {
 									fmt.Fprintf(os.Stderr, "  Warning: failed to remove session '%s' (%s) from %s: %v\n", sessionTitle, id, meta.Profile, rmErr)
 								}
+								continue
 							}
+							// Inbox / notify-state sweep and macapp.session.closed.
+							session.CleanupRemovedSession(storage.Profile(), id)
 						}
 						if !removeFailed && !*jsonOutput {
 							fmt.Printf("  [ok] Removed session '%s' from %s\n", sessionTitle, meta.Profile)
@@ -1002,9 +1075,34 @@ func handleConductorTeardown(_ string, args []string) {
 	}
 }
 
+// conductorRowIDsToRemove returns the state.db rows `conductor teardown
+// --remove` deletes for the named conductor: the session found by identity
+// (session.FindConductorInstance — the same one teardown stopped, even when
+// renamed or decorated) plus any other row still titled exactly
+// conductor-<name> that is not stamped as a different conductor (the
+// historical behavior, which also swept up duplicates).
+func conductorRowIDsToRemove(instances []*session.Instance, name string) []string {
+	var ids []string
+	found := session.FindConductorInstance(instances, name)
+	if found != nil {
+		ids = append(ids, found.ID)
+	}
+	title := session.ConductorSessionTitle(name)
+	for _, inst := range instances {
+		if inst == nil || inst == found || inst.Title != title {
+			continue
+		}
+		if stored := inst.ConductorName; inst.IsConductor && stored != "" && stored != name {
+			continue
+		}
+		ids = append(ids, inst.ID)
+	}
+	return ids
+}
+
 // handleConductorStatus shows conductor health
 func handleConductorStatus(_ string, args []string) {
-	fs := flag.NewFlagSet("conductor status", flag.ExitOnError)
+	fs := flag.NewFlagSet("conductor status", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 
 	fs.Usage = func() {
@@ -1030,8 +1128,8 @@ func handleConductorStatus(_ string, args []string) {
 		}
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, flagArgs)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, flagArgs)); err != nil {
+		exitCLI(1)
 	}
 
 	// Auto-migrate before status check so stale heartbeat scripts self-heal even
@@ -1059,7 +1157,7 @@ func handleConductorStatus(_ string, args []string) {
 		meta, err := session.LoadConductorMeta(name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: conductor %q not found: %v\n", name, err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		conductors = []session.ConductorMeta{*meta}
 	} else {
@@ -1067,7 +1165,7 @@ func handleConductorStatus(_ string, args []string) {
 		conductors, err = session.ListConductors()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error listing conductors: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 
@@ -1083,6 +1181,17 @@ func handleConductorStatus(_ string, args []string) {
 		Description          string `json:"description,omitempty"`
 		LastActivityAt       string `json:"last_activity_at,omitempty"`
 		HeartbeatIdleMinutes int    `json:"heartbeat_idle_minutes"`
+		// SessionTitle and TitleMismatch surface a conductor whose session
+		// title no longer names it (renamed); settings still resolve by the
+		// stored conductor name.
+		SessionTitle  string `json:"session_title,omitempty"`
+		TitleMismatch bool   `json:"title_mismatch,omitempty"`
+		// ChannelWarnings names channel plugins with no state (no token),
+		// e.g. after an account switch.
+		ChannelWarnings []string `json:"channel_warnings,omitempty"`
+		// DuplicateSessionIDs lists every session resolving as this
+		// conductor when there is more than one (two bot owners).
+		DuplicateSessionIDs []string `json:"duplicate_session_ids,omitempty"`
 	}
 	var statuses []conductorStatus
 
@@ -1104,7 +1213,6 @@ func handleConductorStatus(_ string, args []string) {
 		}
 
 		// Check session
-		sessionTitle := session.ConductorSessionTitle(meta.Name)
 		storage, err := session.NewStorageWithProfile(meta.Profile)
 		if err == nil {
 			instances, _, err := storage.LoadWithGroups()
@@ -1112,14 +1220,17 @@ func handleConductorStatus(_ string, args []string) {
 				// Warm tmux + hook caches before UpdateStatus so we match
 				// what the TUI and /api/menu show (issue #610).
 				session.RefreshInstancesForCLIStatus(instances)
-				for _, inst := range instances {
-					if inst.Title == sessionTitle {
-						cs.SessionID = inst.ID
-						cs.SessionDone = true
-						_ = inst.UpdateStatus()
-						cs.Running = inst.Status == session.StatusRunning || inst.Status == session.StatusWaiting || inst.Status == session.StatusIdle
-						break
+				if inst := session.FindConductorInstance(instances, meta.Name); inst != nil {
+					cs.SessionID = inst.ID
+					cs.SessionDone = true
+					cs.SessionTitle = inst.Title
+					_, cs.TitleMismatch = inst.ConductorTitleDrift()
+					cs.ChannelWarnings = inst.ChannelStateWarnings()
+					if ids := session.ConductorSessionIDs(instances, meta.Name); len(ids) > 1 {
+						cs.DuplicateSessionIDs = ids
 					}
+					_ = inst.UpdateStatus()
+					cs.Running = inst.Status == session.StatusRunning || inst.Status == session.StatusWaiting || inst.Status == session.StatusIdle
 				}
 			}
 		}
@@ -1193,6 +1304,15 @@ func handleConductorStatus(_ string, args []string) {
 		}
 
 		fmt.Printf("  %s %s [%s] agent:%s heartbeat:%s  (%s)%s\n", statusIcon, cs.Name, cs.Profile, cs.Agent, hb, statusText, desc)
+		if cs.TitleMismatch {
+			fmt.Printf("    warning: session title %q no longer matches conductor %q (settings still resolve by the stored name)\n", cs.SessionTitle, cs.Name)
+		}
+		if len(cs.DuplicateSessionIDs) > 1 {
+			fmt.Printf("    ⚠ WARNING: %d sessions resolve as conductor %q (%s); run only one, or two pollers share the bot\n", len(cs.DuplicateSessionIDs), cs.Name, strings.Join(cs.DuplicateSessionIDs, ", "))
+		}
+		for _, w := range cs.ChannelWarnings {
+			fmt.Printf("    ⚠ WARNING: %s\n", w)
+		}
 	}
 	fmt.Println()
 
@@ -1207,7 +1327,7 @@ func handleConductorStatus(_ string, args []string) {
 
 // handleConductorList lists all conductors
 func handleConductorList(profile string, args []string) {
-	fs := flag.NewFlagSet("conductor list", flag.ExitOnError)
+	fs := flag.NewFlagSet("conductor list", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	filterProfile := fs.String("profile", "", "Filter by profile")
 
@@ -1220,8 +1340,8 @@ func handleConductorList(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	// Auto-migrate
@@ -1240,7 +1360,7 @@ func handleConductorList(profile string, args []string) {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error listing conductors: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if *jsonOutput {
@@ -1263,7 +1383,6 @@ func handleConductorList(profile string, args []string) {
 	for _, meta := range conductors {
 		// Check session status
 		var statusText string
-		sessionTitle := session.ConductorSessionTitle(meta.Name)
 		storage, err := session.NewStorageWithProfile(meta.Profile)
 		if err == nil {
 			instances, _, err := storage.LoadWithGroups()
@@ -1271,20 +1390,14 @@ func handleConductorList(profile string, args []string) {
 				// Warm tmux + hook caches before UpdateStatus so conductor
 				// list matches the TUI and /api/menu view (issue #610).
 				session.RefreshInstancesForCLIStatus(instances)
-				found := false
-				for _, inst := range instances {
-					if inst.Title == sessionTitle {
-						found = true
-						_ = inst.UpdateStatus()
-						if inst.Status == session.StatusRunning || inst.Status == session.StatusWaiting || inst.Status == session.StatusIdle {
-							statusText = "running"
-						} else {
-							statusText = "stopped"
-						}
-						break
+				if inst := session.FindConductorInstance(instances, meta.Name); inst != nil {
+					_ = inst.UpdateStatus()
+					if inst.Status == session.StatusRunning || inst.Status == session.StatusWaiting || inst.Status == session.StatusIdle {
+						statusText = "running"
+					} else {
+						statusText = "stopped"
 					}
-				}
-				if !found {
+				} else {
 					statusText = "no session"
 				}
 			}
@@ -1423,6 +1536,47 @@ func formatPipFailureMessage(d pipFailureDiagnostic) string {
 	return b.String()
 }
 
+// bridgePythonPins is the one exact version setup installs for each bridge
+// dependency on Python 3.10 and newer, so a new upstream release never reaches
+// a bridge untested. The automatic install and every printed manual-install
+// command use it. The versions install together (aiogram and discord.py both
+// depend on aiohttp) and ship wheels for current Pythons, including 3.14.
+var bridgePythonPins = map[string]string{
+	"toml":       "0.10.2",
+	"aiogram":    "3.31.0",
+	"slack-bolt": "1.30.0",
+	"slack-sdk":  "3.45.0",
+	"aiohttp":    "3.14.4",
+	"discord.py": "2.7.1",
+}
+
+// bridgePythonPinsLegacy is the same table for Python 3.8 and 3.9: only
+// aiogram and aiohttp differ, since their current releases need 3.10.
+var bridgePythonPinsLegacy = map[string]string{
+	"toml":       "0.10.2",
+	"aiogram":    "3.13.1",
+	"slack-bolt": "1.30.0",
+	"slack-sdk":  "3.45.0",
+	"aiohttp":    "3.10.11",
+	"discord.py": "2.7.1",
+}
+
+// pinBridgePackages returns name==version for each named package, from the
+// table that fits pyVersion (sys.version, e.g. "3.12.4"). An unknown version
+// gets the current table.
+func pinBridgePackages(names []string, pyVersion string) []string {
+	pins := bridgePythonPins
+	if pyVersion == "3.8" || pyVersion == "3.9" ||
+		strings.HasPrefix(pyVersion, "3.8.") || strings.HasPrefix(pyVersion, "3.9.") {
+		pins = bridgePythonPinsLegacy
+	}
+	pinned := make([]string, 0, len(names))
+	for _, name := range names {
+		pinned = append(pinned, name+"=="+pins[name])
+	}
+	return pinned
+}
+
 // installPythonDeps installs Python dependencies for the bridge.
 // Returns true on success. On failure it prints a formatted, actionable error
 // (PEP 668 gets a special-cased remediation block listing three fix options;
@@ -1443,13 +1597,15 @@ func installPythonDeps() bool {
 		if config.Conductor.Discord.BotToken != "" {
 			packages = append(packages, "discord.py")
 		}
+		if config.Conductor.Mattermost.BotToken != "" && !slices.Contains(packages, "aiohttp") {
+			packages = append(packages, "aiohttp")
+		}
 	}
 
 	// Fallback: if no specific integration detected, install all
 	if len(packages) == 1 {
 		packages = append(packages, "aiogram", "slack-bolt", "slack-sdk", "aiohttp", "discord.py")
 	}
-
 	// Try with --user first; fall back to no --user (venvs, containers).
 	// We capture stderr on the second attempt so a failure can be classified
 	// and surfaced with a remediation message.
@@ -1465,6 +1621,8 @@ func installPythonDeps() bool {
 	if python == "" {
 		python = "python3"
 	}
+	_, pyVersion := probePythonInterpreter(python)
+	packages = pinBridgePackages(packages, pyVersion)
 
 	args := append([]string{"-m", "pip", "install", "--quiet", "--user"}, packages...)
 	if err := exec.Command(python, args...).Run(); err == nil {
@@ -1588,7 +1746,7 @@ func bridgeDaemonInstalled() bool {
 // performs the move. This is the deliberate, destructive path the declarative
 // [conductor].dir override intentionally avoids.
 func handleConductorMigrateDir(_ string, args []string) {
-	fs := flag.NewFlagSet("conductor migrate-dir", flag.ExitOnError)
+	fs := flag.NewFlagSet("conductor migrate-dir", flag.ContinueOnError)
 	apply := fs.Bool("apply", false, "Perform the relocation (default is a dry-run that changes nothing)")
 	force := fs.Bool("force", false, "Merge into an existing destination per-file (destination wins on conflicts) instead of skipping")
 	from := fs.String("from", "", "Override the auto-detected source base directory")
@@ -1619,14 +1777,14 @@ func handleConductorMigrateDir(_ string, args []string) {
 			flagArgs = append(flagArgs, arg)
 		}
 	}
-	if err := fs.Parse(normalizeArgs(fs, flagArgs)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, flagArgs)); err != nil {
+		exitCLI(1)
 	}
 	if strings.TrimSpace(target) == "" {
 		fmt.Fprintln(os.Stderr, "Error: migrate-dir requires a target path")
 		fmt.Fprintln(os.Stderr)
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	res, err := session.MigrateConductorDir(session.ConductorDirMigrateOptions{
@@ -1637,7 +1795,7 @@ func handleConductorMigrateDir(_ string, args []string) {
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: migrate-dir failed: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Daemon reconcile (apply only, and only when the migration actually
@@ -1699,7 +1857,7 @@ func handleConductorMigrateDir(_ string, args []string) {
 		fmt.Println(string(b))
 		// An apply that refused to mutate is a failure for scripting purposes.
 		if *apply && res.Refused {
-			os.Exit(1)
+			exitCLI(1)
 		}
 		return
 	}
@@ -1709,7 +1867,7 @@ func handleConductorMigrateDir(_ string, args []string) {
 	// An apply that refused to mutate exits non-zero so the operator (or a
 	// script) sees it did NOT relocate anything.
 	if *apply && res.Refused {
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -1813,7 +1971,7 @@ func printMigrateDirSummary(res *session.ConductorDirMigrateResult, reloadedHear
 // handleConductorMove migrates a conductor (session row + all child sessions
 // + meta.json) to another profile (issue #928).
 func handleConductorMove(sourceProfile string, args []string) {
-	fs := flag.NewFlagSet("conductor move", flag.ExitOnError)
+	fs := flag.NewFlagSet("conductor move", flag.ContinueOnError)
 	toProfile := fs.String("to-profile", "", "Target profile (required)")
 	force := fs.Bool("force", false, "Migrate even if the conductor or a worker is running")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
@@ -1830,8 +1988,8 @@ func handleConductorMove(sourceProfile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -1839,12 +1997,12 @@ func handleConductorMove(sourceProfile string, args []string) {
 	if fs.NArg() < 1 {
 		out.Error("conductor move requires <name>", ErrCodeInvalidOperation)
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if *toProfile == "" {
 		out.Error("--to-profile is required", ErrCodeInvalidOperation)
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	name := fs.Arg(0)
@@ -1862,7 +2020,7 @@ func handleConductorMove(sourceProfile string, args []string) {
 			hint = " (stop the conductor/workers first, or re-run with --force)"
 		}
 		out.Error(fmt.Sprintf("%v%s", err, hint), exitCode)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	out.Success(
@@ -1880,4 +2038,15 @@ func handleConductorMove(sourceProfile string, args []string) {
 			"meta_updated":   result.MetaUpdated,
 		},
 	)
+}
+
+// withSlackCredentials returns s with the tokens and channel the setup wizard
+// collected, keeping every other [conductor.slack] key the user already set
+// (default_conductor #2547, allowed_user_ids, allow_all_users, listen_mode) instead of
+// replacing the whole table and dropping them on save.
+func withSlackCredentials(s session.SlackSettings, botToken, appToken, channelID string) session.SlackSettings {
+	s.BotToken = botToken
+	s.AppToken = appToken
+	s.ChannelID = channelID
+	return s
 }

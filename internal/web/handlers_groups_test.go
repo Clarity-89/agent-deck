@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -120,6 +121,45 @@ func TestGroupRenamePATCHOK(t *testing.T) {
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rr.Code, rr.Body.String())
+	}
+}
+
+// The browser follows a renamed group to its new path (issue #2555), so the
+// PATCH response has to say where the group ended up.
+func TestGroupRenamePATCHReportsNewPath(t *testing.T) {
+	srv := NewServer(Config{
+		ListenAddr:   "127.0.0.1:0",
+		WebMutations: true,
+	})
+	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
+	var gotPath string
+	srv.mutator = &fakeMutator{
+		renameGroupFn: func(groupPath, newName string) error { gotPath = groupPath; return nil },
+		renamedPath:   "work/inno-trade",
+	}
+
+	// Per-segment encoding, as the web client sends it for a nested group.
+	body := strings.NewReader(`{"name":"inno trade"}`)
+	req := newLocalRequest(http.MethodPatch, "/api/groups/work/innotrade", body)
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rr.Code, rr.Body.String())
+	}
+	if gotPath != "work/innotrade" {
+		t.Fatalf("mutator got path %q, want %q", gotPath, "work/innotrade")
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["newPath"] != "work/inno-trade" {
+		t.Fatalf("newPath = %v, want %q (body %s)", resp["newPath"], "work/inno-trade", rr.Body.String())
+	}
+	if resp["path"] != "work/innotrade" {
+		t.Fatalf("path = %v, want the request path %q", resp["path"], "work/innotrade")
 	}
 }
 
@@ -354,5 +394,30 @@ func TestGroupPATCHRenameRealErrorStays500(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// POST /api/groups with an unknown parentPath must be a 404 (the CLI says
+// NOT_FOUND for the same request), not a 500.
+func TestGroupsCollectionPOSTUnknownParentReturns404(t *testing.T) {
+	srv := NewServer(Config{
+		ListenAddr:   "127.0.0.1:0",
+		WebMutations: true,
+	})
+	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
+	srv.mutator = &fakeMutator{
+		createGroupFn: func(name, parentPath string) (string, error) {
+			return "", fmt.Errorf("parent group %q: %w", parentPath, ErrGroupNotFound)
+		},
+	}
+
+	body := strings.NewReader(`{"name":"x","parentPath":"nope"}`)
+	req := newLocalRequest(http.MethodPost, "/api/groups", body)
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rr.Code, rr.Body.String())
 	}
 }

@@ -6,18 +6,18 @@
     │      in group: alpha                                                 │
     │                                                                      │
     │    ▶ Name:                                                           │
-    │      > session-name                                                  │
+    │      > opencode-idle                                                 │
     │                                                                      │
     │      Command:                                                        │
-    │        shell     claude     gemini     opencode     codex            │
-    │        pi     copilot     crush     muse     cursor agent            │
-    │        hermes     deepseek     omp                                   │
+    │        shell     claude     gemini     opencode     opencode2        │
+    │        codex     pi     copilot     crush     muse                   │
+    │        cursor agent     hermes     deepseek     omp                  │
     │                                                                      │
     │        Custom:                                                       │
     │        > custom command                                              │
     │                                                                      │
     │      ↓ more fields                                                   │
-    │    Tab next │ ↑↓ navigate │ Enter next │ ^S create │ Esc cancel      │
+    │    Tab next │ ↑↓ navigate │ Enter create │ Esc cancel                │
     │                                                                      │
     │                                                                      │
     ╰──────────────────────────────────────────────────────────────────────╯

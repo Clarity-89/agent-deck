@@ -57,6 +57,7 @@ type TransitionNotificationEvent struct {
 	// no-op loop from a genuinely-running session. Empty when no refinement
 	// applies. Observability hook only — does not affect delivery/dedup.
 	Substate string `json:"substate,omitempty"`
+	ExitCode *int   `json:"exit_code,omitempty"`
 
 	// LastOutputHash is a stable per-turn signal used by the notifier's #1142
 	// deduplication. Claude uses a transcript-derived signal; Codex uses its
@@ -137,6 +138,11 @@ type TransitionNotificationEvent struct {
 	Question bool   `json:"question,omitempty"`
 	Seq      int64  `json:"seq,omitempty"`
 	FromID   string `json:"from_id,omitempty"`
+	// TurnTextInterim marks a record built while the turn's final text was
+	// not in the transcript yet (a tool call or result newer than Text,
+	// TurnFacts.FinalTextPending): TurnUUID names interim text, so a read of
+	// that uuid never withdraws the record.
+	TurnTextInterim bool `json:"turn_text_interim,omitempty"`
 
 	// OverflowTurns marks the child's overflow digest record (issue #2481
 	// item 7): once the parent holds maxPendingTurnsPerChild undrained turns
@@ -148,6 +154,11 @@ type TransitionNotificationEvent struct {
 	// the first (whose fingerprint the digest keeps), newest last and capped
 	// at maxPendingTurnsPerChild, so a re-observed turn is not counted twice.
 	OverflowFolded []string `json:"overflow_folded,omitempty"`
+
+	// restartJudged marks an event emitTurn already judged against the
+	// child's restart token (#2792), so restartBootRecord leaves it alone.
+	// Never serialized.
+	restartJudged bool
 }
 
 // IsUrgent reports whether a consumer must wake for this record: an explicit
@@ -334,8 +345,19 @@ func isTerminalAttentionStatus(status string) bool {
 	return s == string(StatusWaiting) || s == string(StatusError) || s == string(StatusIdle)
 }
 
-func isConductorSessionTitle(title string) bool {
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(title)), "conductor-")
+// isConductorSession reports whether inst is a conductor by its resolved
+// identity (stored name, else a possibly decorated conductor-* title), or by
+// the historical case-insensitive conductor-* title check this predicate has
+// always applied (legacyConductorNameFold), so "Conductor-Ops" keeps counting.
+func isConductorSession(inst *Instance) bool {
+	if inst.ResolveConductorName() != "" {
+		return true
+	}
+	if inst == nil {
+		return false
+	}
+	_, ok := legacyConductorNameFold(inst.Title)
+	return ok
 }
 
 // isSelfSuppressedConductor reports whether inst is a top-level conductor: no
@@ -348,7 +370,7 @@ func isSelfSuppressedConductor(inst *Instance) bool {
 		return false
 	}
 	parent := strings.TrimSpace(inst.ParentSessionID)
-	return (parent == "" || parent == inst.ID) && isConductorSessionTitle(inst.Title)
+	return (parent == "" || parent == inst.ID) && isConductorSession(inst)
 }
 
 // instanceAcceptsTransitionEvents is the centralized per-session predicate used
@@ -401,6 +423,10 @@ func (n *TransitionNotifier) NotifyTransition(event TransitionNotificationEvent)
 	// pre-filter here did exactly that — it could only see the title, not the
 	// parent linkage, so it silently dropped completions for parented children
 	// whose title merely started with "conductor-".
+	if restartBootRecord(event) {
+		event.DeliveryResult = transitionDeliveryDropped
+		return event
+	}
 	if n.isDuplicate(event) {
 		event.DeliveryResult = transitionDeliveryDropped
 		return event
@@ -546,7 +572,11 @@ func (n *TransitionNotifier) isDuplicate(event TransitionNotificationEvent) bool
 	// one — otherwise there is nothing to compare and the legacy window is the
 	// floor. Requiring both sides to be empty would let a child whose signal is
 	// momentarily unavailable re-emit the identical transition (issue #1187).
-	if (event.LastOutputHash == "" || record.OutputHash == "") &&
+	//
+	// A pi run identity is not collapsed against a record with none: that
+	// record is a session_start (or legacy) wake, and the first real run after a
+	// restart must not be swallowed by it.
+	if (event.LastOutputHash == "" || record.OutputHash == "") && !(record.OutputHash == "" && strings.HasPrefix(event.LastOutputHash, "pi-run:")) &&
 		record.From == event.FromStatus && record.To == event.ToStatus && elapsed <= shortWindowDedupSeconds {
 		return true
 	}
@@ -625,6 +655,9 @@ func transitionContentSignal(inst *Instance) string {
 	if signal := codexTurnSignal(inst); signal != "" {
 		return signal
 	}
+	if signal := piTurnSignal(inst); signal != "" {
+		return signal
+	}
 	// Issue #2469: identify the TURN (the assistant record that finished it),
 	// not the file size, so background task notifications and hook re-fires
 	// that grow the transcript without a new reply do not look like new turns.
@@ -644,6 +677,77 @@ func transitionContentSignal(inst *Instance) string {
 	}
 	return fmt.Sprintf("jsonl:%d", info.Size())
 }
+
+// piSettleGrace is how long a settles-capable pi turn_end waits for its run's
+// agent_settled. The extension emits the settle within its 2 s emit bound, so a
+// run that has not settled after this never will (its emit timed out, or pi died
+// first).
+const piSettleGrace = 10 * time.Second
+
+// piRunFreshness is how long a turn_start that has not reached a turn_end is held:
+// the hook freshness window plus the grace. Past it the run was aborted.
+const piRunFreshness = hookFreshWindow + piSettleGrace
+
+// piTurnVerdict is what a hook status snapshot says about a pi child's turn.
+type piTurnVerdict struct {
+	// Signal is the run's identity: "pi-run:" plus a hash of the run token the
+	// extension minted at agent_start. The settle path and the bounded fallback
+	// use this one key, so a run is one inbox record whichever arrives first and a
+	// late settle finds the key seen. Empty for a writer without the capability bit
+	// and run token (main's legacy behaviour), and before any run token exists.
+	Signal string
+	// Awaiting: the run is still inside its bound: a turn_end within the grace of
+	// its write, or a turn_start younger than the freshness bound, with no settle.
+	// Nothing is committed yet (the emitTurn retry contract).
+	Awaiting bool
+}
+
+// piVerdict derives the verdict from one snapshot of a pi child's status file; the
+// key, the pending decision and the signal all come from that one read. Errors, a
+// restart's session_start waiting and a writer without the capability bit are
+// never held and carry no run key.
+func piVerdict(inst *Instance, hs *HookStatus, to string, now time.Time) piTurnVerdict {
+	var v piTurnVerdict
+	if inst == nil || hs == nil || !strings.EqualFold(strings.TrimSpace(inst.Tool), "pi") {
+		return v
+	}
+	if !hs.Settles || hs.PiRunID == "" {
+		return v // an older writer: origin/main's behaviour exactly, nothing held
+	}
+	v.Signal = piRunSignal(hs.PiRunID)
+	if hs.PiSettleTurnID != "" || hs.PiSettledAt > 0 || (to != string(StatusWaiting) && to != string(StatusIdle)) {
+		return v // settled, or not a waiting edge
+	}
+	received := hs.ReceivedAt
+	if received.IsZero() {
+		received = hs.UpdatedAt
+	}
+	bound := piSettleGrace
+	if hs.Event != "turn_end" {
+		bound = piRunFreshness // a turn_start waiting for a turn_end that may never come
+	}
+	v.Awaiting = now.Sub(received) < bound
+	return v
+}
+
+// piRunSignal is the content signal of one settles-capable pi run.
+func piRunSignal(runID string) string {
+	sum := sha256.Sum256([]byte(runID))
+	return "pi-run:" + hex.EncodeToString(sum[:])[:16]
+}
+
+// piTurnSignal is the run key of the child's current status file, for callers
+// outside the daemon's pass; it reads through readHookStatusForPass.
+func piTurnSignal(inst *Instance) string {
+	if inst == nil || !strings.EqualFold(strings.TrimSpace(inst.Tool), "pi") {
+		return ""
+	}
+	return piVerdict(inst, readHookStatusForPass(inst.ID), "", time.Now()).Signal
+}
+
+// readHookStatusForPass reads the status file once for a candidate in the
+// daemon's pass; a test replaces it to change the file between reads.
+var readHookStatusForPass = readHookStatusFile
 
 // codexTurnSignal returns a durable per-turn signal from the Codex hook state.
 // Codex does not expose a Claude-compatible JSONL transcript, but its hook
@@ -733,7 +837,7 @@ func (n *TransitionNotifier) loadState() {
 }
 
 func (n *TransitionNotifier) saveStateLocked() error {
-	if err := os.MkdirAll(filepath.Dir(n.statePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(n.statePath), 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(n.state, "", "  ")
@@ -741,14 +845,14 @@ func (n *TransitionNotifier) saveStateLocked() error {
 		return err
 	}
 	tmp := n.statePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, n.statePath)
 }
 
 func (n *TransitionNotifier) logEvent(event TransitionNotificationEvent) {
-	if err := os.MkdirAll(filepath.Dir(n.logPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(n.logPath), 0o700); err != nil {
 		return
 	}
 	line, err := json.Marshal(event)
@@ -763,7 +867,7 @@ func (n *TransitionNotifier) logEvent(event TransitionNotificationEvent) {
 // appendLogLine appends line plus a newline to the log at path, reporting
 // open, write and close failures alike.
 func appendLogLine(path string, line []byte) (err error) {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -789,7 +893,7 @@ func (n *TransitionNotifier) logMissed(event TransitionNotificationEvent, reason
 	n.missedSeen[key] = true
 	n.missedMu.Unlock()
 
-	if err := os.MkdirAll(filepath.Dir(n.missedPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(n.missedPath), 0o700); err != nil {
 		return
 	}
 	entry := map[string]any{
@@ -866,7 +970,7 @@ func (n *TransitionNotifier) logOrphanOnce(event TransitionNotificationEvent, ch
 	if path == "" {
 		path = transitionNotifierOrphanLogPath()
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return
 	}
 	entry := map[string]any{

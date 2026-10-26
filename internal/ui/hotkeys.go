@@ -30,6 +30,7 @@ const (
 	hotkeyMarkUnread       = "mark_unread"
 	hotkeyQuickApprove     = "quick_approve"
 	hotkeyPromptSession    = "prompt_session" // #1410: prompt the highlighted session without attaching
+	hotkeyQueueMessage     = "queue_message"
 	hotkeyToggleYolo       = "toggle_yolo"
 	hotkeyQuickFork        = "quick_fork"
 	hotkeyForkWithOptions  = "fork_with_options"
@@ -63,6 +64,13 @@ const (
 	hotkeyDetach           = "detach"
 	hotkeyWatcherPanel     = "watcher_panel"
 	hotkeyDeadLetters      = "dead_letters"
+	// hotkeyTriggers opens the Triggers panel (#2702): every launchd job,
+	// systemd unit, watcher and bridge that wakes a session. The mockup asks
+	// for "T", which is restart_fresh; "alt+t" keeps the mnemonic on a chord
+	// nothing else claims, like alt+d (dead letters) and alt+a (agents).
+	// With a session selected that something wakes (it shows a ⚡ badge) the
+	// panel opens on that session's "what wakes me" view.
+	hotkeyTriggers = "triggers"
 	// hotkeyAgentsPanel opens the Agents tab.
 	//
 	// The design mockup asks for "a". Every plain letter that reads as
@@ -74,6 +82,12 @@ const (
 	// have the bare key can set [hotkeys].agents_panel = "a" and move
 	// quick_approve.
 	hotkeyAgentsPanel = "agents_panel"
+	// hotkeyReportProblem opens the "Report a problem" form: a bug
+	// or idea becomes a structured GitHub issue through internal/issuereport,
+	// shown in full and filed only after an explicit confirm. "Z" is the one
+	// letter the overview dispatcher does not already use (every lowercase
+	// letter and A-Y are taken); ctrl+e stays the version-rating dialog.
+	hotkeyReportProblem = "report_problem"
 	// Session switcher. While attached it is intercepted in the tmux attach
 	// loop (see internal/tmux/pty.go AttachOptions); on the home screen it is
 	// dispatched like any other hotkey. Must resolve to a "ctrl+<letter>" chord.
@@ -131,6 +145,7 @@ var hotkeyActionOrder = []string{
 	hotkeyMarkUnread,
 	hotkeyQuickApprove,
 	hotkeyPromptSession,
+	hotkeyQueueMessage,
 	hotkeyToggleYolo,
 	hotkeyQuickFork,
 	hotkeyForkWithOptions,
@@ -139,6 +154,7 @@ var hotkeyActionOrder = []string{
 	hotkeyCopyInfo,
 	hotkeyContextInspector,
 	hotkeySendOutput,
+	hotkeySessionRef,
 	hotkeyExecShell,
 	hotkeyOpenShellHere,
 	hotkeyEditNotes,
@@ -157,7 +173,9 @@ var hotkeyActionOrder = []string{
 	hotkeyDetach,
 	hotkeyWatcherPanel,
 	hotkeyDeadLetters,
+	hotkeyTriggers,
 	hotkeyAgentsPanel,
+	hotkeyReportProblem,
 	hotkeySwitchSession,
 	hotkeyAltSession,
 	hotkeyMRUBack,
@@ -187,6 +205,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyMarkUnread:       "u",
 	hotkeyQuickApprove:     "a",
 	hotkeyPromptSession:    "o",
+	hotkeyQueueMessage:     "Q",
 	hotkeyToggleYolo:       "y",
 	hotkeyQuickFork:        "f",
 	hotkeyForkWithOptions:  "F",
@@ -195,6 +214,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyCopyInfo:         "B",
 	hotkeyContextInspector: "C",
 	hotkeySendOutput:       "x",
+	hotkeySessionRef:       "alt+l",
 	hotkeyExecShell:        "E",
 	hotkeyOpenShellHere:    "H",
 	hotkeyEditNotes:        "e",
@@ -213,7 +233,9 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyDetach:           "ctrl+q",
 	hotkeyWatcherPanel:     "w",
 	hotkeyDeadLetters:      "alt+d",
+	hotkeyTriggers:         "alt+t",
 	hotkeyAgentsPanel:      "alt+a",
+	hotkeyReportProblem:    "Z",
 	hotkeySwitchSession:    "ctrl+s",
 	hotkeyAltSession:       "`",
 	hotkeyMRUBack:          "alt+left",

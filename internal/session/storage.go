@@ -14,6 +14,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/termtext"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -47,11 +48,15 @@ type InstanceData struct {
 	IsConductor        bool   `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
 	NoTransitionNotify bool   `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
 	TitleLocked        bool   `json:"title_locked,omitempty"`         // #697: block Claude session-name sync into Title
+	// ConductorName mirrors Instance.ConductorName, the stable conductor key.
+	// Lives in the tool_data extras zone (conductor_identity.go).
+	ConductorName string `json:"conductor_name,omitempty"`
 	// SubcommandPassthrough mirrors Instance.SubcommandPassthrough (#1821).
 	// Persisted via the tool_data extras zone (see
 	// WriteSubcommandPassthroughToToolData), not a dedicated SQL column, so
 	// it round-trips across binary versions without a schema migration.
 	SubcommandPassthrough bool      `json:"subcommand_passthrough,omitempty"`
+	TrackCommandExit      bool      `json:"track_command_exit,omitempty"`
 	AutoName              bool      `json:"auto_name,omitempty"`             // marks Title as a machine-generated quick-session handle
 	AutoNameDescription   string    `json:"auto_name_description,omitempty"` // last captured Claude task description for an AutoName session
 	Command               string    `json:"command"`
@@ -189,10 +194,37 @@ type InstanceData struct {
 	// tool_data extras zone (context_level_persist.go).
 	ContextLevel string `json:"context_level,omitempty"`
 
+	// QueuedMessage mirrors Instance.QueuedMessage (tool_data extras zone,
+	// queued_start.go).
+	QueuedMessage string `json:"queued_message,omitempty"`
+
+	// PromptSuggestions mirrors Instance.PromptSuggestions (tool_data extras
+	// zone, prompt_suggestions.go).
+	PromptSuggestions string `json:"prompt_suggestions,omitempty"`
+
+	// WaitTimeout mirrors Instance.WaitTimeout (tool_data extras zone,
+	// wait_timer.go).
+	WaitTimeout string `json:"wait_timeout,omitempty"`
+
+	// IntendedSwitch mirrors Instance.IntendedSwitch (tool_data extras zone,
+	// intended_switch.go).
+	IntendedSwitch *IntendedSwitch `json:"intended_switch,omitempty"`
+
+	// LimitVerdictResetAt mirrors Instance.LimitVerdictResetAt (tool_data
+	// extras zone, limit_verdict_reset.go).
+	LimitVerdictResetAt time.Time `json:"limit_verdict_reset_at,omitempty"`
+
 	// DeepSeekTask mirrors Instance.DeepSeekTask (PR #1942 review, P1c).
 	// Persisted via the tool_data extras zone (see deepseek_task_persist.go).
 	// Empty for every profile but headless.
 	DeepSeekTask string `json:"deepseek_task,omitempty"`
+
+	// HermesSessionID mirrors Instance.HermesSessionID (issue #2582), stored in
+	// the tool_data extras zone (hermes_session_persist.go).
+	HermesSessionID string `json:"hermes_session_id,omitempty"`
+	// HermesDetectedAt is when the binding was recorded (tool_data
+	// hermes_detected_at); restart compares it with the hook record.
+	HermesDetectedAt time.Time `json:"-"`
 }
 
 // GroupData represents serializable group data
@@ -278,6 +310,15 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 		return nil, fmt.Errorf("failed to migrate state database: %w", err)
 	}
 
+	// Identity check after the schema migration (which only creates or
+	// upgrades tables) and before any session row is read or written: the
+	// store must belong to the profile this process resolved (see
+	// statedb.BindProfile).
+	if err := db.BindProfile(statedb.ProfileNameForDir(profileDir)); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("profile %q: %w", effectiveProfile, err)
+	}
+
 	// Auto-migrate from sessions.json if state.db is empty
 	jsonPath := filepath.Join(profileDir, "sessions.json")
 	if _, jsonErr := os.Stat(jsonPath); jsonErr == nil {
@@ -298,6 +339,10 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 				}
 			}
 		}
+	}
+
+	if err := pruneImageUploadsOnStartup(profileDir); err != nil {
+		storageLog.Warn("image_upload_cleanup_failed", slog.String("error", err.Error()))
 	}
 
 	if err := pruneHookArtifactsOnStartup(); err != nil {
@@ -336,6 +381,15 @@ func newReadOnlyStorageWithProfile(profile string, open func(string) (*statedb.S
 	db, err := open(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open state database read-only: %w", err)
+	}
+	// A read-only handle cannot write to the wrong store, so a stamp it cannot
+	// confirm is a warning, never a refusal: the statusline, the remote
+	// catalog and other readers keep working while the writable open reports
+	// the mismatch.
+	if err := db.BindProfile(statedb.ProfileNameForDir(filepath.Dir(dbPath))); err != nil {
+		storageLog.Warn("profile_stamp_unconfirmed_read_only",
+			slog.String("profile", effectiveProfile),
+			slog.String("error", err.Error()))
 	}
 	return &Storage{db: db, dbPath: dbPath, profile: effectiveProfile}, nil
 }
@@ -464,14 +518,26 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 // can still hold stale unedited fields, which must not become future edit intent.
 type instanceStorageSnapshot struct {
 	dbPath   string
+	profile  string // the Storage's profile: where a queued message is sent
 	original *statedb.InstanceRow
 	stored   *statedb.InstanceRow
+}
+
+// ForgetStorageSnapshot drops what the instance remembers of its stored row.
+// An undoable delete calls it once the row is gone: an undo then re-saves the
+// session as a new row instead of failing the registry's stale-deletion
+// check against a row that no longer exists.
+func (i *Instance) ForgetStorageSnapshot() {
+	if i != nil {
+		i.storageSnapshot = nil
+	}
 }
 
 func (s *Storage) rememberInstanceSnapshot(inst *Instance, original, stored *statedb.InstanceRow) {
 	inst.restartDB.Store(s.db)
 	inst.storageSnapshot = &instanceStorageSnapshot{
 		dbPath:   s.dbPath,
+		profile:  s.profile,
 		original: statedb.CloneInstanceRow(original),
 		stored:   statedb.CloneInstanceRow(stored),
 	}
@@ -495,6 +561,24 @@ func (s *Storage) CommitNativeHarnessSwitch(inst *Instance, result *HarnessSwitc
 
 	source := nativeSwitchStorageIdentity(result.nativeSource)
 	target := nativeSwitchStorageIdentity(result.nativeTarget)
+	// A move of the conversation to another account or harness resets the
+	// transcript limit verdict in the same CAS (the moved transcript still
+	// ends in the old account's rejection); a rollback restores what the
+	// move replaced. An acknowledgement writes nothing.
+	var limitState *limitSwitchState
+	if !result.nativeStorageAcknowledgement {
+		switch {
+		case result.nativeRevert:
+			st := result.nativeRevertLimit
+			limitState = &st
+		case source.Account != target.Account || source.Tool != target.Tool:
+			st := limitSwitchStateAfterMove(captureLimitSwitchState(inst), target.Account, time.Now())
+			limitState = &st
+		}
+	}
+	if limitState != nil {
+		target.ToolDataExtras = limitSwitchToolData(*limitState)
+	}
 	var (
 		committed *statedb.InstanceRow
 		err       error
@@ -515,6 +599,9 @@ func (s *Storage) CommitNativeHarnessSwitch(inst *Instance, result *HarnessSwitc
 	// is replayed merely to repair storage.
 	inst.Tool, inst.Account = result.nativeTarget.Tool, result.nativeTarget.Account
 	inst.ClaudeSessionID, inst.CodexSessionID = result.nativeTarget.ClaudeID, result.nativeTarget.CodexID
+	if limitState != nil {
+		inst.applyLimitSwitchState(*limitState)
+	}
 	desired, err := instanceToRow(inst)
 	if err != nil {
 		return err
@@ -618,10 +705,15 @@ func (s *Storage) DeleteInstanceDeferredCleanup(id string) (func(), error) {
 		return nil, fmt.Errorf("failed to delete instance %s: %w", id, err)
 	}
 	_ = s.db.Touch()
+	profileDir := filepath.Dir(s.dbPath)
 	return func() {
-		if err := pruneHookArtifacts(id); err != nil {
-			storageLog.Warn("hook_cleanup_failed", slog.String("id", id), slog.String("error", err.Error()))
+		if err := cleanupImageUploads(profileDir, id); err != nil {
+			storageLog.Warn("image_upload_cleanup_failed", slog.String("id", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(id), "\n", ""), "\r", "")), slog.String("error", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(err.Error()), "\n", ""), "\r", "")))
 		}
+		if err := pruneHookArtifacts(id); err != nil {
+			storageLog.Warn("hook_cleanup_failed", slog.String("id", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(id), "\n", ""), "\r", "")), slog.String("error", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(err.Error()), "\n", ""), "\r", "")))
+		}
+		removeLaunchEnvFiles(id)
 	}, nil
 }
 
@@ -1025,7 +1117,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	}
 	tmuxName := ""
 	if inst.tmuxSession != nil {
-		tmuxName = inst.tmuxSession.Name
+		tmuxName = inst.tmuxSession.TmuxName()
 	}
 	var sandboxJSON json.RawMessage
 	if inst.Sandbox != nil {
@@ -1074,12 +1166,21 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// never silently re-enable claude/codex account-routing treatment for a
 	// command that was never explicitly validated as one.
 	toolData = WriteSubcommandPassthroughToToolData(toolData, inst.SubcommandPassthrough)
+	toolData = writeTrackCommandExitToToolData(toolData, inst.TrackCommandExit)
 	// Identity-injection opt-out lives in the same extras zone so a restart
 	// from any process honours `--no-identity`.
 	toolData = WriteIdentityInjectionDisabledToToolData(toolData, inst.IdentityInjectionDisabled)
+	// Stable conductor identity (conductor_identity.go). Never cleared, so an
+	// empty value leaves the stored key to MergeToolDataExtras.
+	toolData = WriteConductorNameToToolData(toolData, inst.storedConductorName())
 	// #2260: the per-session context-level override lives in the same extras
 	// zone so a restart from any process honours `session set ... context-level`.
 	toolData = WriteContextLevelToToolData(toolData, inst.ContextLevel)
+	toolData = WriteQueuedMessageToToolData(toolData, inst.QueuedMessage)
+	toolData = WritePromptSuggestionsToToolData(toolData, inst.PromptSuggestions)
+	toolData = WriteWaitTimeoutToToolData(toolData, inst.WaitTimeout)
+	toolData = WriteIntendedSwitchToToolData(toolData, inst.IntendedSwitch)
+	toolData = WriteLimitVerdictResetToToolData(toolData, inst.LimitVerdictResetAt)
 	// #1815: the resume-identity taint travels with the id it describes, so a
 	// writer that saves a discovered conversation id without ever passing
 	// through the resume builder (e.g. `switch-account --no-restart`) cannot
@@ -1120,6 +1221,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// zone. For a one-shot the task IS the invocation, so a row that forgets it
 	// can only ever be "restarted" into dsh's usage error.
 	toolData = WriteDeepSeekTaskToToolData(toolData, inst.DeepSeekTask)
+	toolData = WriteHermesSessionIDToToolData(toolData, inst.HermesSessionID)
 	toolData = WriteCrossHarnessLineageToToolData(toolData, inst.SupersededBy, inst.Supersedes)
 
 	return &statedb.InstanceRow{
@@ -1146,7 +1248,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 		WorktreeRepo:        inst.WorktreeRepoRoot,
 		WorktreeBranch:      inst.WorktreeBranch,
 		Account:             inst.Account,
-		ArchivedAt:          inst.ArchivedAt,
+		ArchivedAt:          inst.ArchivedAtThreadSafe(),
 		Pin:                 string(inst.Pin),
 		ToolData:            toolData,
 	}, nil
@@ -1231,7 +1333,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 
 		instances[i] = &InstanceData{
 			ID:                        r.ID,
-			Title:                     r.Title,
+			Title:                     termtext.Clean(r.Title),
 			ProjectPath:               r.ProjectPath,
 			GroupPath:                 r.GroupPath,
 			Order:                     r.Order,
@@ -1286,8 +1388,15 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
 			Favorite:                  ReadFavoriteFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
+			TrackCommandExit:          readTrackCommandExitFromToolData(r.ToolData),
 			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
+			ConductorName:             ReadConductorNameFromToolData(r.ToolData),
 			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
+			QueuedMessage:             ReadQueuedMessageFromToolData(r.ToolData),
+			PromptSuggestions:         ReadPromptSuggestionsFromToolData(r.ToolData),
+			WaitTimeout:               ReadWaitTimeoutFromToolData(r.ToolData),
+			IntendedSwitch:            ReadIntendedSwitchFromToolData(r.ToolData),
+			LimitVerdictResetAt:       ReadLimitVerdictResetFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
@@ -1298,6 +1407,8 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
 			HookLag:                   ReadHookLagFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
+			HermesSessionID:           ReadHermesSessionIDFromToolData(r.ToolData),
+			HermesDetectedAt:          ReadHermesDetectedAtFromToolData(r.ToolData),
 			SupersededBy:              ReadCrossHarnessSupersededByFromToolData(r.ToolData),
 			Supersedes:                ReadCrossHarnessSupersedesFromToolData(r.ToolData),
 		}
@@ -1370,7 +1481,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 
 		data.Instances[i] = &InstanceData{
 			ID:                        r.ID,
-			Title:                     r.Title,
+			Title:                     termtext.Clean(r.Title),
 			ProjectPath:               r.ProjectPath,
 			GroupPath:                 r.GroupPath,
 			Order:                     r.Order,
@@ -1425,8 +1536,15 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
 			Favorite:                  ReadFavoriteFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
+			TrackCommandExit:          readTrackCommandExitFromToolData(r.ToolData),
 			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
+			ConductorName:             ReadConductorNameFromToolData(r.ToolData),
 			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
+			QueuedMessage:             ReadQueuedMessageFromToolData(r.ToolData),
+			PromptSuggestions:         ReadPromptSuggestionsFromToolData(r.ToolData),
+			WaitTimeout:               ReadWaitTimeoutFromToolData(r.ToolData),
+			IntendedSwitch:            ReadIntendedSwitchFromToolData(r.ToolData),
+			LimitVerdictResetAt:       ReadLimitVerdictResetFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
@@ -1437,6 +1555,8 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
 			HookLag:                   ReadHookLagFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
+			HermesSessionID:           ReadHermesSessionIDFromToolData(r.ToolData),
+			HermesDetectedAt:          ReadHermesDetectedAtFromToolData(r.ToolData),
 			SupersededBy:              ReadCrossHarnessSupersededByFromToolData(r.ToolData),
 			Supersedes:                ReadCrossHarnessSupersedesFromToolData(r.ToolData),
 		}
@@ -1530,7 +1650,11 @@ func (s *Storage) LoadRecentSessions() ([]*statedb.RecentSessionRow, error) {
 		return nil, fmt.Errorf("storage database not initialized")
 	}
 
-	return s.db.LoadRecentSessions()
+	rows, err := s.db.LoadRecentSessions()
+	for _, r := range rows {
+		r.Title = termtext.Clean(r.Title) // rendered in the TUI's recent list
+	}
+	return rows, err
 }
 
 // GetDBPathForProfile returns the path to the state.db file for a specific profile.
@@ -1684,7 +1808,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 
 		inst := &Instance{
 			ID:                           instData.ID,
-			Title:                        instData.Title,
+			Title:                        termtext.Clean(instData.Title),
 			ProjectPath:                  projectPath,
 			GroupPath:                    groupPath,
 			Order:                        instData.Order,
@@ -1733,9 +1857,18 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			IdleTimeoutSecs:              instData.IdleTimeoutSecs,
 			Favorite:                     instData.Favorite,
 			DeepSeekTask:                 instData.DeepSeekTask,
+			HermesSessionID:              instData.HermesSessionID,
+			hermesBoundAt:                instData.HermesDetectedAt,
 			SubcommandPassthrough:        instData.SubcommandPassthrough,
+			TrackCommandExit:             instData.TrackCommandExit,
 			IdentityInjectionDisabled:    instData.IdentityInjectionDisabled,
+			ConductorName:                instData.ConductorName,
 			ContextLevel:                 instData.ContextLevel,
+			QueuedMessage:                instData.QueuedMessage,
+			PromptSuggestions:            instData.PromptSuggestions,
+			WaitTimeout:                  instData.WaitTimeout,
+			IntendedSwitch:               instData.IntendedSwitch,
+			LimitVerdictResetAt:          instData.LimitVerdictResetAt,
 			LastStartedAt:                instData.LastStartedAt,
 			GenericSessionID:             instData.GenericSessionID,
 			GenericDetectedAt:            instData.GenericDetectedAt,

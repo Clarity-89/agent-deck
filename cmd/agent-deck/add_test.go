@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -147,7 +149,7 @@ func TestIsDuplicateSession_EmptyInstances(t *testing.T) {
 	}
 }
 
-func TestIsDuplicateSession_CaseInsensitiveTitle(t *testing.T) {
+func TestIsDuplicateSession_TitleIsCaseSensitive(t *testing.T) {
 	// Setup: existing session with title "api work" (lowercase)
 	instances := []*session.Instance{
 		{
@@ -157,21 +159,17 @@ func TestIsDuplicateSession_CaseInsensitiveTitle(t *testing.T) {
 		},
 	}
 
-	// Test: adding session with "API Work" (different case) at same path
-	// This tests whether title comparison is case-sensitive or not
-	// The expected behavior depends on implementation - adjust if needed
-	isDup, _ := isDuplicateSession(instances, "API Work", "/home/user/project")
-
-	// Expect: This may or may not be a duplicate depending on implementation
-	// If case-insensitive: isDup = true
-	// If case-sensitive: isDup = false
-	// For now, we test case-SENSITIVE (different titles)
-	if isDup {
-		t.Logf("Note: Title comparison is case-insensitive (API Work == api work)")
-	} else {
-		t.Logf("Note: Title comparison is case-sensitive (API Work != api work)")
+	// Test: adding session with "API Work" (different case) at same path.
+	// Titles compare case-sensitively: "API Work" is a different session
+	// from "api work", so it must not be refused as a duplicate.
+	isDup, existing := isDuplicateSession(instances, "API Work", "/home/user/project")
+	if isDup || existing != nil {
+		t.Fatalf("isDuplicateSession(%q) = %v, %v; want false, nil (titles are case-sensitive)", "API Work", isDup, existing)
 	}
-	// This test documents the behavior, adjust assertion based on desired behavior
+	// The exact title at the same path still is a duplicate.
+	if isDup, existing := isDuplicateSession(instances, "api work", "/home/user/project"); !isDup || existing != instances[0] {
+		t.Fatalf("isDuplicateSession(%q) = %v, %v; want true, the existing session", "api work", isDup, existing)
+	}
 }
 
 func TestIsDuplicateSession_PathNormalization(t *testing.T) {
@@ -418,10 +416,10 @@ func TestGenerateUniqueTitle_EmptyBaseTitle(t *testing.T) {
 	// Test: generate title with empty base
 	title := generateUniqueTitle(instances, "", "/home/user/project")
 
-	// Expect: empty string (or implementation may provide a default)
-	// This documents edge case behavior
+	// Expect: an empty base title with nothing to collide with is returned
+	// as is (the caller picks a default title before this point).
 	if title != "" {
-		t.Logf("Note: Empty base title generates '%s'", title)
+		t.Fatalf("generateUniqueTitle(\"\") = %q, want \"\"", title)
 	}
 }
 
@@ -507,8 +505,8 @@ func TestResolveGroupPathForAdd_ByExactPath(t *testing.T) {
 		{ID: "1", GroupPath: "platform/backend"},
 	})
 
-	got := resolveGroupPathForAdd(tree, "platform/backend")
-	if got != "platform/backend" {
+	got, err := resolveGroupPathForAdd(tree, "platform/backend")
+	if err != nil || got != "platform/backend" {
 		t.Fatalf("Expected exact group path match, got %q", got)
 	}
 }
@@ -519,12 +517,84 @@ func TestResolveGroupPathForAdd_ByNameAndNormalizedPath(t *testing.T) {
 	}
 	tree := session.NewGroupTreeWithGroups(nil, stored)
 
-	if got := resolveGroupPathForAdd(tree, "My Team"); got != "my-team" {
+	if got, _ := resolveGroupPathForAdd(tree, "My Team"); got != "my-team" {
 		t.Fatalf("Expected name selector to resolve to my-team, got %q", got)
 	}
 
-	if got := resolveGroupPathForAdd(tree, "my team"); got != "my-team" {
+	if got, _ := resolveGroupPathForAdd(tree, "my team"); got != "my-team" {
 		t.Fatalf("Expected normalized selector to resolve to my-team, got %q", got)
+	}
+}
+
+// TestResolveGroupPathForAdd_AmbiguousNameIsNotGuessed pins that a bare name
+// shared by groups under different parents is an error listing the candidates,
+// not one of them. Before the fix the name fallback ranged over the Groups map
+// and returned the first match, so "-g workers" landed in a random group.
+func TestResolveGroupPathForAdd_AmbiguousNameIsNotGuessed(t *testing.T) {
+	tree := session.NewGroupTree([]*session.Instance{
+		{ID: "1", GroupPath: "deck/yasir/workers"},
+		{ID: "2", GroupPath: "deck/team/workers"},
+	})
+
+	want := `group "workers" is ambiguous: deck/team/workers, deck/yasir/workers; use the full path`
+	for i := 0; i < 50; i++ {
+		got, err := resolveGroupPathForAdd(tree, "workers")
+		if err == nil || err.Error() != want {
+			t.Fatalf("call %d: got (%q, %v), want error %q", i, got, err, want)
+		}
+	}
+
+	// A name with exactly one match still resolves.
+	if got, err := resolveGroupPathForAdd(tree, "yasir"); err != nil || got != "deck/yasir" {
+		t.Fatalf("unique name: got (%q, %v), want deck/yasir", got, err)
+	}
+}
+
+// TestAdd_AmbiguousGroupNameFails pins the CLI side: `add -g workers` with two
+// groups named workers must fail and list them, not create a new top-level
+// "workers" group.
+func TestAdd_AmbiguousGroupNameFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess CLI test skipped in short mode")
+	}
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{
+		{"group", "create", "deck", "--json"},
+		{"group", "create", "team", "--parent", "deck", "--json"},
+		{"group", "create", "yasir", "--parent", "deck", "--json"},
+		{"group", "create", "workers", "--parent", "deck/team", "--json"},
+		{"group", "create", "workers", "--parent", "deck/yasir", "--json"},
+	} {
+		if stdout, stderr, code := runAgentDeck(t, home, args...); code != 0 {
+			t.Fatalf("%v failed (%d)\n%s\n%s", args, code, stdout, stderr)
+		}
+	}
+
+	stdout, stderr, code := runAgentDeck(t, home, "add", "-t", "w", "-c", "shell", "-g", "workers", "--no-parent", project)
+	want := `group "workers" is ambiguous: deck/team/workers, deck/yasir/workers; use the full path`
+	if code == 0 || !strings.Contains(stdout+stderr, want) {
+		t.Fatalf("add -g workers: exit=%d, want non-zero and %q\nstdout: %s\nstderr: %s", code, want, stdout, stderr)
+	}
+
+	stdout, stderr, code = runAgentDeck(t, home, "group", "list", "--json")
+	if code != 0 {
+		t.Fatalf("group list failed (%d)\n%s\n%s", code, stdout, stderr)
+	}
+	var resp struct {
+		Groups []groupListNode `json:"groups"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
+		t.Fatalf("unmarshal group list: %v\n%s", err, stdout)
+	}
+	for _, g := range resp.Groups {
+		if strings.EqualFold(g.Path, "workers") {
+			t.Fatalf("ambiguous add created top-level group %q:\n%s", g.Path, stdout)
+		}
 	}
 }
 

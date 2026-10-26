@@ -20,6 +20,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/childenv"
 	"github.com/asheshgoplani/agent-deck/internal/harness"
 	"github.com/asheshgoplani/agent-deck/internal/quota"
+	"github.com/asheshgoplani/agent-deck/internal/sandboxguard"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -82,7 +83,7 @@ func claudeLoggedIn(configDir string) *bool {
 	home, _ := os.UserHomeDir()
 	candidates := []string{filepath.Join(configDir, ".claude.json")}
 	if def := filepath.Join(home, ".claude"); filepath.Clean(configDir) == def || configDir == "" {
-		candidates = append(candidates, filepath.Join(home, ".claude.json"))
+		candidates = append(candidates, sandboxguard.Must("Claude root config (~/.claude.json)", filepath.Join(home, ".claude.json")))
 	}
 	for _, c := range candidates {
 		b, err := os.ReadFile(c)
@@ -119,9 +120,10 @@ func loginFacts(name string, cfg *session.UserConfig) (*bool, []harnessAccountJS
 	case "codex":
 		defHome := os.Getenv("CODEX_HOME")
 		if defHome == "" {
-			defHome = filepath.Join(home, ".codex")
 			if cfg != nil && cfg.Codex.ConfigDir != "" {
 				defHome = session.ExpandPath(cfg.Codex.ConfigDir)
+			} else {
+				defHome = sandboxguard.MustHome("Codex home (~/.codex)", filepath.Join(home, ".codex"))
 			}
 		}
 		return accountLogins(cfg, name, defHome, codexLoggedIn)
@@ -131,11 +133,11 @@ func loginFacts(name string, cfg *session.UserConfig) (*bool, []harnessAccountJS
 	case "opencode":
 		data := os.Getenv("XDG_DATA_HOME")
 		if data == "" {
-			data = filepath.Join(home, ".local", "share")
+			data = sandboxguard.Must("XDG data dir (~/.local/share)", filepath.Join(home, ".local", "share"))
 		}
 		return boolPtr(nonEmptyFile(filepath.Join(data, "opencode", "auth.json"))), accounts
 	case "pi":
-		return boolPtr(nonEmptyFile(filepath.Join(home, ".pi", "agent", "auth.json"))), accounts
+		return boolPtr(nonEmptyFile(sandboxguard.Must("Pi auth file (~/.pi)", filepath.Join(home, ".pi", "agent", "auth.json")))), accounts
 	case "hermes":
 		dir := session.GetHermesConfigDir()
 		return boolPtr(nonEmptyFile(filepath.Join(dir, ".env")) || nonEmptyFile(filepath.Join(dir, "auth.json"))), accounts
@@ -168,7 +170,7 @@ func hooksFacts(name string) *bool {
 	case "codex":
 		codexHome := os.Getenv("CODEX_HOME")
 		if codexHome == "" {
-			codexHome = filepath.Join(home, ".codex")
+			codexHome = sandboxguard.Must("Codex home (~/.codex)", filepath.Join(home, ".codex"))
 		}
 		return boolPtr(codexHooksStateForConfig(filepath.Join(codexHome, "config.toml")) == codexHooksInstalled)
 	case "gemini":
@@ -257,7 +259,7 @@ func handleHarness(profile string, args []string) {
 	if len(args) == 0 || helpRequested(args[:1]) {
 		usage()
 		if len(args) == 0 {
-			os.Exit(2)
+			exitCLI(2)
 		}
 		return
 	}
@@ -269,7 +271,7 @@ func handleHarness(profile string, args []string) {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		os.Exit(2)
+		exitCLI(2)
 	}
 	switch args[0] {
 	case "list":
@@ -284,12 +286,12 @@ func handleHarness(profile string, args []string) {
 	case "status":
 		if fs.NArg() != 1 {
 			usage()
-			os.Exit(2)
+			exitCLI(2)
 		}
 		list := collectHarnesses(profile, fs.Arg(0))
 		if len(list) == 0 {
 			NewCLIOutput(*jsonOutput, false).Error(fmt.Sprintf("unknown harness %q (known: %s)", fs.Arg(0), strings.Join(harness.Names(), ", ")), ErrCodeNotFound)
-			os.Exit(2)
+			exitCLI(2)
 		}
 		h := list[0]
 		if *jsonOutput {
@@ -306,7 +308,7 @@ func handleHarness(profile string, args []string) {
 		}
 	default:
 		usage()
-		os.Exit(2)
+		exitCLI(2)
 	}
 }
 
@@ -314,7 +316,7 @@ func printJSONValue(v any) {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: encode JSON: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	fmt.Println(string(b))
 }
@@ -325,6 +327,17 @@ type limitWindowJSON struct {
 	Window   string  `json:"window"`
 	UsedPct  float64 `json:"used_pct"`
 	ResetsAt string  `json:"resets_at,omitempty"`
+	// Expired marks a window whose resets_at has passed: its used_pct is the
+	// last value seen for a window that is over, so it never drives a limit.
+	Expired bool `json:"expired,omitempty"`
+}
+
+// limitWindowText renders one window for the text output of `limits`.
+func limitWindowText(w limitWindowJSON) string {
+	if w.Expired {
+		return fmt.Sprintf("%s expired (was %.0f%%)", w.Window, w.UsedPct)
+	}
+	return fmt.Sprintf("%s %.0f%%", w.Window, w.UsedPct)
 }
 
 type limitAccountJSON struct {
@@ -335,6 +348,20 @@ type limitAccountJSON struct {
 	UpdatedAt string            `json:"updated_at,omitempty"`
 	Stale     bool              `json:"stale"`
 	Error     string            `json:"error,omitempty"`
+	// Default marks the active default Claude login (~/.claude or the
+	// resolved CLAUDE_CONFIG_DIR) that no [profiles.<name>.claude] slot owns.
+	Default bool `json:"default,omitempty"`
+	// Blocked marks a Claude account a live session reports account-blocked
+	// (the organization disabled subscription access): not a limit that
+	// resets, so its sessions must move (limit-guard bug 2).
+	Blocked       bool   `json:"blocked,omitempty"`
+	BlockedReason string `json:"blocked_reason,omitempty"`
+	// Sessions lists the live sessions on this account that are
+	// account-blocked, model-limited or usage-limited, each with its fix.
+	Sessions []limitSessionJSON `json:"sessions,omitempty"`
+	// ConfigDir is the slot's Claude config dir, used to match sessions to
+	// the account they run on. Not part of the JSON report.
+	ConfigDir string `json:"-"`
 }
 
 func epochRFC3339(sec *int64) string {
@@ -345,11 +372,25 @@ func epochRFC3339(sec *int64) string {
 }
 
 // claudeLimits reads each Claude account's quota cache (fed by the
-// statusLine ingester `agent-deck hooks install` wires).
+// statusLine ingester `agent-deck hooks install` wires): every configured
+// slot, then the active default login when no slot owns its config directory
+// (CORE-CHANGES 9), under the name hooks install wires its feed with, so the
+// same quota cache is read. The default login is never made a slot.
 func claudeLimits(cfg *session.UserConfig, now time.Time) []limitAccountJSON {
 	var out []limitAccountJSON
+	slots := []session.ClaudeAccountSlot{}
+	named := map[string]bool{}
 	for _, a := range configuredAccountSlotsForHarness(cfg, "claude") {
-		acc := limitAccountJSON{Harness: "claude", Name: a.Name, Windows: []limitWindowJSON{}, Source: "quota cache (statusLine ingester)"}
+		slots = append(slots, session.ClaudeAccountSlot{Name: a.Name, ConfigDir: a.ConfigDir})
+		named[a.Name] = true
+	}
+	for _, s := range session.ClaudeUsageFeedSlots(cfg) {
+		if !named[s.Name] {
+			slots = append(slots, s)
+		}
+	}
+	for _, a := range slots {
+		acc := limitAccountJSON{Harness: "claude", Name: a.Name, Windows: []limitWindowJSON{}, Source: "quota cache (statusLine ingester)", Default: !named[a.Name], ConfigDir: a.ConfigDir}
 		store, err := quota.NewStore(a.Name)
 		if err == nil {
 			snaps, _ := store.Load()
@@ -367,7 +408,7 @@ func claudeLimits(cfg *session.UserConfig, now time.Time) []limitAccountJSON {
 					if label == "" {
 						label = w.Label
 					}
-					acc.Windows = append(acc.Windows, limitWindowJSON{Window: label, UsedPct: w.UsedPercentage, ResetsAt: epochRFC3339(w.ResetsAt)})
+					acc.Windows = append(acc.Windows, limitWindowJSON{Window: label, UsedPct: w.UsedPercentage, ResetsAt: epochRFC3339(w.ResetsAt), Expired: w.Expired(now)})
 				}
 			}
 		}
@@ -478,7 +519,7 @@ func codexLimits(cfg *session.UserConfig, now time.Time) []limitAccountJSON {
 	if env := os.Getenv("CODEX_HOME"); env != "" {
 		add("default", env)
 	}
-	add("default", filepath.Join(home, ".codex"))
+	add("default", sandboxguard.Must("Codex home (~/.codex)", filepath.Join(home, ".codex")))
 	var out []limitAccountJSON
 	for _, s := range slots {
 		if info, err := os.Stat(s.dir); err != nil || !info.IsDir() {
@@ -486,6 +527,11 @@ func codexLimits(cfg *session.UserConfig, now time.Time) []limitAccountJSON {
 		}
 		acc := limitAccountJSON{Harness: "codex", Name: s.name, Windows: []limitWindowJSON{}, Source: "last token_count in " + filepath.Join(s.dir, "sessions")}
 		if w, t, ok := codexRateLimits(s.dir); ok {
+			for i := range w {
+				if t, err := time.Parse(time.RFC3339, w[i].ResetsAt); err == nil && !t.After(now) {
+					w[i].Expired = true
+				}
+			}
 			acc.Windows = w
 			acc.UpdatedAt = t.UTC().Format(time.RFC3339)
 			acc.Stale = now.Sub(t) > session.AccountUsageStaleAfter
@@ -497,13 +543,28 @@ func codexLimits(cfg *session.UserConfig, now time.Time) []limitAccountJSON {
 	return out
 }
 
-// limitReachedByHarness marks a harness whose every known window of every
-// account is fresh and at or above 100%.
+// limitReachedByHarness marks a harness whose every account has a fresh,
+// unexpired window at or above 100%.
 func limitReachedByHarness() map[string]bool {
 	cfg, _ := session.LoadUserConfig()
 	now := time.Now()
+	return limitReachedFrom([][]limitAccountJSON{claudeLimits(cfg, now), codexLimits(cfg, now)})
+}
+
+// limitReachedFrom is limitReachedByHarness over already collected accounts.
+// A default Claude login with no known windows (no feed or no data yet) is
+// left out, so it never masks the configured slots' verdict. An expired
+// window (its resets_at has passed) no longer applies and never counts.
+func limitReachedFrom(groups [][]limitAccountJSON) map[string]bool {
 	out := map[string]bool{}
-	for _, accs := range [][]limitAccountJSON{claudeLimits(cfg, now), codexLimits(cfg, now)} {
+	for _, group := range groups {
+		var accs []limitAccountJSON
+		for _, a := range group {
+			if a.Default && len(a.Windows) == 0 {
+				continue
+			}
+			accs = append(accs, a)
+		}
 		if len(accs) == 0 {
 			continue
 		}
@@ -511,7 +572,7 @@ func limitReachedByHarness() map[string]bool {
 		for _, a := range accs {
 			hit := false
 			for _, w := range a.Windows {
-				if w.UsedPct >= 100 && !a.Stale {
+				if w.UsedPct >= 100 && !a.Stale && !w.Expired {
 					hit = true
 				}
 			}
@@ -522,32 +583,38 @@ func limitReachedByHarness() map[string]bool {
 	return out
 }
 
-func handleLimits(args []string) {
+func handleLimits(profile string, args []string) {
 	fs := flag.NewFlagSet("limits", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck limits [--json]")
 		fmt.Println()
-		fmt.Println("Usage limits per account: Claude 5h and 7d windows per account slot (from the quota")
-		fmt.Println("cache the statusLine ingester fills; `agent-deck hooks install` wires it) and Codex")
+		fmt.Println("Usage limits per account: Claude 5h and 7d windows per account slot and for the")
+		fmt.Println("default login no slot owns (marked \"default\": true), from the quota cache the")
+		fmt.Println("statusLine ingester fills (`agent-deck hooks install` wires it), and Codex")
 		fmt.Println("weekly/5h windows per CODEX_HOME (from the newest token_count frame in its rollouts),")
-		fmt.Println("each with used_pct and resets_at. Needs [macapp] plugins = true (docs/macapp-core.md).")
+		fmt.Println("each with used_pct and resets_at; \"expired\": true marks a window whose resets_at")
+		fmt.Println("has passed, so its used_pct no longer applies. A Claude account a live session reports")
+		fmt.Println("account-blocked (organization disabled access) carries \"blocked\": true and \"blocked_reason\";")
+		fmt.Println("\"sessions\" lists the account's account-blocked, model-limit and usage-limit sessions,")
+		fmt.Println("each with the command that moves it on (\"fix\"). Needs [macapp] plugins = true: run")
+		fmt.Println("agent-deck config set macapp.plugins true --yes (docs/macapp-core.md).")
 	}
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		os.Exit(2)
+		exitCLI(2)
 	}
 	out := NewCLIOutput(*jsonOutput, false)
 	cfg, _ := session.LoadUserConfig()
 	if cfg == nil || !cfg.Macapp.Plugins {
-		out.Error("limits is off: set [macapp] plugins = true in config.toml (docs/macapp-core.md)", ErrCodeInvalidOperation)
-		os.Exit(2)
+		exitMacappPluginsOff(out, "limits")
 	}
 	now := time.Now()
-	accounts := append(claudeLimits(cfg, now), codexLimits(cfg, now)...)
+	claude := annotateClaudeLimits(claudeLimits(cfg, now), liveClaudeSessionRows(profile))
+	accounts := append(claude, codexLimits(cfg, now)...)
 	if accounts == nil {
 		accounts = []limitAccountJSON{}
 	}
@@ -558,11 +625,14 @@ func handleLimits(args []string) {
 	for _, a := range accounts {
 		var parts []string
 		for _, w := range a.Windows {
-			parts = append(parts, fmt.Sprintf("%s %.0f%%", w.Window, w.UsedPct))
+			parts = append(parts, limitWindowText(w))
 		}
 		if a.Error != "" {
 			parts = append(parts, a.Error)
 		}
 		fmt.Printf("%-7s %-12s %s\n", a.Harness, a.Name, strings.Join(parts, "  "))
+		for _, line := range limitsTextNotes(a) {
+			fmt.Println(line)
+		}
 	}
 }

@@ -13,7 +13,7 @@ import (
 // conductor, or nothing when this tick has nothing new to say (issue #2348).
 // heartbeat.sh sends whatever this prints; empty output means no turn at all.
 func handleConductorHeartbeatTick(profile string, args []string) {
-	fs := flag.NewFlagSet("conductor heartbeat-tick", flag.ExitOnError)
+	fs := flag.NewFlagSet("conductor heartbeat-tick", flag.ContinueOnError)
 	rules := fs.String("rules", "", "Resolved HEARTBEAT_RULES.md path (re-read is requested only when it changes)")
 	commitMessage := fs.String("commit-message", "", "Persist this exact message after a successful send")
 	fs.Usage = func() {
@@ -23,24 +23,24 @@ func handleConductorHeartbeatTick(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 	if fs.NArg() < 1 {
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 	name := fs.Arg(0)
 
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "heartbeat-tick: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	instances, _, err := storage.LoadWithGroups()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "heartbeat-tick: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	session.RefreshInstancesForCLIStatus(instances)
 
@@ -49,17 +49,17 @@ func handleConductorHeartbeatTick(profile string, args []string) {
 		RulesPath:  *rules,
 		RulesStamp: session.HeartbeatRulesStamp(*rules),
 	}
-	conductorTitle := session.ConductorSessionTitle(name)
+	conductorInst := session.FindConductorInstance(instances, name)
 	prev := session.LoadHeartbeatTickState(name)
 	for _, inst := range instances {
-		if inst.Title == conductorTitle {
+		if conductorInst != nil && inst == conductorInst {
 			n, digest, err := session.InboxSnapshot(inst.ID)
 			in.InboxPending = n
 			in.InboxDigest = digest
 			in.InboxError = in.InboxError || err != nil
 			continue
 		}
-		if strings.HasPrefix(inst.Title, "conductor-") ||
+		if inst.ResolveConductorName() != "" ||
 			(inst.GroupPath != name && !strings.HasPrefix(inst.GroupPath, name+"/")) {
 			continue
 		}
@@ -73,11 +73,11 @@ func handleConductorHeartbeatTick(profile string, args []string) {
 	if *commitMessage != "" {
 		if msg != *commitMessage {
 			fmt.Fprintln(os.Stderr, "heartbeat-tick: inputs changed before commit; next tick will retry")
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if err := session.SaveHeartbeatTickState(name, next); err != nil {
 			fmt.Fprintf(os.Stderr, "heartbeat-tick: save state: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		return
 	}

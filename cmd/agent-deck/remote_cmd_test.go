@@ -148,6 +148,7 @@ func tempHomeWithConfig(t *testing.T, contents string) string {
 // degrades to "no rows" cleanly. `[]` was already the shape for
 // --with-errors's "sessions" field; this makes the bare-array form match.
 func TestRemoteSessionsPlainJSONStaysBareArray(t *testing.T) {
+	parallelSubprocessTest(t)
 	if testing.Short() {
 		t.Skip("subprocess CLI test skipped in short mode")
 	}
@@ -170,11 +171,10 @@ func TestRemoteSessionsPlainJSONStaysBareArray(t *testing.T) {
 	}
 }
 
-// TestRemoteSessionsNoRemotesConfiguredStaysPlainText pins the long-standing
-// quirk that "no remotes configured" is reported as plain text even under
-// --json, since there is no session list to report. Scripts parsing that
-// output already had to handle this case, so nothing here regresses.
-func TestRemoteSessionsNoRemotesConfiguredStaysPlainText(t *testing.T) {
+// TestRemoteSessionsNoRemotesConfiguredJSONIsEmptyArray: with no remotes
+// configured, plain --json prints an empty array (#2920). It used to print
+// "No remotes configured." even under --json, which broke JSON parsers.
+func TestRemoteSessionsNoRemotesConfiguredJSONIsEmptyArray(t *testing.T) {
 	if testing.Short() {
 		t.Skip("subprocess CLI test skipped in short mode")
 	}
@@ -182,8 +182,8 @@ func TestRemoteSessionsNoRemotesConfiguredStaysPlainText(t *testing.T) {
 	if code != 0 || stderr != "" {
 		t.Fatalf("empty remotes: code=%d stderr=%q", code, stderr)
 	}
-	if strings.TrimSpace(stdout) != "No remotes configured." {
-		t.Fatalf("no-remotes output = %q, want the plain text message", stdout)
+	if strings.TrimSpace(stdout) != "[]" {
+		t.Fatalf("no-remotes --json output = %q, want []", stdout)
 	}
 }
 

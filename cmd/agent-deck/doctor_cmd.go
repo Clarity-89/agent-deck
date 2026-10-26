@@ -14,30 +14,31 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
+	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
 func handleDoctor(args []string) {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs.SetOutput(helpOutput(args, os.Stdout, os.Stderr))
 	jsonOutput := fs.Bool("json", false, "Output account and runtime health diagnostics as JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: agent-deck doctor [--json]\n\nReport local runtime health and check named Claude slots configured as [profiles.<name>.claude].config_dir.\nWarn when slots share a directory; missing or unreadable paths remain unknown.\nAccount checks read directory metadata; health reads local samples. Neither verifies live login identities.\nAlso lists untracked tmux sessions (agentdeck_ prefix, not in `list --json`) so you can decide whether to keep or stop them; never stops any itself.")
+		fmt.Fprintln(fs.Output(), "Usage: agent-deck doctor [--json]\n\nReport local runtime health and check named Claude slots configured as [profiles.<name>.claude].config_dir.\nWarn when slots share a directory; missing or unreadable paths remain unknown.\nAccount checks read directory metadata; health reads local samples. Neither verifies live login identities.\nWarns when an older agent-deck copy earlier on PATH shadows this binary (shadowed_by in JSON; never removed).\nAlso lists untracked tmux sessions (agentdeck_ prefix, not in `list --json`) so you can decide whether to keep or stop them; never stops any itself.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return
 		}
-		os.Exit(2)
+		exitCLI(2)
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "doctor does not accept positional arguments")
-		os.Exit(2)
+		exitCLI(2)
 	}
 	config, err := session.LoadUserConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: load config: %q\n", err.Error())
-		os.Exit(1)
+		exitCLI(1)
 	}
 	runtimeHealth, err := readRuntimeHealth("", time.Hour)
 	if err != nil {
@@ -60,6 +61,9 @@ func handleDoctor(args []string) {
 		info := tmux.CheckIndicZeroWidthMarks()
 		indicMarks = &info
 	}
+	// Older agent-deck copies earlier on PATH than this binary (stale
+	// manual installs): shells run those instead. Reported, never touched.
+	shadowed := shadowedBy(onDiskVersion())
 	if *jsonOutput {
 		report := struct {
 			AccountSlots []session.AccountDirectoryDiagnostic `json:"account_slots"`
@@ -72,7 +76,8 @@ func handleDoctor(args []string) {
 			StoreError string                        `json:"store_roots_error,omitempty"`
 			IndicMarks *tmux.IndicZeroWidthMarksInfo `json:"tmux_indic_zero_width_marks,omitempty"`
 			Telemetry  string                        `json:"telemetry"`
-		}{AccountSlots: slots, Health: runtimeHealth, IndicMarks: indicMarks, Telemetry: telemetryDoctorLine()}
+			ShadowedBy []update.ShadowCopy           `json:"shadowed_by"`
+		}{AccountSlots: slots, Health: runtimeHealth, IndicMarks: indicMarks, Telemetry: telemetryDoctorLine(), ShadowedBy: shadowed}
 		report.CodexHooks.State = codexHooks
 		report.CodexHooks.Config = codexConfig
 		if storeRootsErr != nil {
@@ -82,7 +87,7 @@ func handleDoctor(args []string) {
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: encode diagnostics: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		return
 	}
@@ -90,6 +95,11 @@ func handleDoctor(args []string) {
 	fmt.Print(formatStoreRoots(storeRoots, storeRootsErr))
 	fmt.Printf("Codex notify %s\n", codexHooksLine(codexHooks, codexConfig))
 	fmt.Printf("Telemetry: %s\n", telemetryDoctorLine())
+	if len(shadowed) == 0 {
+		fmt.Println("agent-deck on PATH: OK (no older copy shadows this binary)")
+	} else {
+		fmt.Print(update.ShadowWarnings(shadowed))
+	}
 	if indicMarks != nil {
 		fmt.Printf("tmux indic_zero_width_marks INFO: %s\n", indicMarks.Detail)
 	}

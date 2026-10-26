@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -57,7 +56,7 @@ type staleCandidate struct {
 	Tool                string   `json:"tool"`
 	Status              string   `json:"status"`
 	Substate            string   `json:"substate,omitempty"`
-	SubstateDetail      string   `json:"substate_detail,omitempty"` // free text for the substate (codex usage-limit retry time)
+	SubstateDetail      string   `json:"substate_detail,omitempty"` // free text for the substate (codex usage-limit retry time; usage-limit window, model-limit model, account-blocked reason)
 	Path                string   `json:"path"`
 	GroupPath           string   `json:"group_path,omitempty"`
 	ParentSessionID     string   `json:"parent_session_id,omitempty"`
@@ -224,13 +223,13 @@ func runStatusStale(profile string, threshold time.Duration, jsonOutput bool) {
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		fmt.Printf("Error: failed to initialize storage: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, _, err := storage.LoadWithGroups()
 	if err != nil {
 		fmt.Printf("Error: failed to load sessions: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Refresh status the same way `status`/`status -v` does (issue #610 parity)

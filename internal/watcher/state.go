@@ -23,7 +23,17 @@ type WatcherState struct {
 	ErrorCount     int            `json:"error_count"`
 	AdapterHealthy bool           `json:"adapter_healthy"`
 	HealthWindow   []HealthSample `json:"health_window"` // cap at 64 samples
-	DedupCursor    string         `json:"dedup_cursor"`
+	// DedupCursor is the source resume position of the last event the engine
+	// stored (an ntfy message ID for ntfy and slack watchers), and
+	// DedupCursorTime is that event's source timestamp. On start the engine
+	// turns them into AdapterConfig.ResumeSince (#2538).
+	DedupCursor     string    `json:"dedup_cursor"`
+	DedupCursorTime time.Time `json:"dedup_cursor_time,omitzero"`
+	// ReplayFrom, when set, is a source time no later than a routed event
+	// the engine left unstored because the send queue would not take it
+	// (#2537). On start the engine resumes from it, whatever the cursor
+	// says, so the source replays that event and it is routed again.
+	ReplayFrom time.Time `json:"replay_from,omitzero"`
 }
 
 // SaveState writes <name>/state.json atomically (write-temp-rename).

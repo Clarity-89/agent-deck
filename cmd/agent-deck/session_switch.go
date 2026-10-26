@@ -18,7 +18,7 @@ import (
 // the TUI. It never infers an account or harness: both are explicit (an empty
 // value means the target default only where the preview says that is valid).
 func handleSessionSwitch(profile string, args []string) {
-	fs := flag.NewFlagSet("session switch", flag.ExitOnError)
+	fs := flag.NewFlagSet("session switch", flag.ContinueOnError)
 	toHarness := fs.String("to-harness", "", "Target harness (claude, codex, pi, …); empty keeps the source harness")
 	toAccount := fs.String("to-account", "", "Target configured account slot; empty means the target default")
 	maxBytes := fs.Int("max-bytes", session.DefaultHandoffMaxChars, "Maximum transferred context bytes for cross-harness handoff")
@@ -26,6 +26,8 @@ func handleSessionSwitch(profile string, args []string) {
 	confirmContextLoss := fs.Bool("confirm-context-loss", false, "Required for lossy cross-harness transfer after reviewing switch-preview")
 	archiveDestination := fs.Bool("archive-destination", false, "Install the source conversation even when the destination holds a newer or undated copy; the destination copy is archived next to it, never deleted")
 	jsonOutput := fs.Bool("json", false, "Output the switch result as JSON")
+	noSettle := fs.Bool("no-settle", false, "After a native restart, do not run switch-settle (ready, known prompts, plugins, kick, verify)")
+	settleStrict := fs.Bool("settle-strict", false, "Exit 4 (3: stopped at a prompt) when the switch succeeded but the settle did not end healthy")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session switch <id|title> --to-harness <harness> [--to-account <account>]")
@@ -34,42 +36,51 @@ func handleSessionSwitch(profile string, args []string) {
 		fmt.Println("Same-harness native switches are supported where verified; cross-harness directions create fresh targets and wait for native readiness evidence.")
 		fmt.Println("Configured account presence is reported; OAuth authentication is never verified here.")
 		fmt.Println("Pi cross-harness plans use the default account only; named Pi accounts fail explicitly.")
+		fmt.Println("Run from inside the session it targets, the switch is handed to a detached")
+		fmt.Println("agent-deck (the restart ends the calling pane): the command prints that")
+		fmt.Println("process's pid and log file and exits 0; the switch's own result is in the log.")
 		fmt.Println()
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 	if fs.NArg() < 1 {
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 	out := NewCLIOutput(*jsonOutput, false)
-	storage, instances, _, err := loadSessionData(profile)
+	storage, instances, groups, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	inst, errMsg, errCode := ResolveSession(fs.Arg(0), instances)
 	if inst == nil {
 		out.Error(errMsg, errCode)
-		os.Exit(1)
+		exitCLI(1)
+	}
+	// #2897: a native switch stops the pane this process runs in when it
+	// targets the calling session; hand it to a detached child.
+	if handOffIfSelfTarget(out, profile, "switch", args, inst) {
+		return
 	}
 	cfg, cfgErr := session.LoadUserConfig()
 	if cfgErr != nil {
 		out.Error(fmt.Sprintf("load config: %v", cfgErr), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	target := session.SwitchPreviewTarget{Harness: strings.TrimSpace(*toHarness), Account: strings.TrimSpace(*toAccount)}
 	sourceSnapshot := switchSourceSnapshot(inst, instances)
 	preview := session.PreviewSwitchWithMaxBytesAndSnapshot(cfg, inst, target, *maxBytes, &sourceSnapshot)
 	var result *session.HarnessSwitchResult
 	var crossResult *session.CrossHarnessSwitchResult
+	var oldPIDs []int
 	var switchErr error
 	if preview.Execution == session.ExecutionPlanned && preview.Refusal == nil {
 		if !*confirmContextLoss {
 			out.Error("cross-harness transfer is lossy; review `session switch-preview` and repeat with --confirm-context-loss", ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		crossResult, switchErr = session.ExecuteCrossHarnessSwitch(context.Background(), cfg, inst, session.CrossHarnessSwitchOptions{
 			Target: target, MaxBytes: *maxBytes, NoStart: *noStart, SourceSnapshot: &sourceSnapshot,
@@ -80,6 +91,9 @@ func handleSessionSwitch(profile string, args []string) {
 			SourceOwnership: switchSourceOwnershipValidator(storage),
 		})
 	} else {
+		if !*noStart && !*noSettle {
+			oldPIDs = session.SnapshotPaneProcesses(inst)
+		}
 		result, switchErr = session.ExecuteHarnessSwitch(cfg, inst, session.HarnessSwitchOptions{
 			Target: target, MaxBytes: *maxBytes, NoStart: *noStart,
 			Storage: storage, ArchiveDestination: *archiveDestination,
@@ -90,7 +104,7 @@ func handleSessionSwitch(profile string, args []string) {
 			switchErr = fmt.Errorf("switch failed without a result")
 		}
 		out.Error(switchErr.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if switchErr != nil {
 		// A normal lack of readiness remains pending. A journal failure after a
@@ -132,7 +146,7 @@ func handleSessionSwitch(profile string, args []string) {
 				fmt.Fprintf(os.Stderr, "warning: persist native switch recovery failed: %v\n", saveErr)
 			}
 		}
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if crossResult != nil {
 		payload := crossHarnessSuccessPayload(inst, crossResult)
@@ -147,9 +161,20 @@ func handleSessionSwitch(profile string, args []string) {
 	}
 	if err := storage.CommitNativeHarnessSwitch(inst, result); err != nil {
 		out.Error(fmt.Sprintf("save switched session: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
+	var settle *session.SettleReport
+	var settleErr error
+	if result.Restarted && !*noSettle && result.OldAccount != result.NewAccount && session.IsClaudeCompatible(inst.Tool) {
+		settle, settleErr = settleAfterSwitch(inst, *jsonOutput, oldPIDs, func() error { return saveSessionData(storage, instances, groups) })
+	}
+	defer func() {
+		if code := switchSettleExit(*settleStrict, settle, settleErr); code != 0 {
+			exitCLI(code)
+		}
+	}()
 	payload := map[string]any{
+		"settle":  settle,
 		"success": result.Committed && result.DestinationReady, "status": switchPresentationStatus(result.Committed, result.DestinationReady), "pending": result.Committed && !result.DestinationReady,
 		"id": inst.ID, "title": inst.Title,
 		"old_tool": result.OldTool, "new_tool": result.NewTool,
@@ -171,6 +196,9 @@ func handleSessionSwitch(profile string, args []string) {
 	fmt.Printf("Switch %s: %s/%q -> %s/%q (%s); status=%s; readiness=%s\n", inst.Title, result.OldTool, result.OldAccount, result.NewTool, result.NewAccount, result.Continuity, status, readinessPresentation(result.DestinationReady))
 	if len(result.LossDisclosure) > 0 {
 		fmt.Printf("Not preserved: %s\n", strings.Join(result.LossDisclosure, "; "))
+	}
+	if settle != nil {
+		fmt.Println(settle.Receipt())
 	}
 }
 
@@ -222,7 +250,7 @@ func switchSourceSnapshot(inst *session.Instance, instances []*session.Instance)
 				managementUnknown = true
 			} else {
 				for _, client := range clients {
-					if client.Conductor == inst.ID || client.Conductor == inst.Title || session.ConductorSessionTitle(client.Conductor) == inst.Title {
+					if client.Conductor == inst.ID || client.Conductor == inst.Title || session.ConductorSessionTitle(client.Conductor) == inst.Title || inst.IsConductorNamed(client.Conductor, inst.Title) {
 						watcherTarget = true
 						break
 					}

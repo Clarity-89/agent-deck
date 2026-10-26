@@ -77,6 +77,11 @@ type HarnessSwitchResult struct {
 	nativeTarget                 switchIdentity
 	nativeJournalPath            string
 	nativeStorageAcknowledgement bool
+	// nativeRevert marks the storage CAS that undoes a committed switch whose
+	// target failed to start; nativeRevertLimit is the verdict-reset and
+	// intent state the forward commit replaced, written back with it.
+	nativeRevert      bool
+	nativeRevertLimit limitSwitchState
 }
 
 var ErrSwitchBusy = errors.New("session switch already in progress")
@@ -317,13 +322,15 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 		}
 		return switchFailedNative(journalPath, j, err)
 	}
+	sharedRoot := ""
 	if choice != nil {
 		sourcePath, sourceHash = choice.Chosen.Path, choice.Chosen.SHA256
+		sharedRoot = choice.SharedProjectsRoot
 	}
 	if sourcePath != "" {
 		j.SourcePath, j.SourceSHA256 = sourcePath, sourceHash
 	}
-	if j.StageDir == "" {
+	if j.StageDir == "" && sharedRoot == "" {
 		stageRoot, err := switchStageRoot(inst.ID)
 		if err != nil {
 			return nil, err
@@ -336,7 +343,7 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 			return nil, fmt.Errorf("create switch staging directory: %w", err)
 		}
 	}
-	if sourcePath != "" {
+	if sourcePath != "" && sharedRoot == "" {
 		stagePath := filepath.Join(j.StageDir, filepath.Base(sourcePath))
 		if _, err := os.Stat(stagePath); os.IsNotExist(err) {
 			if err := copyFileVerified(sourcePath, stagePath); err != nil {
@@ -371,11 +378,30 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 			return switchFailedNative(journalPath, j, fmt.Errorf("stop source before install: %w", err))
 		}
 	}
+	if sharedRoot != "" {
+		// A stop may flush the transcript or an operator may rebind projects.
+		// Re-read the exact shared store, but never stage, install or archive it.
+		finalChoice, selectErr := selectSwitchTranscript(inst, sourceDir, targetDir, opts.ArchiveDestination)
+		if selectErr != nil {
+			return switchFailedAfterStop(journalPath, j, inst, wasRunning, fmt.Errorf("final shared source export failed: %w", selectErr))
+		}
+		if finalChoice == nil || finalChoice.SharedProjectsRoot != sharedRoot ||
+			!os.SameFile(choice.sharedProjectsInfo, finalChoice.sharedProjectsInfo) {
+			return switchFailedAfterStop(journalPath, j, inst, wasRunning, fmt.Errorf("shared transcript store changed during account switch"))
+		}
+		choice = finalChoice
+		sourcePath, sourceHash = choice.Chosen.Path, choice.Chosen.SHA256
+		j.SourcePath, j.SourceSHA256, j.Destination = sourcePath, sourceHash, sourcePath
+		j.State = switchInstalled
+		if err := writeSwitchJournal(journalPath, j); err != nil {
+			return switchFailedAfterStop(journalPath, j, inst, wasRunning, err)
+		}
+	}
 	// KillAndWait flushes the source and confirms the old pane is gone. The
 	// provisional pre-copy above is only a rollback snapshot: select and stage
 	// the final bytes now, before installing anything. A changed identity is a
 	// failure, never permission to fall back to an mtime scan.
-	if sourcePath != "" {
+	if sourcePath != "" && sharedRoot == "" {
 		finalChoice, selectErr := selectSwitchTranscript(inst, sourceDir, targetDir, opts.ArchiveDestination)
 		if selectErr != nil {
 			return switchFailedAfterStop(journalPath, j, inst, wasRunning, fmt.Errorf("final source export failed: %w", selectErr))
@@ -457,10 +483,18 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 			return switchFailedAfterStop(journalPath, j, inst, wasRunning, err)
 		}
 	}
-	if trustErr := PreAcceptClaudeTrust(filepath.Join(targetDir, ".claude.json"), inst.EffectiveWorkingDir()); trustErr != nil {
-		j.Failure = "folder trust pre-seed: " + trustErr.Error()
+	// The target account has its own trust list and onboarding state; seed
+	// them so the restarted session meets no first-start prompt. A failure is
+	// a visible warning, and settle answers the prompt instead.
+	if _, seedErr := PreseedClaudeFirstStart(sourceDir, targetDir, inst.EffectiveWorkingDir(), SessionRunsBypass(inst, cfg)); seedErr != nil {
+		j.Failure = "folder trust pre-seed: " + seedErr.Error()
+		warnings = append(warnings, "folder trust pre-seed failed: "+seedErr.Error())
 	}
+	// A conductor's channel plugin state (bot token) must follow it to the new
+	// account before the target starts; link or point only, never copy.
+	warnings = append(warnings, carryConductorChannelState(inst, sourceDir, targetDir)...)
 	oldAccount := inst.Account
+	prevLimit := captureLimitSwitchState(inst)
 	storageAcknowledged, err := commitNativeSwitchAccount(journalPath, j, inst, preview.TargetAccount, wasRunning, opts.Storage)
 	if err != nil {
 		return nil, err
@@ -468,7 +502,11 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 
 	migrated := "conversation migrated"
 	if choice != nil {
-		migrated += ": " + choice.Summary()
+		if sharedRoot != "" {
+			migrated = choice.Summary()
+		} else {
+			migrated += ": " + choice.Summary()
+		}
 	}
 	conversation := migrated + "; native destination readiness has not yet been asserted"
 	if sourcePath == "" {
@@ -478,10 +516,19 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 	result.nativeJournalPath = journalPath
 	result.nativeStorageAcknowledgement = storageAcknowledged
 	if !opts.NoStart && wasRunning {
-		if err := startNativeSwitchInstance(inst); err != nil {
+		if err := startNativeSwitchInstance(inst); err != nil && nativeSwitchLiveOnAccount(inst, targetDir) {
+			// The start reported an error, yet this session's Claude is
+			// running on the target account (its pane came up anyway, e.g.
+			// re-created concurrently between stop and start). Rolling back
+			// now would record the source account while Claude keeps running
+			// on the target, the split seen in the field. Keep the switch.
+			result.Restarted = true
+			result.Warnings = append(result.Warnings, fmt.Sprintf("target start reported %v, but the session is running on account %q; switch kept", err, preview.TargetAccount))
+			result.Conversation = migrated + "; target start reported an error, but the session runs on the target account"
+		} else if err != nil {
 			result.Committed = false
 			inst.Account = oldAccount
-			if restoreErr := revertNativeSwitchStorage(opts.Storage, inst, storageAcknowledged, j.Target, j.Source); restoreErr != nil {
+			if restoreErr := revertNativeSwitchStorage(opts.Storage, inst, storageAcknowledged, j.Target, j.Source, prevLimit); restoreErr != nil {
 				j.Failure = fmt.Sprintf("target start failed: %v; persisted account restore failed: %v", err, restoreErr)
 			} else if restartErr := startNativeSwitchInstance(inst); restartErr != nil {
 				j.Failure = fmt.Sprintf("target start failed: %v; source rollback failed: %v", err, restartErr)
@@ -491,13 +538,14 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 			j.State, j.UpdatedAt = switchFailed, time.Now()
 			_ = writeSwitchJournal(journalPath, j)
 			return result, fmt.Errorf("target Claude session failed to start: %w", err)
+		} else {
+			// Start only requests a tmux launch; it is not native readiness
+			// evidence. Native account switches have no observer wired into this
+			// transaction, so keep readiness explicitly pending rather than
+			// inferring it from mutable fields or Start success.
+			result.Restarted = true
+			result.Conversation = migrated + "; target start requested; native destination readiness remains pending"
 		}
-		// Start only requests a tmux launch; it is not native readiness
-		// evidence. Native account switches have no observer wired into this
-		// transaction, so keep readiness explicitly pending rather than
-		// inferring it from mutable fields or Start success.
-		result.Restarted = true
-		result.Conversation = migrated + "; target start requested; native destination readiness remains pending"
 	}
 	// The lifecycle journal remains committed until the caller's scoped storage
 	// CAS succeeds and completeNativeHarnessSwitchJournal durably acknowledges
@@ -622,6 +670,7 @@ func executeNativeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 	}
 	oldAccount := inst.Account
 	oldIdentity := identityForInstance(inst)
+	prevLimit := captureLimitSwitchState(inst)
 	storageAcknowledged, err := commitNativeSwitchAccount(journalPath, j, inst, preview.TargetAccount, wasRunning, opts.Storage)
 	if err != nil {
 		return nil, err
@@ -633,7 +682,7 @@ func executeNativeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 		if err := startNativeSwitchInstance(inst); err != nil {
 			result.Committed = false
 			restoreSwitchIdentity(inst, oldIdentity, oldIdentity.Command)
-			storageErr := revertNativeSwitchStorage(opts.Storage, inst, storageAcknowledged, j.Target, j.Source)
+			storageErr := revertNativeSwitchStorage(opts.Storage, inst, storageAcknowledged, j.Target, j.Source, prevLimit)
 			var rollbackErr error
 			if storageErr == nil {
 				rollbackErr = startNativeSwitchInstance(inst)
@@ -802,6 +851,7 @@ func executeClaudeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 var (
 	nativeSwitchStart         = func(inst *Instance) error { return inst.Start() }
 	nativeSwitchRunning       = func(inst *Instance) bool { return inst.Exists() }
+	nativeSwitchLiveOnAccount = liveOnAccount
 	nativeSwitchStop          = func(inst *Instance) error { return inst.KillAndWait() }
 	harnessSwitchJournalWrite = writeSwitchJournal
 )
@@ -852,11 +902,11 @@ func commitNativeSwitchAccount(path string, j *switchJournal, inst *Instance, ac
 // identity restored by the caller never diverges from what storage durably
 // holds. It is a no-op when storage was never written (storageAcknowledged is
 // false, e.g. Storage was nil).
-func revertNativeSwitchStorage(storage *Storage, inst *Instance, storageAcknowledged bool, committed, restored switchIdentity) error {
+func revertNativeSwitchStorage(storage *Storage, inst *Instance, storageAcknowledged bool, committed, restored switchIdentity, prevLimit limitSwitchState) error {
 	if !storageAcknowledged || storage == nil {
 		return nil
 	}
-	stub := nativeHarnessSwitchResult(&HarnessSwitchResult{Committed: true}, committed, restored)
+	stub := nativeHarnessSwitchResult(&HarnessSwitchResult{Committed: true, nativeRevert: true, nativeRevertLimit: prevLimit}, committed, restored)
 	return storage.CommitNativeHarnessSwitch(inst, stub)
 }
 

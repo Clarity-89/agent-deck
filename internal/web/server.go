@@ -38,7 +38,10 @@ type Config struct {
 	// ConfirmLinkOpen gates the web terminal's link-open confirm for hosts
 	// that are NOT trusted. nil means "confirm" — the safe default, so a
 	// Config built without this field never silently disables the prompt.
-	ConfirmLinkOpen     *bool
+	ConfirmLinkOpen *bool
+	// FileLinkRoots are the absolute `[web] file_link_roots` directories
+	// GET /api/files may read (issue #2676). Empty turns the route off.
+	FileLinkRoots       []string
 	MenuData            MenuDataLoader
 	PushVAPIDPublicKey  string
 	PushVAPIDPrivateKey string
@@ -53,128 +56,6 @@ func (c Config) confirmLinkOpen() bool {
 	return c.ConfirmLinkOpen == nil || *c.ConfirmLinkOpen
 }
 
-// DefaultUndoWindow is the default Chrome-style undo grace period for
-// session deletes (POST /api/sessions/undelete). Mirrors the TUI ctrl+z
-// in-memory undo stack window.
-const DefaultUndoWindow = 30 * time.Second
-
-// ErrUndoNothing is returned by SessionMutator.UndoDelete when the undo
-// stack is empty.
-var ErrUndoNothing = errors.New("nothing to undo")
-
-// ErrUndoExpired is returned by SessionMutator.UndoDelete when the most
-// recent delete is older than the configured undo window.
-var ErrUndoExpired = errors.New("undo window expired")
-
-// ErrSessionNotFound is returned by SessionMutator.FinishWorktree when the
-// target session id does not resolve to a live instance. The handler maps
-// this to 404. See issue #1126.
-var ErrSessionNotFound = errors.New("session not found")
-
-// ErrGroupNotFound is returned by SessionMutator.SetGroupExpanded when the
-// path does not resolve to a group. The handler maps this to 404. A stale
-// browser tab can easily PATCH a group the TUI has since deleted, and a
-// silent no-op there would leave the sidebar asserting a collapse that was
-// never stored.
-var ErrGroupNotFound = errors.New("group not found")
-
-// ErrNotAWorktree is returned by SessionMutator.FinishWorktree when the
-// target session exists but is not in a git/jujutsu worktree (so there is
-// nothing to merge or clean up). The handler maps this to 400. See issue
-// #1126.
-var ErrNotAWorktree = errors.New("session is not in a worktree")
-
-// WorktreeFinishOptions configures a SessionMutator.FinishWorktree call.
-// All fields are optional; the zero value asks the implementation to
-// auto-detect the target branch, perform the merge, delete the source
-// branch, and refuse if the worktree is dirty.
-type WorktreeFinishOptions struct {
-	// Into is the target branch to merge the worktree branch into. When
-	// empty the backend's default branch is used (matches the
-	// `agent-deck worktree finish --into` flag).
-	Into string
-	// NoMerge skips the merge step (mirrors --no-merge). The branch is
-	// still removed (unless KeepBranch) and the worktree torn down.
-	NoMerge bool
-	// KeepBranch leaves the source branch in place after finishing
-	// (mirrors --keep-branch). Useful when the branch already lives on a
-	// remote PR.
-	KeepBranch bool
-	// Force skips the dirty-worktree safety check and forces branch
-	// deletion even if the merge fast-forward didn't succeed.
-	Force bool
-}
-
-// WorktreeFinishResult is what SessionMutator.FinishWorktree returns on
-// success. Mirrors the JSON-output payload of `agent-deck worktree finish
-// --json`.
-type WorktreeFinishResult struct {
-	SessionID     string
-	Branch        string
-	MergedInto    string
-	Merged        bool
-	BranchDeleted bool
-}
-
-// MenuDataLoader provides menu snapshots for web APIs and push notifications.
-type MenuDataLoader interface {
-	LoadMenuSnapshot() (*MenuSnapshot, error)
-}
-
-// SessionMutator is implemented by internal/ui.WebMutator and injected at startup.
-// It bridges web HTTP handlers to the TUI session/group management methods.
-type SessionMutator interface {
-	CreateSession(title, tool, projectPath, groupPath, modelID, reasoningEffort string) (string, error)
-	StartSession(sessionID string) error
-	StopSession(sessionID string) error
-	RestartSession(sessionID string) error
-	DeleteSession(sessionID string) error
-	// CloseSession stops the session process while keeping its metadata
-	// in storage (TUI Shift+D — non-destructive close).
-	CloseSession(sessionID string) error
-	ArchiveSession(sessionID string) error
-	UnarchiveSession(sessionID string) error
-	ForkSession(sessionID string) (string, error)
-	// UndoDelete restores the most-recently deleted session if it was
-	// deleted within the implementation's undo window. Returns the
-	// restored session id. Implementations should return ErrUndoNothing
-	// when the stack is empty and ErrUndoExpired when the most recent
-	// entry is older than the window — the handler maps both to 404.
-	UndoDelete() (string, error)
-	// UpdateSession applies one or more field edits to a session. updates maps
-	// session.Field* constants (raw strings — see internal/session/mutators.go)
-	// to their string-encoded new values; bools are "true"/"false". Returns the
-	// list of fields that actually changed (a no-op subset is permitted; only
-	// fields whose new value differs from the stored value are reported) and
-	// whether any updated field requires a restart to take effect. Validation
-	// errors (unknown field, invalid value) leave the session unchanged.
-	UpdateSession(sessionID string, updates map[string]string) (updatedFields []string, restartRequired bool, err error)
-	CreateGroup(name, parentPath string) (string, error)
-	RenameGroup(groupPath, newName string) error
-	// MoveSessionToGroup moves a session to another group with the
-	// `agent-deck group move` semantics (see session.GroupTree.
-	// ResolveMoveTargetGroup): "" or "root" is the default group, and a
-	// missing group is created. Returns the group path the session landed in
-	// and whether its resolved Claude config dir changed, which only takes
-	// effect on the next restart (no conversation migration, like the CLI).
-	// Returns ErrSessionNotFound when the id doesn't resolve. See issue #2368.
-	MoveSessionToGroup(sessionID, groupPath string) (movedTo string, restartRequired bool, err error)
-	DeleteGroup(groupPath string) error
-	// SetGroupExpanded persists a group's collapsed/expanded state, the same
-	// flag the TUI writes on its Enter/Tab toggle (home.go saveGroupState ->
-	// Storage.SaveGroupsOnly). The web sidebar keeps its own collapse state,
-	// so without this the two views drift apart permanently. Returns
-	// ErrGroupNotFound when the path does not resolve to a group.
-	SetGroupExpanded(groupPath string, expanded bool) error
-	// FinishWorktree merges (or skips), removes the worktree, optionally
-	// deletes the source branch, kills the tmux session, and removes the
-	// session from storage. Mirrors the TUI W/shift+w hotkey and the
-	// `agent-deck worktree finish` CLI. Returns ErrSessionNotFound when
-	// the id doesn't resolve and ErrNotAWorktree when the session exists
-	// but lacks worktree metadata. See issue #1126.
-	FinishWorktree(sessionID string, opts WorktreeFinishOptions) (WorktreeFinishResult, error)
-}
-
 // Server wraps an HTTP server for Agent Deck web mode.
 type Server struct {
 	cfg         Config
@@ -184,6 +65,7 @@ type Server struct {
 	baseCtx     context.Context
 	cancelBase  context.CancelFunc
 	hookWatcher *session.StatusFileWatcher
+	onListening func()
 
 	menuSubscribersMu sync.Mutex
 	menuSubscribers   map[chan struct{}]struct{}
@@ -292,6 +174,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/groups", s.handleGroupsCollection)
 	mux.HandleFunc("/api/groups/", s.handleGroupByPath)
 	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/path-suggestions", s.handlePathSuggestions)
 	mux.HandleFunc("/api/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/push/config", s.handlePushConfig)
 	mux.HandleFunc("/api/push/subscribe", s.handlePushSubscribe)
@@ -327,6 +210,12 @@ func (s *Server) Handler() http.Handler {
 	return s.httpServer.Handler
 }
 
+// SetOnListening sets fn to run once Start has bound the listen address,
+// before it serves requests. It is not called when binding fails.
+func (s *Server) SetOnListening(fn func()) {
+	s.onListening = fn
+}
+
 // Start starts the HTTP server and blocks until shutdown or error.
 // Returns nil on graceful shutdown.
 func (s *Server) Start() error {
@@ -338,6 +227,9 @@ func (s *Server) Start() error {
 	if s.remoteFleet != nil {
 		s.remoteFleet.Start(s.baseCtx)
 	}
+	// Probe CLIs for model lists in the background, so /api/settings never
+	// waits on one (#2664).
+	session.WarmModelCatalog()
 
 	webLog := logging.ForComponent(logging.CompWeb)
 	if watcher, err := session.NewStatusFileWatcher(func() {
@@ -355,7 +247,7 @@ func (s *Server) Start() error {
 	if s.push != nil {
 		s.push.Start(s.baseCtx)
 	}
-	err := s.httpServer.ListenAndServe()
+	err := s.listenAndServe()
 	if s.hookWatcher != nil {
 		s.hookWatcher.Stop()
 		s.hookWatcher = nil
@@ -372,8 +264,56 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Shutdown gracefully stops the server.
+// listenAndServe is http.Server.ListenAndServe with the onListening hook
+// between binding and serving.
+func (s *Server) listenAndServe() error {
+	addr := s.httpServer.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	if s.onListening != nil {
+		s.onListening()
+	}
+	return s.httpServer.Serve(ln)
+}
+
+// pendingDeleteFinalizer is implemented by a mutator whose deletes stay
+// undoable for a while (ui.WebMutator): once the server stops they can no
+// longer be undone, so Shutdown finalizes them.
+type pendingDeleteFinalizer interface {
+	FinalizePendingDeletes()
+}
+
+// pendingDeleteFinalizeTimeout caps the undoable-delete sweep in Shutdown:
+// an inbox file under lock contention can hold it for seconds, and whatever
+// is not swept by then keeps its pending record for the next start's
+// reconcile.
+var pendingDeleteFinalizeTimeout = 5 * time.Second
+
+// finalizePendingDeletesBounded runs f.FinalizePendingDeletes and waits at
+// most timeout for it.
+func finalizePendingDeletesBounded(f pendingDeleteFinalizer, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.FinalizePendingDeletes()
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
+// Shutdown gracefully stops the server. Deletes still undoable through the
+// mutator are finalized once the listener is down.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if f, ok := s.mutator.(pendingDeleteFinalizer); ok {
+		defer finalizePendingDeletesBounded(f, pendingDeleteFinalizeTimeout)
+	}
 	if s.cancelBase != nil {
 		// Signal long-lived handlers (SSE/WS) to stop promptly.
 		s.cancelBase()

@@ -407,6 +407,24 @@ press esc to exit cancel`,
 press enter to send the message`,
 			expected: false,
 		},
+		{
+			name: "fresh home screen logo with idle prompt",
+			content: `█▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█
+█  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀
+▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀
+┃ Ask anything… "Fix a TODO in the codebase"`,
+			expected: false,
+		},
+		{
+			name:     "static pulse character with question prompt",
+			content:  "░ Progress: 100%\nenter submit     esc dismiss",
+			expected: false,
+		},
+		{
+			name:     "busy interrupt hint overrides idle prompt",
+			content:  "┃ Ask anything\n█\nesc interrupt",
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -610,8 +628,8 @@ func TestDetectToolKeepsRecognizedRuntimeWhenPaneCommandIsChildTool(t *testing.T
 	}
 }
 
-// Same guard for the content fallback: an unrecognized foreground command must
-// not open the door for conversation text to relabel a recognized runtime.
+// An unrecognized foreground command must not open the door for conversation
+// text to relabel a recognized runtime. Pane text is not a detection input.
 func TestDetectToolKeepsRecognizedRuntimeWhenContentMentionsOtherTool(t *testing.T) {
 	sess := NewSession("tool-detection-child-shell", "/tmp")
 	sess.Command = "shell"
@@ -624,6 +642,114 @@ func TestDetectToolKeepsRecognizedRuntimeWhenContentMentionsOtherTool(t *testing
 
 	if got := sess.DetectTool(); got != "claude" {
 		t.Fatalf("DetectTool() = %q, want %q when pane content merely mentions another tool", got, "claude")
+	}
+}
+
+func TestDetectToolDoesNotPromoteScreenText(t *testing.T) {
+	for _, command := range []string{"zsh", "nvim", "node", ""} {
+		for _, content := range []string{
+			"Gemini API key; OpenCode is running inside Neovim",
+			"OpenAI GPT model",
+			"codex --help",
+			"Welcome to Claude Code!",
+		} {
+			t.Run(command+"/"+content, func(t *testing.T) {
+				sess := NewSession("tool-detection-screen-text", "/tmp")
+				sess.Command = "shell"
+				sess.cacheContent = content
+				sess.cacheTime = time.Now()
+				seedPaneCommand(t, sess.Name, command)
+
+				if got := sess.DetectTool(); got != "shell" {
+					t.Fatalf("DetectTool() = %q, want shell for foreground %q and incidental text %q", got, command, content)
+				}
+				if got := sess.ForceDetectTool(); got != "shell" {
+					t.Fatalf("ForceDetectTool() = %q, want shell", got)
+				}
+			})
+		}
+	}
+}
+
+func TestDetectToolWithoutPaneInfoDoesNotPromoteScreenText(t *testing.T) {
+	sess := NewSession("tool-detection-no-pane-info", "/tmp")
+	sess.Command = "shell"
+	sess.cacheContent = "Gemini OpenAI Codex OpenCode Claude Code"
+	sess.cacheTime = time.Now()
+	seedPaneCommand(t, "another-session", "gemini")
+
+	if got := sess.DetectTool(); got != "shell" {
+		t.Fatalf("DetectTool() = %q, want shell without process evidence", got)
+	}
+}
+
+func TestDetectToolPreservesConfiguredIdentityOverScreenText(t *testing.T) {
+	for _, tool := range []string{"claude", "gemini", "opencode", "codex"} {
+		t.Run(tool, func(t *testing.T) {
+			sess := NewSession("tool-detection-configured", "/tmp")
+			sess.Command = tool
+			sess.cacheContent = "Gemini OpenAI Codex OpenCode Claude Code"
+			sess.cacheTime = time.Now()
+			seedPaneCommand(t, sess.Name, "nvim")
+
+			if got := sess.DetectTool(); got != tool {
+				t.Fatalf("DetectTool() = %q, want configured tool %q", got, tool)
+			}
+		})
+	}
+}
+
+func TestDetectToolDoesNotPromoteLiveShellOutput(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	sess := NewSession("tool-detection-live-output", t.TempDir())
+	sess.Command = "shell"
+	sess.SocketName = fmt.Sprintf("agentdeck-detection-test-%d", time.Now().UnixNano())
+	output, err := exec.Command("tmux", "-L", sess.SocketName, "-f", "/dev/null",
+		"new-session", "-d", "-s", sess.Name,
+		"printf 'Gemini OpenAI Codex OpenCode Claude Code\\n'; exec sleep 60").CombinedOutput()
+	if err != nil {
+		t.Fatalf("create isolated tmux server: %v: %s", err, output)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-L", sess.SocketName, "kill-server").Run()
+	})
+
+	// Read a real pane, not the content cache used by the unit tests above.
+	deadline := time.Now().Add(5 * time.Second)
+	var content string
+	for time.Now().Before(deadline) {
+		output, err = exec.Command("tmux", "-L", sess.SocketName,
+			"capture-pane", "-p", "-t", sess.Name).CombinedOutput()
+		if err != nil {
+			t.Fatalf("capture isolated pane: %v: %s", err, output)
+		}
+		content = string(output)
+		if strings.Contains(content, "Gemini OpenAI Codex OpenCode Claude Code") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.Contains(t, content, "Gemini OpenAI Codex OpenCode Claude Code")
+	seedPaneCommand(t, "another-session", "") // no process-cache entry for this pane
+	got := sess.DetectTool()
+	t.Logf("live pane output: %q; detected tool: %s", strings.TrimSpace(content), got)
+	if got != "shell" {
+		t.Fatalf("DetectTool() = %q, want shell for incidental live output", got)
+	}
+}
+
+func BenchmarkDetectToolIgnoresScreenText(b *testing.B) {
+	sess := NewSession("tool-detection-benchmark", "/tmp")
+	sess.Command = "shell"
+	sess.cacheContent = "Gemini OpenAI Codex OpenCode Claude Code"
+	sess.cacheTime = time.Now().Add(time.Hour)
+	sess.toolDetectExpiry = 0
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sess.detectedTool = ""
+		sess.DetectTool()
 	}
 }
 
@@ -656,65 +782,6 @@ func TestDetectToolFromCommand(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := detectToolFromCommand(tt.command); got != tt.want {
 				t.Fatalf("detectToolFromCommand(%q) = %q, want %q", tt.command, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestDetectToolFromContentClaudeRegression(t *testing.T) {
-	tests := []struct {
-		name    string
-		content string
-		want    string
-	}{
-		{
-			name: "path containing claude should stay shell",
-			content: `user@host:/Users/test/claude-deck$ 
-$ `,
-			want: "shell",
-		},
-		{
-			name: "claude banner detects claude",
-			content: `Welcome to Claude Code!
-Do you trust the files in this folder?`,
-			want: "claude",
-		},
-		{
-			name: "claude permission prompt detects claude",
-			content: `No, and tell Claude what to do differently
-Yes, allow once`,
-			want: "claude",
-		},
-		{
-			name: "pi prompt detects pi",
-			content: `Welcome to Pi CLI
-pi> `,
-			want: "pi",
-		},
-		{
-			name: "omp busy marker detects omp",
-			content: `╭──     Sonnet 5 · high   my-session   2.4%/1M  (sub) ────────────────────────╮
-╰─                                                                              ─╯
- ⠋ Working… ⟨esc⟩`,
-			want: "omp",
-		},
-		{
-			name: "omp approval dialog detects omp",
-			content: ` Allow tool: bash
- Command: echo hi
-
-  Approve
-   Deny
-
- up/down navigate  enter select  esc cancel`,
-			want: "omp",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := detectToolFromContent(tt.content); got != tt.want {
-				t.Fatalf("detectToolFromContent(%q) = %q, want %q", tt.name, got, tt.want)
 			}
 		})
 	}
@@ -1218,21 +1285,6 @@ func TestUserTypingInsideSession(t *testing.T) {
 		t.Fatalf("Step 6: Expected idle (acknowledged), got %s", status)
 	}
 	t.Log("User acknowledged, session idle (GRAY)")
-}
-
-// TestStatusStrings verifies the status string mapping
-func TestStatusStrings(t *testing.T) {
-	// These are the status strings returned by GetStatus()
-	validStatuses := map[string]string{
-		"active":   "GREEN - content changing",
-		"waiting":  "YELLOW - needs attention",
-		"idle":     "GRAY - acknowledged",
-		"inactive": "Session doesn't exist",
-	}
-
-	for status, description := range validStatuses {
-		t.Logf("Status '%s' = %s", status, description)
-	}
 }
 
 // TestReconnectSessionHasStateTracker verifies reconnected sessions work correctly
@@ -1989,23 +2041,12 @@ Thinking… (46s · 1234 tokens · esc to interrupt)
 	newNormalized := session.normalizeContent(contentAt46s)
 	newHash := session.hashContent(newNormalized)
 
-	// BUG: The hashes are different because time counter changed
-	hashesMatch := session.stateTracker.lastHash == newHash
-
-	t.Logf("Content at 45s hash: %s", session.stateTracker.lastHash[:16])
-	t.Logf("Content at 46s hash: %s", newHash[:16])
-	t.Logf("Hashes match: %v", hashesMatch)
-
-	// This test documents the BUG - hashes should match after normalization
-	// but currently they don't because we don't strip time counters
-	if !hashesMatch {
-		t.Log("BUG CONFIRMED: Dynamic time counter causes hash change")
-		t.Log("OLD normalized (last 100 chars):", truncateEnd(oldNormalized, 100))
-		t.Log("NEW normalized (last 100 chars):", truncateEnd(newNormalized, 100))
+	// The time counter ticking from 45s to 46s must not change the hash,
+	// or the status light flickers to GREEN every second.
+	if session.stateTracker.lastHash != newHash {
+		t.Fatalf("time counter tick changed the normalized hash\nold: %s\nnew: %s",
+			truncateEnd(oldNormalized, 100), truncateEnd(newNormalized, 100))
 	}
-
-	// The fix should make these hashes equal
-	// assert.True(t, hashesMatch, "After normalization, time counters should be stripped")
 }
 
 // TestNormalizeShouldStripTimeCounters verifies normalization strips dynamic content
@@ -2034,11 +2075,13 @@ func TestNormalizeShouldStripTimeCounters(t *testing.T) {
 			description: "Token counts should be stripped",
 		},
 		{
+			// Only the agent's status counter "(Ns · ... tokens)" is
+			// normalized. A duration elsewhere is pane content.
 			name:        "Standalone time",
 			content1:    "Last updated: 45s ago",
 			content2:    "Last updated: 46s ago",
-			shouldMatch: true,
-			description: "Standalone time indicators should be stripped",
+			shouldMatch: false,
+			description: "A duration outside the status counter is real content",
 		},
 		{
 			name:        "Actual content change - should NOT match",
@@ -2086,7 +2129,7 @@ func TestNormalizeShouldStripTimeCounters(t *testing.T) {
 			t.Logf("Hashes match: %v (expected: %v)", hashesMatch, tt.shouldMatch)
 
 			if tt.shouldMatch && !hashesMatch {
-				t.Logf("BUG: %s - hashes should match but don't", tt.description)
+				t.Errorf("%s - hashes should match but don't", tt.description)
 			}
 			if !tt.shouldMatch && hashesMatch {
 				t.Errorf("ERROR: %s - hashes should NOT match", tt.description)
@@ -2178,36 +2221,6 @@ func TestFlickeringScenarioEndToEnd(t *testing.T) {
 		t.Logf("Step 4: Status=%s (back to waiting after cooldown)", status4)
 		t.Log("Result: YELLOW → GREEN (flicker) → YELLOW")
 	}
-}
-
-// TestAcknowledgedShouldNotResetOnDynamicContent tests that acknowledged
-// flag should NOT be reset when only dynamic content changes
-func TestAcknowledgedShouldNotResetOnDynamicContent(t *testing.T) {
-	session := NewSession("ack-test", "/tmp")
-
-	// User has acknowledged (seen) this session
-	session.stateTracker = &StateTracker{
-		lastHash:       "hash1",
-		lastChangeTime: time.Now().Add(-10 * time.Second),
-		acknowledged:   true, // User has seen this
-	}
-
-	// Current behavior: ANY hash change resets acknowledged
-	// This is problematic because time counters cause hash changes
-
-	// Simulate time counter change
-	newContent := "Some content (46s · 100 tokens)"
-	_ = newContent // Would be used in actual GetStatus
-
-	// Document the current behavior (BUG):
-	// - If hash changes, acknowledged is set to false
-	// - This means dynamic content causes status to cycle:
-	//   IDLE (gray) → ACTIVE (green) → WAITING (yellow)
-
-	t.Log("Current behavior: acknowledged resets on ANY content change")
-	t.Log("Desired behavior: acknowledged should only reset on MEANINGFUL content changes")
-	t.Log("Option 1: Strip dynamic content from hash calculation")
-	t.Log("Option 2: Don't reset acknowledged if only dynamic content changed")
 }
 
 // truncateEnd returns the last n characters of a string
@@ -3412,9 +3425,16 @@ func TestKillSessionsWithEnvValue(t *testing.T) {
 	assert.Error(t, exec.Command("tmux", "has-session", "-t", sess2).Run(), "duplicate session should have been killed")
 }
 
+// An empty id must never match: a session whose variable is set but empty
+// (or a caller that has no id yet) would otherwise be killed as a "duplicate".
 func TestKillSessionsWithEnvValue_EmptyID(t *testing.T) {
-	// Should be a no-op when envValue is empty
-	KillSessionsWithEnvValue("CLAUDE_SESSION_ID", "", "anything")
+	sess := createTestSessionStrict(t, "dedup-emptyid")
+	require.NoError(t, exec.Command("tmux", "set-environment", "-t", sess, "CLAUDE_SESSION_ID", "").Run())
+
+	KillSessionsWithEnvValue("CLAUDE_SESSION_ID", "", "")
+
+	assert.NoError(t, exec.Command("tmux", "has-session", "-t", sess).Run(),
+		"an empty id killed a session whose CLAUDE_SESSION_ID is empty")
 }
 
 func TestKillSessionsWithEnvValue_NoMatch(t *testing.T) {

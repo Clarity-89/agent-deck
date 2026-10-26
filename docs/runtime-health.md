@@ -21,7 +21,7 @@ Each process is identified by role, PID and start time, so PID reuse does not me
 
 Each sample carries `binary_version`, the running binary's version string, alongside the record schema `version`, so a mixed deck (e.g. a partially updated remote) is visible in `health --json` and `doctor` rather than silently mixed into one series. Samples written before this field existed simply omit it; it decodes as empty, never a fabricated value.
 
-Default budgets are status pass under 250 ms, fewer than 512 open descriptors, at most twice as many tmux subprocess starts as sessions, and remote poll under two seconds. CPU percent uses one core as 100%, so a multithreaded process can exceed 100%. Tmux counts measure process-wide starts during the status-pass interval and can include overlapping background work. Hook counts cover the shared hooks directory; more than 4096 entries is reported as unknown to bound sampler work. Timing observations refer to operations measured during the sampling interval; missing operations remain unknown.
+Default budgets are status pass under 250 ms, fewer than 512 open descriptors, at most twice as many tmux subprocess starts as sessions, and remote poll under two seconds. CPU percent uses one core as 100%, so a multithreaded process can exceed 100%. Tmux counts measure process-wide starts during the status-pass interval and can include overlapping background work. The footer does not warn on one over-budget sample: the tmux-call warning needs three consecutive breaches, and detach reconciliation plus the per-client status-bar refresh (one command per attached viewer, including a web terminal) are not charged to that budget. Hook counts cover the shared hooks directory; more than 4096 entries is reported as unknown to bound sampler work. Timing observations refer to operations measured during the sampling interval; missing operations remain unknown.
 
 Files rotate at 1 MiB with one backup and age out after seven days while a sampler runs. Cleanup retains the newest 128 files plus files modified in the last two minutes, so active writers are not removed. Health collection errors do not interrupt the application; missing data remains visible as unknown in the report. Disabling collection leaves existing history available.
 
@@ -32,6 +32,14 @@ go test -tags runtimehealthperf ./internal/ui -run TestPerf_RuntimeHealth -count
 ```
 
 Run tests inside Docker as required by the repository development workflow. `PERF_BUDGET_MULTIPLIER` scales timing budgets for shared runners. Synthetic sessions exercise the local status path, not live SSH latency or production-scale filesystem histories.
+
+## Descriptor budget
+
+The descriptor budget is 512 plus 16 per session, capped at 80% of the process's soft open-file limit (`ulimit -n`). The footer warns after two consecutive samples over budget, and `agent-deck health` flags the process with `descriptor count exceeds budget` followed by a hint. The warning is advisory: nothing fails until the count reaches the open-file limit, and past it opening files, sockets and tmux pipes fails. A count that stays over budget and keeps rising while the session count stays flat is a descriptor leak in that process, not a limit to raise; the hint says so when the count rose during the report window, and says the breach is historical when only earlier samples were over budget (a breakdown taken then cannot show what held them). To act on it:
+
+1. Rerun `agent-deck health` after a while. A count that stays flat while the session count is unchanged is the steady state of a busy deck; a count that keeps growing points to a leak.
+2. See what the process holds, using the PID from the report: `lsof -p <pid> | awk 'NR>1 {print $5}' | sort | uniq -c | sort -rn`. Attach that breakdown when reporting a leak.
+3. Restarting the TUI (or `web --no-tui`, `notify-daemon`) resets the count. Raising `ulimit -n` before starting raises the cap, not the 512 + 16 per session part.
 
 ## Session metrics
 

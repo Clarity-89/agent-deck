@@ -13,12 +13,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/sandboxguard"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
 const codexNotifyMarkerBegin = "# BEGIN AGENTDECK CODEX NOTIFY"
 const codexNotifyMarkerEnd = "# END AGENTDECK CODEX NOTIFY"
 const codexNotifyLine = `notify = ["agent-deck", "codex-notify"]`
+
+var codexNotifyLog = logging.ForComponent(logging.CompSession)
 
 var codexNotifyTableRe = regexp.MustCompile(`(?m)^\s*\[notify\]\s*$`)
 var codexNotifyKeyRe = regexp.MustCompile(`(?m)^\s*notify\s*=`)
@@ -210,13 +214,37 @@ func handleCodexNotify() {
 	// Subagent threads (thread_source=subagent) do write a rollout and fire
 	// agent-turn-complete each time a spawned child finishes, while the parent
 	// turn keeps working; their events are not the pane's either.
-	if home := codexNotifyHome(); home != "" &&
-		(session.CodexUnbackedTurnEnd(sessionID, event, home) || session.CodexSubagentThread(sessionID, home)) {
-		return
+	if home := codexNotifyHome(); home != "" {
+		reason := ""
+		switch {
+		case session.CodexUnbackedTurnEnd(sessionID, event, home):
+			reason = "unbacked_turn_end"
+		case session.CodexSubagentThread(sessionID, home):
+			reason = "subagent_thread"
+		}
+		if reason != "" {
+			logCodexNotifyDropped(reason, instanceID, sessionID, turnID, event, home)
+			return
+		}
 	}
 
-	writeCodexHookStatus(instanceID, status, sessionID, event, turnID)
+	writeCodexHookStatusDone(instanceID, status, sessionID, event, turnID, codexNotifyDoneSignal(event, data))
 	spoolCommsFromCodexNotify(instanceID, sessionID, turnID, event, data)
+}
+
+// logCodexNotifyDropped records why a notify payload never reached the hook
+// status (issue #2900): one debug line with the reason and the payload's
+// identity, never its text. codex-notify is a short-lived child of Codex, so
+// like `ask` it opens the debug.log only when AGENTDECK_DEBUG is set.
+func logCodexNotifyDropped(reason, instanceID, threadID, turnID, event, codexHome string) {
+	defer initAskDebugLogging()()
+	codexNotifyLog.Debug("codex_notify_dropped",
+		slog.String("reason", reason),
+		slog.String("instance", instanceID),
+		slog.String("thread_id", threadID),
+		slog.String("turn_id", turnID),
+		slog.String("event", event),
+		slog.String("codex_home", codexHome))
 }
 
 // codexNotifyText is the text Codex's notify payload already carries
@@ -226,6 +254,26 @@ type codexNotifyText struct {
 	LastAssistantMessage string   `json:"last-assistant-message"`
 	InputMessages        []string `json:"input-messages"`
 	Cwd                  string   `json:"cwd"`
+}
+
+// codexNotifyDoneSignal is the completion sentinel (issue #1186) a Codex turn
+// ended with, read from the notify payload's last-assistant-message: Codex's
+// counterpart of the Claude Stop hook's transcript scan, with the same
+// ScanDoneSentinel rules (a valid sentinel line, last one wins). Only a
+// turn-completion edge carries one; issue #2899.
+func codexNotifyDoneSignal(event string, data []byte) *session.DoneSignal {
+	if _, completed := codexTurnEdge(event); !completed || len(data) == 0 {
+		return nil
+	}
+	var t codexNotifyText
+	if json.Unmarshal(data, &t) != nil {
+		return nil
+	}
+	sig, ok := session.ScanDoneSentinel(t.LastAssistantMessage)
+	if !ok {
+		return nil
+	}
+	return &sig
 }
 
 // spoolCommsFromCodexNotify forwards a completed turn's text to the daemon's
@@ -264,11 +312,11 @@ func codexNotifyHome() string {
 	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
 		return session.ExpandPath(home)
 	}
-	home, err := os.UserHomeDir()
+	dir, err := sandboxguard.HomeJoin("Codex home (~/.codex)", ".codex")
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".codex")
+	return dir
 }
 
 func codexTurnEdge(event string) (started, completed bool) {
@@ -284,6 +332,18 @@ func codexTurnEdge(event string) (started, completed bool) {
 // lock. Notify invocations are separate processes and can overlap; serializing
 // the read/modify/write makes the generation proof deterministic.
 func writeCodexHookStatus(instanceID, status, sessionID, event string, turnIDs ...string) {
+	turnID := ""
+	if len(turnIDs) > 0 {
+		turnID = turnIDs[0]
+	}
+	writeCodexHookStatusDone(instanceID, status, sessionID, event, turnID, nil)
+}
+
+// writeCodexHookStatusDone is writeCodexHookStatus plus the turn's completion
+// sentinel. done is persisted as done_status/done_summary in the same locked
+// write, so the daemon emits a finished record exactly as for a Claude Stop;
+// nil (no sentinel, or not a completion edge) clears them as before.
+func writeCodexHookStatusDone(instanceID, status, sessionID, event, turnID string, done *session.DoneSignal) {
 	if instanceID == "" || status == "" {
 		return
 	}
@@ -345,10 +405,7 @@ func writeCodexHookStatus(instanceID, status, sessionID, event string, turnIDs .
 		evidenceSessionID = session.ReadHookSessionAnchor(instanceID)
 	}
 	started, completed := codexTurnEdge(event)
-	turnID := ""
-	if len(turnIDs) > 0 {
-		turnID = strings.TrimSpace(turnIDs[0])
-	}
+	turnID = strings.TrimSpace(turnID)
 	if started {
 		prior.CodexCompletedGeneration = ""
 		prior.CodexCompletedSessionID = ""
@@ -389,13 +446,16 @@ func writeCodexHookStatus(instanceID, status, sessionID, event string, turnIDs .
 	prior.Status, prior.SessionID, prior.Event = status, sessionID, event
 	prior.Timestamp = time.Now().Unix()
 	prior.DoneStatus, prior.DoneSummary, prior.TranscriptPath, prior.Cwd = "", "", "", ""
+	if done != nil && completed {
+		prior.DoneStatus, prior.DoneSummary = done.Status, done.Summary
+	}
 	writeHookStatusFile(instanceID, prior, false)
 }
 
 func handleCodexHooks(args []string) {
 	if len(args) == 0 {
 		printCodexHooksUsage(os.Stderr)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// A help request anywhere in the argument list must print usage and exit
@@ -417,7 +477,7 @@ func handleCodexHooks(args []string) {
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown codex-hooks subcommand: %s\n", args[0])
 		printCodexHooksUsage(os.Stderr)
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -449,11 +509,11 @@ func handleCodexHooksInstall() {
 			updated = prependCodexNotifyBlock(block, updated)
 			if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
 				fmt.Fprintf(os.Stderr, "Error creating codex config dir: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if err := os.WriteFile(configPath, []byte(updated), 0644); err != nil {
 				fmt.Fprintf(os.Stderr, "Error writing codex config: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			fmt.Println("Codex notify hook upgraded successfully.")
 			fmt.Printf("Config: %s\n", configPath)
@@ -465,11 +525,11 @@ func handleCodexHooksInstall() {
 		updated = prependCodexNotifyBlock(block, strings.TrimSpace(updated))
 		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating codex config dir: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if err := os.WriteFile(configPath, []byte(updated), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing codex config: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		fmt.Println("Codex notify hook upgraded successfully.")
 		fmt.Printf("Config: %s\n", configPath)
@@ -486,18 +546,18 @@ func handleCodexHooksInstall() {
 		fmt.Fprintf(os.Stderr, "Error: existing notify setting found in %s\n", configPath)
 		fmt.Fprintln(os.Stderr, "Please merge manually by setting:")
 		fmt.Fprintln(os.Stderr, `  notify = ["agent-deck", "codex-notify"]`)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	newContent := prependCodexNotifyBlock(block, content)
 
 	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating codex config dir: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if err := os.WriteFile(configPath, []byte(newContent), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing codex config: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	fmt.Println("Codex notify hook installed successfully.")
@@ -509,7 +569,7 @@ func handleCodexHooksUninstall() {
 	content, err := readFileOrEmpty(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading codex config: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	begin := strings.Index(content, codexNotifyMarkerBegin)
@@ -517,7 +577,7 @@ func handleCodexHooksUninstall() {
 		endRel := strings.Index(content[begin:], codexNotifyMarkerEnd)
 		if endRel == -1 {
 			fmt.Fprintln(os.Stderr, "Error: malformed agent-deck Codex hook block in config.")
-			os.Exit(1)
+			exitCLI(1)
 		}
 		end := begin + endRel + len(codexNotifyMarkerEnd)
 		updated := content[:begin] + content[end:]
@@ -528,7 +588,7 @@ func handleCodexHooksUninstall() {
 
 		if err := os.WriteFile(configPath, []byte(updated), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing codex config: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		fmt.Println("Codex notify hook removed successfully.")
 		return
@@ -537,7 +597,7 @@ func handleCodexHooksUninstall() {
 	if updated, removed := removeLegacyCodexNotifyTable(content); removed {
 		if err := os.WriteFile(configPath, []byte(updated), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing codex config: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		fmt.Println("Codex notify hook removed successfully.")
 		return
@@ -546,7 +606,7 @@ func handleCodexHooksUninstall() {
 	if updated, removed := removeExactCodexNotifyLine(content); removed {
 		if err := os.WriteFile(configPath, []byte(updated), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing codex config: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		fmt.Println("Codex notify hook removed successfully.")
 		return
@@ -635,13 +695,13 @@ func codexHooksLine(state, configPath string) string {
 
 func getCodexConfigPath() string {
 	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
-		return filepath.Join(codexHome, "config.toml")
+		return sandboxguard.Must("Codex config (CODEX_HOME)", filepath.Join(codexHome, "config.toml"))
 	}
-	home, err := os.UserHomeDir()
+	p, err := sandboxguard.HomeJoin("Codex config (~/.codex/config.toml)", ".codex", "config.toml")
 	if err != nil {
 		return filepath.Join(os.TempDir(), ".codex", "config.toml")
 	}
-	return filepath.Join(home, ".codex", "config.toml")
+	return p
 }
 
 func readFileOrEmpty(path string) (string, error) {

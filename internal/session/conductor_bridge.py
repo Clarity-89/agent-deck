@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Conductor Bridge: Telegram & Slack & Discord <-> Agent-Deck conductor sessions (multi-conductor).
+Conductor Bridge: Telegram & Slack & Discord & Mattermost <-> Agent-Deck conductor sessions (multi-conductor).
 
 A thin bridge that:
-  A) Forwards Telegram/Slack/Discord messages -> conductor session (via agent-deck CLI)
-  B) Forwards conductor responses -> Telegram/Slack/Discord
+  A) Forwards Telegram/Slack/Discord/Mattermost messages -> conductor session (via agent-deck CLI)
+  B) Forwards conductor responses -> Telegram/Slack/Discord/Mattermost
   C) Runs a periodic heartbeat to trigger conductor status checks
 
 Discovers conductors dynamically from meta.json files in ~/.agent-deck/conductor/*/
 Each conductor has its own name, profile, and heartbeat settings.
 
-Dependencies: pip3 install toml aiogram slack-bolt slack-sdk discord.py
+Dependencies: pip3 install toml aiogram slack-bolt slack-sdk discord.py aiohttp
   - aiogram is only needed if Telegram is configured
   - slack-bolt/slack-sdk are only needed if Slack is configured
   - discord.py is only needed if Discord is configured
+  - aiohttp is only needed if Mattermost is configured
 """
 
 from __future__ import annotations
@@ -29,9 +30,12 @@ import re
 import signal
 import subprocess
 import sys
+import contextvars
 import threading
 import time
-from collections import deque
+import urllib.parse
+from collections import OrderedDict, deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
@@ -63,6 +67,13 @@ try:
     HAS_DISCORD = True
 except ImportError:
     HAS_DISCORD = False
+
+# Conditional import for Mattermost (its REST API and WebSocket, via aiohttp)
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -137,8 +148,36 @@ TG_MAX_LENGTH = 4096
 # Slack message length limit
 SLACK_MAX_LENGTH = 40000
 
+# Slack access migration switch. Installs from before the allow-list was
+# required may have a [conductor.slack] table with neither allowed_user_ids
+# nor allow_all_users. False (shipped): such a table refuses every Slack user.
+# True: it stays open to every workspace member, with a startup warning. An
+# explicit empty allowed_user_ids list refuses everyone either way.
+SLACK_LEGACY_OPEN_WHEN_ALLOWLIST_ABSENT = False
+
+SLACK_NO_ALLOWED_USERS_WARNING = (
+    "Slack bridge: no allowed users are set, so every Slack message and command is refused. "
+    "Add your Slack member ID under [conductor.slack] in ~/.agent-deck/config.toml: "
+    'allowed_user_ids = ["U01234567"] (or set allow_all_users = true to let every '
+    "workspace member in), then restart the bridge."
+)
+SLACK_LEGACY_OPEN_WARNING = (
+    "Slack bridge: no allowed users are set, so every member of this Slack workspace can "
+    "send commands. Add your Slack member ID under [conductor.slack] in "
+    '~/.agent-deck/config.toml: allowed_user_ids = ["U01234567"] (or set '
+    "allow_all_users = true to keep this and silence this warning), then restart the bridge."
+)
+SLACK_REFUSAL_REPLY = (
+    "Not allowed: this agent-deck bridge only takes commands from its allow-list. "
+    "Your Slack member ID is {user_id}. The owner can add it under [conductor.slack] "
+    'in ~/.agent-deck/config.toml: allowed_user_ids = ["{user_id}"]'
+)
+
 # Discord message length limit
 DISCORD_MAX_LENGTH = 2000
+
+# Mattermost post length limit (the server's default MaxPostSize is 16383)
+MM_MAX_LENGTH = 16000
 
 # Marker for uploading local images through the Discord bridge.
 IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(?P<path>[^\]]+)\]")
@@ -215,11 +254,31 @@ def _resolve_secret(value: str) -> str:
     return value
 
 
+def slack_access_policy(sl: dict) -> tuple[list[str], bool, bool]:
+    """Read who may use the Slack bot from a raw [conductor.slack] table.
+
+    Returns (allowed_user_ids, allow_all_users, legacy_open). legacy_open is
+    True only when SLACK_LEGACY_OPEN_WHEN_ALLOWLIST_ABSENT is on and the table
+    has neither key; otherwise an empty allow-list refuses everyone.
+    """
+    raw = sl.get("allowed_user_ids", [])
+    if not isinstance(raw, list):
+        raw = [raw]
+    allowed = [str(u).strip() for u in raw if str(u).strip()]
+    allow_all = sl.get("allow_all_users", False) is True
+    legacy_open = (
+        SLACK_LEGACY_OPEN_WHEN_ALLOWLIST_ABSENT
+        and "allowed_user_ids" not in sl
+        and "allow_all_users" not in sl
+    )
+    return allowed, allow_all, legacy_open
+
+
 def load_config() -> dict:
     """Load [conductor] section from config.toml.
 
-    Returns a dict with nested 'telegram' and 'slack' sub-dicts,
-    each with a 'configured' flag.
+    Returns a dict with a nested sub-dict per platform (telegram, slack,
+    discord, mattermost), each with a 'configured' flag.
     """
     if not CONFIG_PATH.exists():
         log.error("Config not found: %s", CONFIG_PATH)
@@ -256,7 +315,10 @@ def load_config() -> dict:
     sl_app_token = _resolve_secret(sl.get("app_token", ""))
     sl_channel_id = sl.get("channel_id", "")
     sl_listen_mode = sl.get("listen_mode", "mentions")  # "mentions" or "all"
-    sl_allowed_users = sl.get("allowed_user_ids", [])  # List of authorized Slack user IDs
+    sl_allowed_users, sl_allow_all, sl_legacy_open = slack_access_policy(sl)
+    # default_conductor (#2547): None = key absent (legacy first-conductor
+    # routing), "" = no default (prompt with the conductor list), or a name.
+    sl_default_conductor = sl.get("default_conductor")
     sl_configured = bool(sl_bot_token and sl_app_token and sl_channel_id)
 
     # Discord config
@@ -271,10 +333,25 @@ def load_config() -> dict:
     dc_ignore_replies_to_others = dc.get("ignore_replies_to_others", False)
     dc_configured = bool(dc_bot_token and dc_guild_id and dc_channel_id and dc_user_id)
 
-    if not tg_configured and not sl_configured and not dc_configured:
+    # Mattermost config. `user` is the one person the bot obeys, as a username
+    # or a user ID; with no channel_id the bot talks to them in a DM.
+    mm = conductor_cfg.get("mattermost", {})
+    mm_server_url = str(mm.get("server_url", "") or "").strip().rstrip("/")
+    mm_bot_token = _resolve_secret(mm.get("bot_token", ""))
+    mm_user = _resolve_secret(str(mm.get("user", "") or "")).strip().lstrip("@")
+    mm_allow_insecure_http = bool(mm.get("allow_insecure_http", False))
+    mm_configured = bool(mm_server_url and mm_bot_token and mm_user)
+    if mm_configured:
+        problem = mattermost_url_problem(mm_server_url, mm_allow_insecure_http)
+        if problem:
+            log.error("[conductor.mattermost] ignored: %s", problem)
+            mm_configured = False
+
+    if not tg_configured and not sl_configured and not dc_configured and not mm_configured:
         log.error(
             "No messaging platform configured in config.toml. "
-            "Set [conductor.telegram], [conductor.slack], or [conductor.discord]."
+            "Set [conductor.telegram], [conductor.slack], [conductor.discord], "
+            "or [conductor.mattermost]."
         )
         sys.exit(1)
 
@@ -289,7 +366,10 @@ def load_config() -> dict:
             "app_token": sl_app_token,
             "channel_id": sl_channel_id,
             "listen_mode": sl_listen_mode,
+            "default_conductor": sl_default_conductor,
             "allowed_user_ids": sl_allowed_users,
+            "allow_all_users": sl_allow_all or sl_legacy_open,
+            "legacy_open": sl_legacy_open,
             "configured": sl_configured,
         },
         "discord": {
@@ -300,6 +380,15 @@ def load_config() -> dict:
             "listen_mode": dc_listen_mode,
             "ignore_replies_to_others": bool(dc_ignore_replies_to_others),
             "configured": dc_configured,
+        },
+        "mattermost": {
+            "server_url": mm_server_url,
+            "bot_token": mm_bot_token,
+            "user": mm_user,
+            "channel_id": str(mm.get("channel_id", "") or "").strip(),
+            "listen_mode": mm.get("listen_mode", "all"),  # "mentions" or "all"
+            "allow_insecure_http": mm_allow_insecure_http,
+            "configured": mm_configured,
         },
         "heartbeat_interval": conductor_cfg.get("heartbeat_interval", 15),
         # Fallback threshold for filter_need_lines when `conductor tier-filter`
@@ -836,22 +925,112 @@ _reply_owner_lock = threading.Lock()
 _wait_send_reservations: dict[tuple[str | None, str], str | None] = {}
 
 
+_RFC3339 = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$")
+
+
+def _record_stamp_ms(value) -> tuple[int, bool] | None:
+    """Parse a Go time.Time JSON value into (Unix ms, whole_second), or None."""
+    m = _RFC3339.match(str(value or "").strip())
+    if not m:
+        return None
+    base, frac, zone = m.group(1), m.group(2) or "", m.group(3)
+    if base.startswith("0001-01-01"):
+        return None  # Go's zero time
+    try:
+        dt = datetime.fromisoformat(base + ("+00:00" if zone == "Z" else zone))
+    except ValueError:
+        return None
+    nanos = int((frac + "000000000")[:9]) if frac else 0
+    return int(dt.timestamp()) * 1000 + nanos // 1_000_000, nanos == 0
+
+
+def _load_result_reads(reader_id: str) -> dict:
+    """The reader's result-read file (internal/session/inbox_result_read.go)."""
+    path = resolve_data_dir("runtime") / "runtime" / "result-reads" / f"{reader_id}.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _record_withdrawn(record: dict, reads: dict) -> bool:
+    """Mirror resultReads.covers in Go: a record the reader already read the
+    result of after the turn ended is withdrawn at the next drain, so the
+    heartbeat does not count it as pending. Anything unclear counts."""
+    if not reads or not isinstance(record, dict):
+        return False
+    child = str(record.get("child_session_id") or "").strip()
+    uuid = str(record.get("turn_uuid") or "").strip()
+    if (record.get("question") or record.get("source_remote") or record.get("overflow_turns")
+            or record.get("turn_text_interim") or not child or not uuid):
+        return False
+    kind = record.get("kind") or ""
+    if kind:
+        if kind != "finished":
+            return False
+    elif record.get("to_status") not in ("waiting", "idle"):
+        return False
+    stamp = _record_stamp_ms(record.get("timestamp"))
+    if stamp is None:
+        return False
+    stamp_ms, whole_second = stamp
+    if whole_second:
+        stamp_ms += 1000  # the turn may have ended anywhere in that second
+    entry = reads.get(child)
+    if not isinstance(entry, dict) or uuid not in (entry.get("turns") or []):
+        return False
+    read_at = (entry.get("read_at") or {}).get(uuid)
+    return isinstance(read_at, int) and read_at >= stamp_ms
+
+
+def _find_conductor_row(sessions: list[dict], name: str) -> dict | None:
+    """The named conductor's row in a `list --json` listing. The stable
+    conductor_name wins, so a renamed or decorated conductor is still found;
+    the exact title is the fallback for an agent-deck that predates the
+    field. A row named as a different conductor never matches by title."""
+    for s in sessions:
+        if isinstance(s, dict) and s.get("conductor_name") == name:
+            return s
+    title = conductor_session_title(name)
+    for s in sessions:
+        if isinstance(s, dict) and not s.get("conductor_name") and s.get("title") == title:
+            return s
+    return None
+
+
 def _conductor_inbox_snapshot(sessions: list[dict], name: str) -> tuple[int, str, bool]:
-    """Count durable records and identify replacement records at the same count."""
-    conductor = next((s for s in sessions if s.get("title") == conductor_session_title(name)), None)
+    """Count durable records still to be delivered and identify replacement
+    records at the same count. A record the conductor already read the
+    result of with `session output` is withdrawn at the next drain and is not
+    counted, the same way the Go heartbeat counts (InboxSnapshot)."""
+    conductor = _find_conductor_row(sessions, name)
     if not conductor or not conductor.get("id"):
         return 0, "", False
     session_id = str(conductor["id"]).strip().replace("/", "_").replace("..", "_").replace(" ", "_")
     path = resolve_data_dir("inboxes") / "inboxes" / f"{session_id}.jsonl"
     try:
         data = path.read_bytes()
-        count = sum(bool(line.strip()) for line in data.splitlines())
-        return count, hashlib.sha256(data).hexdigest() if count else "", False
     except FileNotFoundError:
         return 0, "", False
     except OSError as exc:
         log.warning("Heartbeat [%s]: cannot read inbox %s: %s", name, path, exc)
         return 0, "", True
+    reads = _load_result_reads(session_id)
+    count = 0
+    digest = hashlib.sha256()
+    for line in data.splitlines():
+        if not line.strip():
+            continue
+        if reads:
+            try:
+                if _record_withdrawn(json.loads(line), reads):
+                    continue
+            except ValueError:
+                pass  # unparseable: counts, fail toward delivering
+        count += 1
+        digest.update(line + b"\n")
+    return count, digest.hexdigest() if count else "", False
 
 
 def _heartbeat_fingerprint(scoped_sessions: list[dict], inbox_pending: int = 0, inbox_digest: str = "") -> str:
@@ -918,6 +1097,7 @@ def send_to_conductor(
     reply_callback: ReplyCallback | None = None,
     force_queue: bool = False,
     claim_late_reply: bool = False,
+    source: str | None = None,
 ) -> tuple[bool, str, dict | bool | str]:
     """Send a message to the conductor session.
 
@@ -937,12 +1117,16 @@ def send_to_conductor(
 
     claim_late_reply reserves one in-memory owner across the blocking wait and,
     on an accepted timeout, until the caller registers its reply watcher.
+
+    source (e.g. "channel:telegram") names the sender in `agent-deck triggers`
+    (session send --source); a queued message keeps it for the drain.
     """
+    source_args = ("--source", source) if source else ()
     if not wait_for_reply:
         # force_queue: caller already confirmed conductor is busy — skip status check.
         if force_queue:
             log.info("Conductor %s: force-queueing message", session)
-            _enqueue_message(session, message, profile, reply_callback)
+            _enqueue_message(session, message, profile, reply_callback, source)
             return True, "", False
 
         # For non-blocking sends (user messages), check if conductor is busy
@@ -952,11 +1136,15 @@ def send_to_conductor(
             log.info(
                 "Conductor %s is busy (%s), queueing message", session, status,
             )
-            _enqueue_message(session, message, profile, reply_callback)
+            _enqueue_message(session, message, profile, reply_callback, source)
             return True, "", False  # queued, not failed
 
+        # A chat message is a person's: an enforced cost budget never
+        # blocks it (--ignore-budget). Flags go before "--" so a message that
+        # starts with "-" is delivered as text, never parsed as a flag.
         result = run_cli(
-            "session", "send", session, message, "--no-wait",
+            "session", "send", "--no-wait", "--ignore-budget", *source_args,
+            "--", session, message,
             profile=profile, timeout=30,
         )
         if result.returncode != 0:
@@ -968,7 +1156,7 @@ def send_to_conductor(
                     "Conductor %s became busy during send, queueing message",
                     session,
                 )
-                _enqueue_message(session, message, profile, reply_callback)
+                _enqueue_message(session, message, profile, reply_callback, source)
                 return True, "", False
             log.error("Failed to send to conductor: %s", stderr)
             return False, "", False
@@ -987,8 +1175,9 @@ def send_to_conductor(
         # `--wait --json` returns the accepted turn and its exact correlated
         # response as one result; never issue a second output read here.
         result = run_cli(
-            "session", "send", session, message,
-            "--wait", "--timeout", f"{response_timeout}s", "--json",
+            "session", "send",
+            "--wait", "--timeout", f"{response_timeout}s", "--json", "--ignore-budget", *source_args,
+            "--", session, message,
             profile=profile,
             timeout=max(response_timeout + 30, 60),
         )
@@ -1012,6 +1201,18 @@ def send_to_conductor(
                     retain_reservation = True
                 return False, "", True
             error = payload.get("error") or result.stderr.strip()
+            if (
+                payload.get("submitted") is not True
+                and (
+                    payload.get("delivery") == "target_busy"
+                    or "not ready" in error.lower()
+                )
+            ):
+                log.info(
+                    "Conductor %s became busy before submission; queue required",
+                    session,
+                )
+                return False, "", _WAIT_SEND_QUEUE_REQUIRED
             log.error("Failed to send to conductor: %s", error)
             return False, "", False
         payload = _cli_json(result.stdout)
@@ -1049,6 +1250,7 @@ def _enqueue_message(
     message: str,
     profile: str | None,
     reply_callback: ReplyCallback | None = None,
+    source: str | None = None,
 ) -> None:
     """Add a message to the in-memory queue for a busy conductor.
 
@@ -1064,7 +1266,7 @@ def _enqueue_message(
             "Queue full for %s (depth=%d), dropping oldest message",
             session, MAX_QUEUE_DEPTH,
         )
-        _msg, _prof, dropped_cb = queue.popleft()
+        dropped_cb = queue.popleft()[2]
         if dropped_cb is not None:
             try:
                 loop = asyncio.get_running_loop()
@@ -1074,9 +1276,15 @@ def _enqueue_message(
                 ))
             except RuntimeError:
                 pass  # no event loop available, can't fire async callback
-    queue.append((message, profile, reply_callback))
+    # A source rides along as an optional fourth element (see _queue_source).
+    queue.append((message, profile, reply_callback, source) if source else (message, profile, reply_callback))
     log.info("Queued message for %s (queue depth: %d)", session, len(queue))
     _ensure_drain_task()
+
+
+def _queue_source(item: tuple) -> str | None:
+    """The --source a queued item was sent with, if any."""
+    return item[3] if len(item) > 3 else None
 
 
 async def _fire_callback(cb: ReplyCallback, text: str) -> None:
@@ -1138,7 +1346,8 @@ async def _drain_queue() -> None:
                 _message_queue.pop(session, None)
                 continue
 
-            message, profile, reply_callback = items[0]
+            message, profile, reply_callback = items[0][:3]
+            source = _queue_source(items[0])
             with _reply_owner_lock:
                 if ((profile, session) in _wait_send_reservations or
                         (profile, session) in _pending_reply_tasks):
@@ -1159,7 +1368,8 @@ async def _drain_queue() -> None:
                     session, len(items),
                 )
                 dropped = _message_queue.pop(session, deque())
-                for _msg, _prof, cb in dropped:
+                for dropped_item in dropped:
+                    cb = dropped_item[2]
                     if cb is not None:
                         loop.create_task(_fire_callback(
                             cb,
@@ -1167,19 +1377,49 @@ async def _drain_queue() -> None:
                         ))
                 continue
 
-            # Conductor is ready — deliver the message and wait for the response
-            result = await loop.run_in_executor(
+            # Keep the in-flight item outside the overflow-managed deque. New
+            # arrivals can then evict only genuinely waiting messages, and the
+            # result below always belongs to this exact item.
+            inflight_item = items.popleft()
+
+            # Conductor is ready — use the same structured accepted-turn path as
+            # an idle remote send. A timed-out wait may still have submitted the
+            # turn; in that case ownership transfers to a reply-only watcher and
+            # the queued message must never be sent a second time.
+            ok, response, pending = await loop.run_in_executor(
                 None,
                 functools.partial(
-                    run_cli,
-                    "session", "send", session, message,
-                    "--wait", "--timeout", f"{RESPONSE_TIMEOUT}s", "-q",
+                    send_to_conductor,
+                    session, message,
                     profile=profile,
-                    timeout=max(RESPONSE_TIMEOUT + 30, 60),
+                    wait_for_reply=True,
+                    response_timeout=RESPONSE_TIMEOUT,
+                    claim_late_reply=True,
+                    **({"source": source} if source else {}),
                 ),
             )
-            if result.returncode == 0:
-                items.popleft()
+
+            # Another sender acquired reply ownership after the status check.
+            # Restore this exact unsent item at the head for the next cycle.
+            if not ok and pending == _WAIT_SEND_QUEUE_REQUIRED:
+                if len(items) >= MAX_QUEUE_DEPTH:
+                    dropped_cb = items.pop()[2]
+                    log.warning(
+                        "Queue full for %s while restoring unsent item; dropping newest message",
+                        session,
+                    )
+                    if dropped_cb is not None:
+                        loop.create_task(_fire_callback(
+                            dropped_cb,
+                            "[Message dropped — conductor queue overflow.]",
+                        ))
+                items.appendleft(inflight_item)
+                continue
+
+            # A synchronous response or an accepted asynchronous turn owns this
+            # queue item now. Remove it before any callback work so it cannot be
+            # replayed if callback setup fails.
+            if ok or pending is True or isinstance(pending, dict):
                 remaining = len(items)
                 if not remaining:
                     _message_queue.pop(session, None)
@@ -1187,36 +1427,46 @@ async def _drain_queue() -> None:
                     "Conductor %s delivered queued message (%d remaining)",
                     session, remaining,
                 )
-                if reply_callback is not None:
-                    # Re-fetch the clean reply via get_session_output (consistent
-                    # with send_to_conductor's wait path) rather than the raw
-                    # `--wait` stdout. Off-loop to avoid blocking the drain.
-                    output = await loop.run_in_executor(
-                        None,
-                        functools.partial(get_session_output, session, profile=profile),
-                    )
-                    text = output.strip() or "[No output from conductor.]"
-                    loop.create_task(_fire_callback(reply_callback, text))
-            else:
-                stderr = result.stderr.strip()
-                if "timeout" in stderr.lower() or "not ready" in stderr.lower():
+                if ok:
+                    if reply_callback is not None:
+                        text = response.strip() or "[No output from conductor.]"
+                        loop.create_task(_fire_callback(reply_callback, text))
+                    continue
+
+                receipt = pending if isinstance(pending, dict) else None
+                if reply_callback is None:
+                    _release_late_reply_claim(session, profile, receipt)
+                    continue
+                if _register_pending_reply(
+                    session, profile, receipt, reply_callback,
+                ):
                     log.info(
-                        "Conductor %s busy again during drain, will retry",
+                        "Conductor %s accepted queued message; reply pending",
                         session,
                     )
-                else:
-                    log.error(
-                        "Failed to deliver queued message to %s: %s — dropping",
-                        session, stderr,
-                    )
-                    items.popleft()
-                    if not items:
-                        _message_queue.pop(session, None)
-                    if reply_callback is not None:
-                        loop.create_task(_fire_callback(
-                            reply_callback,
-                            f"[Queued message could not be delivered — send failed: {stderr[:100]}]",
-                        ))
+                    continue
+
+                _release_late_reply_claim(session, profile, receipt)
+                loop.create_task(_fire_callback(
+                    reply_callback,
+                    "[Queued message was accepted, but its reply watcher could not be started.]",
+                ))
+                continue
+
+            # Any other failure is final for this item. The CLI may already have
+            # written the message (a Claude wait that timed out, or an
+            # unacknowledged socket write), so it is never sent a second time
+            # and the caller is not told it was undelivered.
+            log.error(
+                "Queued message to %s was not confirmed — not resending", session,
+            )
+            if not items:
+                _message_queue.pop(session, None)
+            if reply_callback is not None:
+                loop.create_task(_fire_callback(
+                    reply_callback,
+                    "[Queued message was not confirmed and was not resent; no reply was captured.]",
+                ))
 
         # Exit check AFTER the session loop — avoids missing items enqueued during drain
         if not _message_queue:
@@ -1730,6 +1980,104 @@ def invoke_hook(
 # ---------------------------------------------------------------------------
 
 
+# Thread -> conductor affinity (#2547): a reply inside a thread the bridge
+# created for conductor X routes to X without a 'name:' prefix. Bounded FIFO.
+_THREAD_AFFINITY: OrderedDict[str, str] = OrderedDict()
+_THREAD_AFFINITY_CAP = 500
+# Conductor whose posts are in flight in this task (#2547): set by
+# deliver_tiered_reply / _human_outbox_send before any deliver() call so
+# _deliver_need_alert can tag the created thread with its conductor.
+_DELIVER_CONDUCTOR: contextvars.ContextVar = contextvars.ContextVar(
+    "conductor_delivery_name", default=None
+)
+
+
+@contextlib.contextmanager
+def _delivering_for(name: str):
+    """Tag every post made inside the block with conductor `name` (#2547),
+    restoring the previous tag on exit so it never leaks to later posts."""
+    token = _DELIVER_CONDUCTOR.set(name)
+    try:
+        yield
+    finally:
+        _DELIVER_CONDUCTOR.reset(token)
+
+
+def _slack_post_ts(resp) -> str | None:
+    """ts of an accepted chat_postMessage, else None.
+
+    slack_sdk's AsyncWebClient returns an AsyncSlackResponse, which is not a
+    dict: its parsed JSON body is the .data dict. Anything else yields None,
+    since affinity is bookkeeping and must never fail an accepted post.
+    """
+    data = resp if isinstance(resp, dict) else getattr(resp, "data", None)
+    if not isinstance(data, dict) or not data.get("ok"):
+        return None
+    ts = data.get("ts")
+    return ts if isinstance(ts, str) and ts else None
+
+
+def remember_thread_conductor(
+    ts: str | None, name: str, affinity: OrderedDict[str, str] | None = None,
+) -> None:
+    """Record thread_ts -> conductor so later replies in the thread route there."""
+    if not ts or not name:
+        return
+    if affinity is None:
+        affinity = _THREAD_AFFINITY
+    affinity[ts] = name
+    affinity.move_to_end(ts)
+    while len(affinity) > _THREAD_AFFINITY_CAP:
+        affinity.popitem(last=False)
+
+
+def resolve_slack_routing(
+    text: str,
+    thread_ts: str | None,
+    conductor_names: list[str],
+    conductors: list[dict],
+    default_conductor: str | None,
+    affinity: OrderedDict[str, str] | None = None,
+) -> tuple[dict | None, str, str]:
+    """Resolve the target conductor for one inbound Slack message (#2547).
+
+    Resolution order: explicit `name:` prefix, thread affinity, configured
+    default_conductor, legacy first conductor. Returns (target_or_None,
+    cleaned_message, reason) with reason one of: "prefix", "affinity",
+    "default", "legacy", "no_default", "misconfigured", "none". The
+    caller replies with the conductor list for "no_default"/
+    "misconfigured" and the no-conductors message for "none"; it never
+    silently picks a conductor the user did not address.
+    """
+    if affinity is None:
+        affinity = _THREAD_AFFINITY
+    target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
+    if target_name:
+        for c in conductors:
+            if c["name"] == target_name:
+                return c, cleaned_msg, "prefix"
+    if thread_ts:
+        affinity_name = affinity.get(thread_ts)
+        if affinity_name:
+            for c in conductors:
+                if c["name"] == affinity_name:
+                    return c, text, "affinity"
+    if not conductors:
+        return None, text, "none"
+    if default_conductor is None:
+        # Key absent: unchanged historical behavior (first conductor).
+        return conductors[0], text, "legacy"
+    if default_conductor == "":
+        # Explicit opt-out: unprefixed messages get no default target.
+        return None, text, "no_default"
+    for c in conductors:
+        if c["name"] == default_conductor:
+            return c, text, "default"
+    # An unknown configured name must never fall back to the first
+    # conductor — that is exactly the silent surprise this resolves.
+    return None, text, "misconfigured"
+
+
 def parse_conductor_prefix(text: str, conductor_names: list[str]) -> tuple[str | None, str]:
     """Parse conductor name prefix from user message.
 
@@ -1940,13 +2288,14 @@ def ack_tier_filter_reply(name: str, profile: str | None, reply_id: str) -> bool
 
 def need_alert_deliverer(
     tg_user_id, telegram_bot, slack_app, slack_channel_id, discord_bot, discord_channel_id,
+    mattermost_bot=None,
 ):
     """deliver(text) -> bool that sends text to every configured channel
     (_deliver_need_alert): True when at least one accepted it."""
     async def deliver(text: str) -> bool:
         return await _deliver_need_alert(
             text, tg_user_id, telegram_bot, slack_app,
-            slack_channel_id, discord_bot, discord_channel_id,
+            slack_channel_id, discord_bot, discord_channel_id, mattermost_bot,
         )
 
     return deliver
@@ -1984,6 +2333,13 @@ async def deliver_tiered_reply(loop, name: str, profile: str | None, filtered: d
     result when there are none), True when there was nothing to send; False
     means retry later.
     """
+    # Thread affinity (#2547): posts in this reply carry the conductor name
+    # (async-safe context var) so replies inside the thread route back to it.
+    with _delivering_for(name):
+        return await _deliver_tiered_reply(loop, name, profile, filtered, prefix, deliver)
+
+
+async def _deliver_tiered_reply(loop, name: str, profile: str | None, filtered: dict, prefix: str, deliver) -> bool:
     lines, digest = filtered["lines"], filtered["digest"]
     delivered = True
     if lines:
@@ -2046,6 +2402,11 @@ async def _human_outbox_send(loop, name: str, profile: str, deliver) -> None:
     others. Queued info leaves as digest message(s) when an urgent item went
     out this poll or the digest window is due.
     """
+    with _delivering_for(name):  # thread affinity (#2547)
+        await _human_outbox_send_items(loop, name, profile, deliver)
+
+
+async def _human_outbox_send_items(loop, name: str, profile: str, deliver) -> None:
     items = _cli_json_value(await loop.run_in_executor(None, functools.partial(
         run_cli, "conductor", "outbox", "--json", "--conductor", name,
         profile=profile, timeout=30,
@@ -2081,12 +2442,13 @@ async def _human_outbox_send(loop, name: str, profile: str, deliver) -> None:
 
 async def human_outbox_loop(
     telegram_bot=None, tg_user_id=None, slack_app=None, slack_channel_id=None,
-    discord_bot=None, discord_channel_id=None,
+    discord_bot=None, discord_channel_id=None, mattermost_bot=None,
 ):
     """Forward what conductors queued for the human, every 5 s (issue #2469)."""
     poll_state: dict = {}
     deliver = need_alert_deliverer(
         tg_user_id, telegram_bot, slack_app, slack_channel_id, discord_bot, discord_channel_id,
+        mattermost_bot,
     )
 
     log.info("Human outbox loop started (poll every %d s)", HUMAN_OUTBOX_POLL_SECONDS)
@@ -2566,6 +2928,7 @@ def create_telegram_bot(config: dict):
                 wait_for_reply=False,
                 reply_callback=_tg_reply,
                 force_queue=True,
+                source="channel:telegram",
             )
             if not ok:
                 await message.answer(
@@ -2590,6 +2953,7 @@ def create_telegram_bot(config: dict):
                 wait_for_reply=True,
                 response_timeout=RESPONSE_TIMEOUT,
                 claim_late_reply=True,
+                source="channel:telegram",
             ),
         )
         if not ok:
@@ -2616,6 +2980,7 @@ def create_telegram_bot(config: dict):
                 if still_running == _WAIT_SEND_QUEUE_REQUIRED:
                     _enqueue_message(
                         session_title, cleaned_msg, target_profile, _tg_late_reply,
+                        "channel:telegram",
                     )
                     await message.answer(
                         f"{profile_tag}⏳ Conductor busy — message queued, will reply here when done."
@@ -2712,22 +3077,82 @@ def create_slack_app(config: dict):
 
     app = AsyncApp(token=bot_token, authorize=_cached_authorize)
     listen_mode = config["slack"].get("listen_mode", "mentions")
+    default_conductor = config["slack"].get("default_conductor")
 
     # Authorization setup
     allowed_users = config["slack"]["allowed_user_ids"]
+    allow_all_users = config["slack"].get("allow_all_users", False)
+    if config["slack"].get("legacy_open"):
+        log.warning(SLACK_LEGACY_OPEN_WARNING)
+    elif not allowed_users and not allow_all_users:
+        log.warning(SLACK_NO_ALLOWED_USERS_WARNING)
+    # Users already told they are not allowed, so a refused user gets one
+    # reply per bridge process instead of one per message.
+    _refusal_replied: set = set()
 
-    def is_slack_authorized(user_id: str) -> bool:
-        """Check if Slack user is authorized to use the bot.
+    def _bot_team_id():
+        result = _auth_cache.get("result")
+        return getattr(result, "team_id", None) if result else None
 
-        If allowed_user_ids is empty, allow all users (backward compatible).
-        Otherwise, only allow users in the list.
+    def slack_refusal(
+        user_id: str, channel: str, team: str, home_only: bool, event_team: str = "",
+    ):
+        """Return why a Slack event is refused, or None when it is accepted.
+
+        "team": the envelope team (team) or the event's own team (event_team)
+        is another Slack team than the bot's own (an unknown id does not
+        block). "no-user": the event has no user id (an integration or app
+        post), refused in every mode. A user on allowed_user_ids is accepted
+        in any channel, even with allow_all_users.
+        "user": the user is not on allowed_user_ids and allow_all_users is
+        off. "channel": open mode (allow_all_users), a user not on the list,
+        and the event is outside the configured channel while home_only is
+        set. Every refusal is logged without message text.
         """
-        if not allowed_users:  # Empty list = no restrictions
-            return True
-        if user_id not in allowed_users:
-            log.warning("Unauthorized Slack message from user %s", user_id)
-            return False
-        return True
+        bot_team = _bot_team_id()
+        if bot_team and any(t and t != bot_team for t in (team, event_team)):
+            reason = "team"
+        elif not user_id:
+            reason = "no-user"
+        elif user_id in allowed_users:
+            reason = None
+        elif allow_all_users:
+            reason = "channel" if home_only and channel != channel_id else None
+        else:
+            reason = "user"
+        if reason:
+            log.warning(
+                "Refused Slack event (%s): user=%s channel=%s team=%s event_team=%s",
+                reason, user_id, channel, team, event_team,
+            )
+        return reason
+
+    async def _reply_refused_once(say, user_id: str, thread_ts: str | None):
+        if not user_id or user_id in _refusal_replied:
+            return
+        _refusal_replied.add(user_id)
+        try:
+            await say(text=SLACK_REFUSAL_REPLY.format(user_id=user_id), thread_ts=thread_ts)
+        except Exception as e:
+            log.error("Slack refusal reply failed: %s", e)
+
+    async def _slash_authorized(respond, command) -> bool:
+        """Check a slash command before any of the /ad-* handlers runs.
+
+        Same rule as mentions: a user on allowed_user_ids may use the
+        commands in any channel; with allow_all_users (open mode) they are
+        accepted only in the configured channel_id. A refused user gets the
+        refusal text as an ephemeral reply; other refusals stay silent.
+        """
+        user_id = command.get("user_id", "")
+        reason = slack_refusal(
+            user_id, command.get("channel_id", ""), command.get("team_id", ""), True,
+        )
+        if reason == "user":
+            await respond(
+                SLACK_REFUSAL_REPLY.format(user_id=user_id), response_type="ephemeral",
+            )
+        return reason is None
 
     # Caches for Slack user/channel name resolution.
     # Entries: (value: str, expires_at: float | None).
@@ -2844,26 +3269,46 @@ def create_slack_app(config: dict):
         user_id: str = None, event_channel: str = None,
     ):
         """Shared handler for Slack messages and mentions."""
-        conductor_names = get_conductor_names()
+        # One discovery snapshot for both lists (CodeRabbit, #2548): two
+        # separate calls can race, leaving conductor_names empty while
+        # conductors is not — the no-default prompt would then IndexError on
+        # conductor_names[0].
         conductors = discover_conductors()
+        conductor_names = [c["name"] for c in conductors]
 
-        target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
-
-        target = None
-        if target_name:
-            for c in conductors:
-                if c["name"] == target_name:
-                    target = c
-                    break
+        target, cleaned_msg, reason = resolve_slack_routing(
+            text, thread_ts, conductor_names, conductors, default_conductor,
+        )
         if target is None:
-            target = get_default_conductor()
-        if target is None:
+            if reason == "none":
+                await _safe_say(
+                    say,
+                    text="[No conductors configured. Run: agent-deck conductor setup <name>]",
+                    thread_ts=thread_ts,
+                )
+                return
+            # "no_default" (default_conductor = "") or "misconfigured"
+            # (default_conductor names an unknown conductor): reply with the
+            # routing syntax instead of silently picking a conductor.
+            if reason == "misconfigured":
+                log.warning(
+                    "Slack default_conductor %r is not a known conductor",
+                    default_conductor,
+                )
+            names = ", ".join(conductor_names)
             await _safe_say(
                 say,
-                text="[No conductors configured. Run: agent-deck conductor setup <name>]",
+                text=(
+                    "No conductor specified. Route a DM as `name: message`"
+                    f" (e.g. `{conductor_names[0]}: status`).\nConductors: {names}"
+                ),
                 thread_ts=thread_ts,
             )
+            log.info("Slack unprefixed message not routed (reason: %s)", reason)
             return
+        log.info("Slack routing -> [%s] (%s)", target["name"], reason)
+        if thread_ts:
+            remember_thread_conductor(thread_ts, target["name"])
 
         if not cleaned_msg:
             cleaned_msg = text
@@ -2928,7 +3373,7 @@ def create_slack_app(config: dict):
             ok, _, _ = send_to_conductor(
                 session_title, cleaned_msg, profile=profile,
                 wait_for_reply=False, reply_callback=_slack_reply,
-                force_queue=True,
+                force_queue=True, source="channel:slack",
             )
             if not ok:
                 await _safe_say(
@@ -2952,7 +3397,7 @@ def create_slack_app(config: dict):
                 send_to_conductor,
                 session_title, cleaned_msg, profile=profile,
                 wait_for_reply=True, response_timeout=RESPONSE_TIMEOUT,
-                claim_late_reply=True,
+                claim_late_reply=True, source="channel:slack",
             ),
         )
         if not ok:
@@ -2978,6 +3423,7 @@ def create_slack_app(config: dict):
                 if still_running == _WAIT_SEND_QUEUE_REQUIRED:
                     _enqueue_message(
                         session_title, cleaned_msg, profile, _slack_late_reply,
+                        "channel:slack",
                     )
                     notice = f"{name_tag}⏳ Conductor busy — message queued, will reply here when done."
                 elif (still_running is True or isinstance(still_running, dict)) and _register_pending_reply(
@@ -3009,7 +3455,7 @@ def create_slack_app(config: dict):
             await _safe_say(say, text=prefixed, thread_ts=thread_ts)
 
     @app.event("message")
-    async def handle_slack_message(event, say):
+    async def handle_slack_message(event, say, body=None):
         """Handle messages in the configured channel.
 
         Only active when listen_mode is "all". Ignored in "mentions" mode.
@@ -3025,7 +3471,13 @@ def create_slack_app(config: dict):
 
         # Authorization check
         user_id = event.get("user", "")
-        if not is_slack_authorized(user_id):
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        reason = slack_refusal(
+            user_id, event.get("channel"), (body or {}).get("team_id"), False, event.get("team"),
+        )
+        if reason == "user":
+            await _reply_refused_once(say, user_id, thread_ts)
+        if reason:
             return
 
         text = event.get("text", "").strip()
@@ -3033,17 +3485,31 @@ def create_slack_app(config: dict):
             return
         await _handle_slack_text(
             text, say,
-            thread_ts=event.get("thread_ts") or event.get("ts"),
+            thread_ts=thread_ts,
             user_id=user_id, event_channel=event.get("channel"),
         )
 
     @app.event("app_mention")
-    async def handle_slack_mention(event, say):
-        """Handle @bot mentions in any channel the bot is in. Always active."""
+    async def handle_slack_mention(event, say, body=None):
+        """Handle @bot mentions. Always active.
+
+        With allowed_user_ids, a listed user may mention the bot in any
+        channel it is in. With allow_all_users (open mode), mentions are
+        accepted only in the configured channel_id.
+        """
+        # Ignore mentions posted by bots and integrations
+        if event.get("bot_id") or event.get("subtype"):
+            return
 
         # Authorization check
         user_id = event.get("user", "")
-        if not is_slack_authorized(user_id):
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        reason = slack_refusal(
+            user_id, event.get("channel"), (body or {}).get("team_id"), True, event.get("team"),
+        )
+        if reason == "user":
+            await _reply_refused_once(say, user_id, thread_ts)
+        if reason:
             return
 
         text = event.get("text", "")
@@ -3051,7 +3517,6 @@ def create_slack_app(config: dict):
         text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
         if not text:
             return
-        thread_ts = event.get("thread_ts") or event.get("ts")
         await _handle_slack_text(
             text, say,
             thread_ts=thread_ts,
@@ -3063,10 +3528,7 @@ def create_slack_app(config: dict):
         """Handle /ad-status slash command."""
         await ack()
 
-        # Authorization check
-        user_id = command.get("user_id", "")
-        if not is_slack_authorized(user_id):
-            await respond("⛔ Unauthorized. Contact your administrator.")
+        if not await _slash_authorized(respond, command):
             return
 
         profiles = get_unique_profiles()
@@ -3097,10 +3559,7 @@ def create_slack_app(config: dict):
         """Handle /ad-sessions slash command."""
         await ack()
 
-        # Authorization check
-        user_id = command.get("user_id", "")
-        if not is_slack_authorized(user_id):
-            await respond("⛔ Unauthorized. Contact your administrator.")
+        if not await _slash_authorized(respond, command):
             return
 
         profiles = get_unique_profiles()
@@ -3124,10 +3583,7 @@ def create_slack_app(config: dict):
         """Handle /ad-restart slash command."""
         await ack()
 
-        # Authorization check
-        user_id = command.get("user_id", "")
-        if not is_slack_authorized(user_id):
-            await respond("⛔ Unauthorized. Contact your administrator.")
+        if not await _slash_authorized(respond, command):
             return
 
         target_name = command.get("text", "").strip()
@@ -3162,10 +3618,7 @@ def create_slack_app(config: dict):
         """Handle /ad-help slash command."""
         await ack()
 
-        # Authorization check
-        user_id = command.get("user_id", "")
-        if not is_slack_authorized(user_id):
-            await respond("⛔ Unauthorized. Contact your administrator.")
+        if not await _slash_authorized(respond, command):
             return
 
         conductors = discover_conductors()
@@ -3569,6 +4022,7 @@ def create_discord_bot(config: dict):
                     wait_for_reply=True,
                     response_timeout=RESPONSE_TIMEOUT,
                     claim_late_reply=True,
+                    source="channel:discord",
                 ),
             )
         finally:
@@ -3594,6 +4048,7 @@ def create_discord_bot(config: dict):
                 if still_running == _WAIT_SEND_QUEUE_REQUIRED:
                     _enqueue_message(
                         session_title, cleaned_msg, profile, _dc_late_reply,
+                        "channel:discord",
                     )
                     notice = "⏳ Conductor busy — message queued, will reply here when done."
                 elif (still_running is True or isinstance(still_running, dict)) and _register_pending_reply(
@@ -3631,6 +4086,670 @@ def create_discord_bot(config: dict):
         guild_id, channel_id,
     )
     return bot, channel_id
+
+
+# ---------------------------------------------------------------------------
+# Mattermost bot setup
+# ---------------------------------------------------------------------------
+
+# Set on every post the bridge makes, so its own posts are never relayed back.
+MM_BRIDGE_POST_PROP = "from_agent_deck"
+
+# Mattermost IDs are 26 lowercase alphanumerics; anything else is a username.
+_MM_ID_RE = re.compile(r"^[a-z0-9]{26}$")
+
+# Text commands. Mattermost slash commands need an HTTP endpoint the server can
+# reach, so the bridge reads "!status" and friends from ordinary posts instead.
+MM_COMMANDS = ("status", "sessions", "restart", "help")
+
+# Props Mattermost sets on posts that a webhook, bot or plugin made on behalf
+# of a user. Values arrive as "true" strings or booleans.
+MM_AUTOMATED_POST_PROPS = ("from_webhook", "from_bot", "from_plugin")
+
+# Loopback hosts may be reached over plain http without allow_insecure_http.
+_MM_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def describe_error(error: BaseException) -> str:
+    """Text for a log line; some exceptions (asyncio.TimeoutError) have none."""
+    return str(error) or type(error).__name__
+
+
+def _mm_prop_set(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0")
+    return bool(value)
+
+
+def mattermost_retry_after(headers) -> float | None:
+    """Seconds a 429 response asks the client to wait, or None if it does not
+    say. Mattermost sends X-Ratelimit-Reset (seconds until the limit resets);
+    proxies may send Retry-After."""
+    for name in ("Retry-After", "X-Ratelimit-Reset"):
+        try:
+            return max(0.0, float(headers.get(name)))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def mattermost_url_problem(server_url: str, allow_insecure_http: bool) -> str | None:
+    """Why server_url must not be used, or None. The bot token and every
+    message travel on this connection, so plain http needs a loopback host or
+    an explicit allow_insecure_http."""
+    parsed = urllib.parse.urlparse(server_url)
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        return f"server_url {server_url!r} is not an http(s) URL"
+    if parsed.scheme == "http" and parsed.hostname not in _MM_LOOPBACK_HOSTS and not allow_insecure_http:
+        return (
+            f"server_url {server_url!r} uses plain http, which would send the bot token "
+            "unencrypted; use https, or set allow_insecure_http = true"
+        )
+    return None
+
+
+def mattermost_post_text(
+    post: dict,
+    bot_user_id: str,
+    bot_username: str,
+    owner_user_id: str,
+    home_channel_id: str,
+    home_is_dm: bool,
+    listen_mode: str,
+) -> str | None:
+    """The text to act on for a post, or None when the bridge must ignore it.
+
+    Ignored: the bridge's own posts, system posts, posts made by a webhook, bot
+    or plugin, posts outside the home channel, posts by anyone but the owner,
+    and (in a channel with listen_mode "mentions") posts that do not @mention
+    the bot. A mention of the bot is stripped from the text.
+    """
+    if post.get("user_id") == bot_user_id:
+        return None
+    props = post.get("props") or {}
+    if props.get(MM_BRIDGE_POST_PROP):
+        return None
+    if post.get("type"):  # join/leave and other system posts
+        return None
+    # A webhook's posts carry its creator's user_id, so the owner check alone
+    # would obey anyone holding the URL of a webhook the owner created.
+    automated = [p for p in MM_AUTOMATED_POST_PROPS if _mm_prop_set(props.get(p))]
+    if automated:
+        log.warning("Ignoring Mattermost post %s marked %s", post.get("id"), ", ".join(automated))
+        return None
+    if post.get("channel_id") != home_channel_id:
+        return None
+    text = (post.get("message") or "").strip()
+    mention = re.compile(r"(?<![\w@.-])@" + re.escape(bot_username) + r"(?![\w.-])", re.IGNORECASE)
+    if not home_is_dm and listen_mode == "mentions" and not mention.search(text):
+        return None
+    if post.get("user_id") != owner_user_id:
+        log.warning("Unauthorized Mattermost message from user %s", post.get("user_id"))
+        return None
+    text = mention.sub("", text).strip()
+    return text or None
+
+
+def mattermost_reply_root(post: dict, home_is_dm: bool) -> str:
+    """The thread a reply belongs in: the post's own thread, or a new thread
+    under it in a channel. In a DM an unthreaded post is answered unthreaded."""
+    if post.get("root_id"):
+        return post["root_id"]
+    return "" if home_is_dm else post.get("id", "")
+
+
+def parse_mattermost_command(text: str) -> tuple[str, str] | None:
+    """("restart", "ops") for "!restart ops"; None when text is not a command."""
+    if not text.startswith("!"):
+        return None
+    word, _, argument = text[1:].partition(" ")
+    word = word.lower()
+    if word not in MM_COMMANDS:
+        return None
+    return word, argument.strip()
+
+
+def mattermost_command_reply(command: str, argument: str) -> str:
+    """Run a text command and return the reply. Blocking (it calls the CLI)."""
+    if command == "status":
+        profiles = get_unique_profiles()
+        agg = get_status_summary_all(profiles)
+        totals = agg["totals"]
+        lines = [
+            f"Total: {totals['total']} sessions",
+            f"  Running: {totals['running']}",
+            f"  Waiting: {totals['waiting']}",
+            f"  Idle: {totals['idle']}",
+            f"  Error: {totals['error']}",
+        ]
+        if len(profiles) > 1:
+            lines.append("")
+            for profile in profiles:
+                p = agg["per_profile"][profile]
+                lines.append(
+                    f"[{profile}] {p['total']}s "
+                    f"({p['running']}R {p['waiting']}W {p['idle']}I {p['error']}E)"
+                )
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    if command == "sessions":
+        profiles = get_unique_profiles()
+        all_sessions = get_sessions_list_all(profiles)
+        if not all_sessions:
+            return "No sessions found."
+        lines = []
+        for profile, s in all_sessions:
+            prefix = f"[{profile}] " if len(profiles) > 1 else ""
+            lines.append(
+                f"{prefix}{s.get('title', 'untitled')} ({s.get('tool', '')}) - {s.get('status', 'unknown')}"
+            )
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    if command == "restart":
+        target = None
+        if argument:
+            target = next((c for c in discover_conductors() if c["name"] == argument), None)
+            if target is None:
+                return f"No conductor named {argument}."
+        else:
+            target = get_default_conductor()
+        if target is None:
+            return "No conductors found."
+        result = run_cli(
+            "session", "restart", conductor_session_title(target["name"]),
+            profile=target["profile"], timeout=60,
+        )
+        if result.returncode == 0:
+            return f"Conductor {target['name']} restarted."
+        return f"Restart of {target['name']} failed: {result.stderr.strip()}"
+
+    names = [c["name"] for c in discover_conductors()]
+    return (
+        "Conductor commands:\n"
+        "- `!status`: aggregated status across all profiles\n"
+        "- `!sessions`: list all sessions (all profiles)\n"
+        "- `!restart [name]`: restart a conductor (default: the first)\n"
+        "- `!help`: this message\n\n"
+        f"Conductors: {', '.join(names) if names else 'none'}\n"
+        "Route a message with `<name>: <message>`; otherwise it goes to the first conductor."
+    )
+
+
+class MattermostAPIError(RuntimeError):
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+class MattermostBridge:
+    """A Mattermost bot account driven through the REST API and the WebSocket
+    event stream, with nothing but aiohttp.
+
+    It listens in one home channel: a DM between the bot and its owner, or the
+    configured channel_id. Only the owner is obeyed, and every reply and alert
+    goes to the home channel.
+
+    Missed posts are recovered by reading the home channel back to a little
+    before the newest post handled. All timestamps compared are the server's
+    create_at values, so the local clock never decides what was missed.
+    """
+
+    RECONNECT_INITIAL_DELAY = 2
+    RECONNECT_MAX_DELAY = 60
+    # Only a connection that stayed up this long resets the reconnect backoff.
+    STABLE_CONNECTION_SECONDS = 60
+    REQUEST_TIMEOUT = 30
+    TYPING_INTERVAL = 4
+    POST_ATTEMPTS = 3
+    POST_RETRY_DELAY = 1
+    # A 429 is retried after the wait the server asks for, capped here.
+    RATE_LIMIT_ATTEMPTS = 6
+    RATE_LIMIT_DEFAULT_WAIT = 1
+    RATE_LIMIT_MAX_WAIT = 60
+    # Catch-up re-reads this far behind the newest post handled, for posts in
+    # the same millisecond or delivered out of order. Post IDs in the window
+    # are remembered, so nothing in it is handled twice.
+    CATCH_UP_OVERLAP_MS = 60_000
+    CATCH_UP_PAGE_SIZE = 200
+    # After a catch-up, the IDs it read are all kept this long, while the
+    # events that queued on the socket during it are read and matched.
+    CATCH_UP_DEDUP_HOLD_SECONDS = 60
+
+    def __init__(self, settings: dict):
+        self.server_url = settings["server_url"].rstrip("/")
+        problem = mattermost_url_problem(self.server_url, bool(settings.get("allow_insecure_http")))
+        if problem:
+            raise ValueError(problem)
+        self._token = settings["bot_token"]
+        self._owner = settings["user"].lstrip("@")
+        self._configured_channel_id = settings.get("channel_id", "")
+        self.listen_mode = settings.get("listen_mode", "all")
+        self._api = f"{self.server_url}/api/v4"
+        self._ws_url = re.sub(r"^http", "ws", self.server_url) + "/api/v4/websocket"
+        self._http = None
+        self.bot_user_id = ""
+        self.bot_username = ""
+        self.owner_user_id = ""
+        self.owner_username = ""
+        self.home_channel_id = ""
+        self.home_is_dm = True
+        self.home_channel_tag = "[dm]"
+        # create_at of every home-channel post handled (or present at start)
+        # inside the catch-up window, by post ID.
+        self._seen_posts: dict[str, int] = {}
+        self._prune_at = 1024
+        # Until _dedup_hold_until, IDs at or after _dedup_hold_floor are kept.
+        self._dedup_hold_floor = 0
+        self._dedup_hold_until = 0.0
+        self._last_create_at = 0
+        self._connected_at: float | None = None
+        self._tasks: set = set()
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.home_channel_id)
+
+    async def _request(self, method: str, path: str, **kwargs):
+        timeout = aiohttp.ClientTimeout(total=self.REQUEST_TIMEOUT)
+        for attempt in range(1, self.RATE_LIMIT_ATTEMPTS + 1):
+            async with self._http.request(method, f"{self._api}{path}", timeout=timeout, **kwargs) as resp:
+                # Error bodies need not be JSON: the rate limiter answers a
+                # 429 with plain text.
+                if resp.status == 429 and attempt < self.RATE_LIMIT_ATTEMPTS:
+                    wait = mattermost_retry_after(resp.headers)
+                    if wait is None:
+                        wait = self.RATE_LIMIT_DEFAULT_WAIT * attempt
+                    wait = min(wait, self.RATE_LIMIT_MAX_WAIT)
+                    log.warning("Mattermost %s %s rate limited; retrying in %ss", method, path, wait)
+                elif resp.status >= 300:
+                    text = await resp.text()
+                    try:
+                        detail = json.loads(text).get("message") or text
+                    except (ValueError, AttributeError):
+                        detail = text.strip()
+                    raise MattermostAPIError(
+                        f"Mattermost {method} {path} failed ({resp.status}): {detail}", resp.status,
+                    )
+                else:
+                    return await resp.json(content_type=None)
+            await asyncio.sleep(wait)
+
+    async def start(self) -> None:
+        """Identify the bot and its owner and resolve the home channel."""
+        if self._http is None:
+            self._http = aiohttp.ClientSession(headers={"Authorization": f"Bearer {self._token}"})
+        me = await self._request("GET", "/users/me")
+        self.bot_user_id, self.bot_username = me["id"], me["username"]
+        owner_path = f"/users/{self._owner}" if _MM_ID_RE.match(self._owner) else f"/users/username/{self._owner}"
+        owner = await self._request("GET", owner_path)
+        self.owner_user_id, self.owner_username = owner["id"], owner["username"]
+        if self._configured_channel_id:
+            channel = await self._request("GET", f"/channels/{self._configured_channel_id}")
+        else:
+            channel = await self._request(
+                "POST", "/channels/direct", json=[self.bot_user_id, self.owner_user_id],
+            )
+        self.home_is_dm = channel.get("type") == "D"
+        self.home_channel_tag = (
+            "[dm]" if self.home_is_dm
+            else f"[channel:~{channel.get('name') or channel['id']} ({channel['id']})]"
+        )
+        if not self._last_create_at:
+            await self._skip_existing_posts(channel["id"])
+        self.home_channel_id = channel["id"]
+        log.info(
+            "Mattermost bot @%s ready (owner=@%s, home=%s)",
+            self.bot_username, self.owner_username,
+            "DM" if self.home_is_dm else self.home_channel_tag,
+        )
+
+    async def _skip_existing_posts(self, channel_id: str) -> None:
+        """Start the catch-up point at the channel's newest post, and remember
+        the posts in its overlap window so a catch-up does not replay them.
+
+        The newest post and the window come from one newest-first read whose
+        pages are anchored on posts already read, so posts arriving meanwhile
+        are never on its later pages and are left for the first catch-up.
+        """
+        for post in await self._read_back(channel_id, None):
+            self._seen_posts[post["id"]] = post.get("create_at", 0)
+            self._last_create_at = max(self._last_create_at, post.get("create_at", 0))
+
+    async def _read_back(self, channel_id: str, floor: int | None) -> list[dict]:
+        """Every live post in the channel created at or after floor, oldest
+        first. With floor None, the floor is the overlap window behind the
+        newest post on the first page.
+
+        Pages back from the newest post until it passes floor, however many
+        pages that takes: stopping early would abandon the oldest missed
+        posts. (The `since` query is no use: the server caps it at 1000 posts,
+        other users' posts included.) Posts the owner did not write can never
+        be acted on, so only their ID and create_at are kept.
+
+        Each page after the first is the posts `before` one already read, not
+        a numeric offset: a post deleted or added mid-read would shift offsets
+        and make a page skip or repeat posts at its edge.
+        """
+        found: dict[str, dict] = {}
+        anchor: dict | None = None
+        while True:
+            params = {"per_page": str(self.CATCH_UP_PAGE_SIZE)}
+            if anchor is not None:
+                params["before"] = anchor["id"]
+            listing = await self._request("GET", f"/channels/{channel_id}/posts", params=params)
+            order = listing.get("order") or []
+            posts = listing.get("posts") or {}
+            # `posts` also holds the thread roots of replies on the page.
+            batch = [posts[i] for i in order if i in posts]
+            if floor is None:
+                newest = max((p.get("create_at", 0) for p in batch), default=0)
+                floor = newest - self.CATCH_UP_OVERLAP_MS
+            for post in batch:
+                create_at = post.get("create_at", 0)
+                if create_at < floor or post.get("delete_at") or post["id"] in found:
+                    continue
+                if post.get("user_id") == self.owner_user_id:
+                    found[post["id"]] = post
+                else:
+                    found[post["id"]] = {"id": post["id"], "create_at": create_at, "compact": True}
+            if len(order) < self.CATCH_UP_PAGE_SIZE or min((p.get("create_at", 0) for p in batch), default=0) < floor:
+                break
+            next_anchor = self._page_anchor(batch)
+            if anchor is not None and next_anchor.get("create_at", 0) >= anchor.get("create_at", 0):
+                raise RuntimeError("Mattermost catch-up is not making progress; will retry")
+            anchor = next_anchor
+        return sorted(found.values(), key=lambda p: (p.get("create_at", 0), p["id"]))
+
+    @staticmethod
+    def _page_anchor(batch: list[dict]) -> dict:
+        """The post to read the next page `before`.
+
+        `before` returns posts strictly older than the anchor's create_at, and
+        a full page can end part way through the posts of one millisecond. So
+        the anchor is the oldest post newer than the page's oldest
+        millisecond, and the next page re-reads that millisecond whole.
+        """
+        oldest = min(p.get("create_at", 0) for p in batch)
+        newer = [p for p in batch if p.get("create_at", 0) > oldest]
+        if newer:
+            return min(newer, key=lambda p: p.get("create_at", 0))
+        log.warning(
+            "Mattermost: a full page of posts shares one millisecond; others in it may be skipped",
+        )
+        return min(batch, key=lambda p: p.get("create_at", 0))
+
+    async def run(self) -> None:
+        """Start, then keep the event stream open, reconnecting with backoff.
+
+        A failed start raises, so _run_platform_task retries it.
+        """
+        if not self.ready:
+            await self.start()
+        delay = self.RECONNECT_INITIAL_DELAY
+        while True:
+            self._connected_at = None
+            try:
+                await self._listen()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Mattermost event stream failed: %s", describe_error(e))
+            if (
+                self._connected_at is not None
+                and time.monotonic() - self._connected_at >= self.STABLE_CONNECTION_SECONDS
+            ):
+                delay = self.RECONNECT_INITIAL_DELAY
+            log.info("Mattermost: reconnecting in %ss", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
+
+    async def _listen(self) -> None:
+        async with self._http.ws_connect(self._ws_url, heartbeat=30) as ws:
+            self._connected_at = time.monotonic()
+            log.info("Mattermost event stream connected")
+            await self._catch_up()
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    self._on_event(json.loads(msg.data))
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    raise ws.exception() or ConnectionError("websocket error")
+        log.warning("Mattermost event stream closed")
+
+    async def _catch_up(self) -> None:
+        """Handle home-channel posts made while the stream was down.
+
+        The whole backlog is read before any of it is handled, so a read that
+        fails part way leaves the catch-up point where it was and the next
+        connection reads it all again.
+        """
+        floor = self._last_create_at - self.CATCH_UP_OVERLAP_MS if self._last_create_at else 0
+        posts = await self._read_back(self.home_channel_id, floor)
+        self._forget_old_posts()
+        # Posts made during the catch-up are queued on the socket too, and may
+        # be anywhere in the window it read: keep every ID in it until they
+        # have been read.
+        self._dedup_hold_floor = floor
+        self._dedup_hold_until = float("inf")
+        skipped = 0
+        for post in posts:
+            if post.get("compact"):
+                skipped += self._remember(post) is not None
+            else:
+                self._accept(post)
+        if skipped:
+            log.info("Mattermost catch-up passed over %d posts by other users", skipped)
+        self._dedup_hold_until = time.monotonic() + self.CATCH_UP_DEDUP_HOLD_SECONDS
+
+    def _forget_old_posts(self) -> None:
+        """Drop remembered IDs older than any catch-up or queued socket event
+        can deliver again."""
+        floor = self._last_create_at - self.CATCH_UP_OVERLAP_MS
+        if time.monotonic() < self._dedup_hold_until:
+            floor = min(floor, self._dedup_hold_floor)
+        self._seen_posts = {i: t for i, t in self._seen_posts.items() if t >= floor}
+        self._prune_at = max(1024, 2 * len(self._seen_posts))
+
+    def _on_event(self, event: dict) -> None:
+        if event.get("event") != "posted":
+            return
+        try:
+            post = json.loads(event["data"]["post"])
+        except (KeyError, TypeError, ValueError) as e:
+            log.warning("Mattermost: unreadable posted event: %s", describe_error(e))
+            return
+        self._accept(post)
+
+    def _remember(self, post: dict) -> str | None:
+        """Record a home-channel post as seen. Its ID if it is new, else None."""
+        post_id = post.get("id")
+        if not post_id or post_id in self._seen_posts:
+            return None
+        create_at = post.get("create_at", 0)
+        self._seen_posts[post_id] = create_at
+        self._last_create_at = max(self._last_create_at, create_at)
+        if len(self._seen_posts) >= self._prune_at:
+            self._forget_old_posts()
+        return post_id
+
+    def _accept(self, post: dict) -> None:
+        # Posts elsewhere (the bot can be in other channels) must not move
+        # the catch-up point past an unseen home-channel post.
+        if post.get("channel_id") != self.home_channel_id:
+            return
+        if self._remember(post) is None:
+            return
+        # Handled in its own task: a relay can wait minutes for the conductor,
+        # and the event stream must keep being read meanwhile.
+        task = asyncio.create_task(self._handle_post(post))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _handle_post(self, post: dict) -> None:
+        try:
+            text = mattermost_post_text(
+                post, self.bot_user_id, self.bot_username, self.owner_user_id,
+                self.home_channel_id, self.home_is_dm, self.listen_mode,
+            )
+            if text is None:
+                return
+            root_id = mattermost_reply_root(post, self.home_is_dm)
+            command = parse_mattermost_command(text)
+            if command is not None:
+                loop = asyncio.get_running_loop()
+                reply = await loop.run_in_executor(
+                    None, functools.partial(mattermost_command_reply, *command),
+                )
+                await self.post(reply, root_id)
+                return
+            await self._relay(text, root_id)
+        except Exception as e:
+            log.error("Mattermost: handling post %s failed: %s", post.get("id"), describe_error(e))
+
+    async def post(self, text: str, root_id: str = "") -> bool:
+        """Post text to the home channel (split if long). True if all of it posted."""
+        if not self.ready:
+            log.warning("Mattermost: not connected yet; dropping post")
+            return False
+        ok = True
+        for chunk in split_message(text, max_len=MM_MAX_LENGTH):
+            ok = await self._post_chunk(chunk, root_id) and ok
+        return ok
+
+    async def _post_chunk(self, chunk: str, root_id: str) -> bool:
+        """Post one chunk, retrying network errors and 5xx responses. A retry
+        after a lost response can duplicate the post; that beats losing a reply."""
+        for attempt in range(1, self.POST_ATTEMPTS + 1):
+            try:
+                await self._request("POST", "/posts", json={
+                    "channel_id": self.home_channel_id,
+                    "message": chunk,
+                    "root_id": root_id,
+                    "props": {MM_BRIDGE_POST_PROP: True},
+                })
+                return True
+            except Exception as e:
+                retryable = not isinstance(e, MattermostAPIError) or e.status >= 500
+                if not retryable or attempt == self.POST_ATTEMPTS:
+                    log.error("Mattermost post failed (attempt %d): %s", attempt, describe_error(e))
+                    return False
+                log.warning("Mattermost post failed (attempt %d), retrying: %s", attempt, describe_error(e))
+                await asyncio.sleep(self.POST_RETRY_DELAY * attempt)
+        return False
+
+    async def _show_typing(self, root_id: str) -> None:
+        """Show "<bot> is typing" until cancelled. Best effort."""
+        try:
+            while True:
+                await self._request("POST", f"/users/{self.bot_user_id}/typing", json={
+                    "channel_id": self.home_channel_id, "parent_id": root_id,
+                })
+                await asyncio.sleep(self.TYPING_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("Mattermost typing indicator failed; continuing: %s", describe_error(e))
+
+    async def _relay(self, text: str, root_id: str) -> None:
+        """Send text to its conductor and post the reply, mirroring the Slack
+        flow: queue while the conductor is busy, else wait for the reply, and
+        hand a turn that outlasts the wait to a late-reply watcher."""
+        async def reply(message: str) -> None:
+            await self.post(message, root_id)
+
+        conductors = discover_conductors()
+        target_name, cleaned = parse_conductor_prefix(text, [c["name"] for c in conductors])
+        target = next((c for c in conductors if c["name"] == target_name), None) or get_default_conductor()
+        if target is None:
+            await reply("[No conductors configured. Run: agent-deck conductor setup <name>]")
+            return
+
+        message = (
+            f"[from:{self.owner_username} ({self.owner_user_id})] "
+            f"{self.home_channel_tag} {cleaned or text}"
+        )
+        session_title = conductor_session_title(target["name"])
+        profile = target["profile"]
+        name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
+
+        if not await ensure_conductor_running(target["name"], profile):
+            await reply(f"[Could not start conductor {target['name']}. Check agent-deck.]")
+            return
+
+        loop = asyncio.get_running_loop()
+        status = await loop.run_in_executor(
+            None, functools.partial(get_session_status, session_title, profile=profile),
+        )
+        log.info("Mattermost message -> [%s]: %s", target["name"], message[:100])
+        started_at = time.monotonic()
+        busy_notice = f"{name_tag}⏳ Conductor busy — message queued, will reply here when done."
+
+        async def late_reply(response_text: str) -> None:
+            elapsed = int(time.monotonic() - started_at)
+            waited = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+            await reply(f"{name_tag}Queued response (waited {waited}):\n{response_text}")
+
+        if status in ("running", "active", "starting"):
+            ok, _, _ = send_to_conductor(
+                session_title, message, profile=profile,
+                wait_for_reply=False, reply_callback=late_reply, force_queue=True,
+            )
+            await reply(busy_notice if ok else f"[Failed to send message to conductor {target['name']}.]")
+            return
+
+        typing = asyncio.create_task(self._show_typing(root_id))
+        try:
+            ok, response, still_running = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    send_to_conductor, session_title, message, profile=profile,
+                    wait_for_reply=True, response_timeout=RESPONSE_TIMEOUT,
+                    claim_late_reply=True,
+                ),
+            )
+        finally:
+            typing.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await typing
+
+        if ok:
+            log.info("Conductor [%s] response: %s", target["name"], response[:100])
+            await reply(f"{name_tag}{response}")
+            return
+        if not still_running:
+            await reply(f"[Failed to send message to conductor {target['name']}.]")
+            return
+        # The message WAS delivered; the turn just outran the blocking wait.
+        # Don't re-send (that would double-process): watch for the reply.
+        receipt = still_running if isinstance(still_running, dict) else None
+        if still_running == _WAIT_SEND_QUEUE_REQUIRED:
+            _enqueue_message(session_title, message, profile, late_reply)
+            notice = busy_notice
+        elif _register_pending_reply(session_title, profile, receipt, late_reply):
+            notice = f"{name_tag}⏳ Still working — will reply here when done."
+        else:
+            _release_late_reply_claim(session_title, profile, receipt)
+            notice = f"[Accepted turn could not acquire a reply watcher {target['name']}.]"
+        await reply(notice)
+
+    async def close(self) -> None:
+        if self._http is not None:
+            await self._http.close()
+            self._http = None
+
+
+def create_mattermost_bot(config: dict) -> MattermostBridge | None:
+    """The Mattermost bot, or None if Mattermost is not configured or aiohttp
+    is unavailable. Nothing touches the network until run()."""
+    if not HAS_AIOHTTP:
+        log.warning("aiohttp not installed, skipping Mattermost bot")
+        return None
+    if not config["mattermost"]["configured"]:
+        return None
+    try:
+        return MattermostBridge(config["mattermost"])
+    except ValueError as e:
+        log.error("Mattermost bot not started: %s", describe_error(e))
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -3710,7 +4829,7 @@ async def need_scan_cycle(
     need_state: dict,
     save_state,
     telegram_bot=None, slack_app=None, slack_channel_id=None,
-    discord_bot=None, discord_channel_id=None,
+    discord_bot=None, discord_channel_id=None, mattermost_bot=None,
 ) -> None:
     """One scan pass over all heartbeat-enabled conductors (issue #2426).
 
@@ -3730,6 +4849,7 @@ async def need_scan_cycle(
     changed = False
     deliver = need_alert_deliverer(
         tg_user_id, telegram_bot, slack_app, slack_channel_id, discord_bot, discord_channel_id,
+        mattermost_bot,
     )
 
     # Forget conductors that are gone or no longer heartbeat-enabled so the
@@ -3789,7 +4909,7 @@ async def need_scan_cycle(
 
 async def _deliver_need_alert(
     alert_msg: str, tg_user_id, telegram_bot, slack_app, slack_channel_id,
-    discord_bot, discord_channel_id,
+    discord_bot, discord_channel_id, mattermost_bot=None,
 ) -> bool:
     """Send a NEED alert to every configured channel; True if any accepted it."""
     delivered = False
@@ -3801,8 +4921,11 @@ async def _deliver_need_alert(
             log.error("Failed to send Telegram notification: %s", e)
     if slack_app and slack_channel_id:
         try:
-            await slack_app.client.chat_postMessage(channel=slack_channel_id, text=alert_msg)
+            resp = await slack_app.client.chat_postMessage(channel=slack_channel_id, text=alert_msg)
             delivered = True
+            conductor_name = _DELIVER_CONDUCTOR.get()
+            if conductor_name:
+                remember_thread_conductor(_slack_post_ts(resp), conductor_name)
         except Exception as e:
             log.error("Failed to send Slack notification: %s", e)
     if discord_bot and discord_channel_id:
@@ -3813,12 +4936,18 @@ async def _deliver_need_alert(
                 delivered = True
         except Exception as e:
             log.error("Failed to send Discord notification: %s", e)
+    if mattermost_bot is not None:
+        try:
+            if await mattermost_bot.post(alert_msg):
+                delivered = True
+        except Exception as e:
+            log.error("Failed to send Mattermost notification: %s", describe_error(e))
     return delivered
 
 
 async def heartbeat_need_scan_loop(
     config: dict, telegram_bot=None, slack_app=None, slack_channel_id=None,
-    discord_bot=None, discord_channel_id=None,
+    discord_bot=None, discord_channel_id=None, mattermost_bot=None,
 ):
     """Scan-only NEED: forwarder for OS-heartbeat mode (issue #2426).
 
@@ -3854,7 +4983,7 @@ async def heartbeat_need_scan_loop(
             await need_scan_cycle(
                 config, need_state, lambda: save_need_scan_state(state_path, need_state),
                 telegram_bot, slack_app, slack_channel_id,
-                discord_bot, discord_channel_id,
+                discord_bot, discord_channel_id, mattermost_bot,
             )
         except Exception as e:
             log.error("NEED scan cycle failed: %s", e)
@@ -3863,7 +4992,7 @@ async def heartbeat_need_scan_loop(
 
 async def heartbeat_loop(
     config: dict, telegram_bot=None, slack_app=None, slack_channel_id=None,
-    discord_bot=None, discord_channel_id=None,
+    discord_bot=None, discord_channel_id=None, mattermost_bot=None,
 ):
     """Periodic heartbeat: check status for each conductor and trigger checks."""
     global_interval = config["heartbeat_interval"]
@@ -3875,7 +5004,7 @@ async def heartbeat_loop(
         log.info("OS heartbeat daemon detected; switching to scan-only NEED forwarding (no bridge ticks)")
         await heartbeat_need_scan_loop(
             config, telegram_bot, slack_app, slack_channel_id,
-            discord_bot, discord_channel_id,
+            discord_bot, discord_channel_id, mattermost_bot,
         )
         return
 
@@ -3883,6 +5012,7 @@ async def heartbeat_loop(
     tg_user_id = config["telegram"]["user_id"] if config["telegram"]["configured"] else None
     deliver_alert = need_alert_deliverer(
         tg_user_id, telegram_bot, slack_app, slack_channel_id, discord_bot, discord_channel_id,
+        mattermost_bot,
     )
 
     # Per-conductor NEED: dedup state for issue #971 — tracks consecutive
@@ -4114,6 +5244,7 @@ async def heartbeat_loop(
                         profile=profile,
                         wait_for_reply=True,
                         response_timeout=RESPONSE_TIMEOUT,
+                        source=f"heartbeat:{name}",
                     ),
                 )
                 if not ok:
@@ -4187,7 +5318,7 @@ async def _run_platform_task(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.error("%s task failed: %s; retrying in %ds", name, e, backoff)
+            log.error("%s task failed: %s; retrying in %ds", name, describe_error(e), backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
 
@@ -4203,15 +5334,18 @@ async def main():
     tg_ok = config["telegram"]["configured"] and HAS_AIOGRAM
     sl_ok = config["slack"]["configured"] and HAS_SLACK
     dc_ok = config["discord"]["configured"] and HAS_DISCORD
+    mm_ok = config["mattermost"]["configured"] and HAS_AIOHTTP
 
-    if not tg_ok and not sl_ok and not dc_ok:
+    if not tg_ok and not sl_ok and not dc_ok and not mm_ok:
         if config["telegram"]["configured"] and not HAS_AIOGRAM:
             log.error("Telegram configured but aiogram not installed. pip install aiogram")
         if config["slack"]["configured"] and not HAS_SLACK:
             log.error("Slack configured but slack-bolt not installed. pip install slack-bolt slack-sdk")
         if config["discord"]["configured"] and not HAS_DISCORD:
             log.error("Discord configured but discord.py not installed. pip install discord.py")
-        if not config["telegram"]["configured"] and not config["slack"]["configured"] and not config["discord"]["configured"]:
+        if config["mattermost"]["configured"] and not HAS_AIOHTTP:
+            log.error("Mattermost configured but aiohttp not installed. pip install aiohttp")
+        if not any(config[p]["configured"] for p in ("telegram", "slack", "discord", "mattermost")):
             log.error("No messaging platform configured. Exiting.")
         sys.exit(1)
 
@@ -4222,6 +5356,8 @@ async def main():
         platforms.append("Slack")
     if dc_ok:
         platforms.append("Discord")
+    if mm_ok:
+        platforms.append("Mattermost")
 
     log.info(
         "Starting conductor bridge (platforms=%s, heartbeat=%dm, conductors=%s)",
@@ -4253,6 +5389,9 @@ async def main():
         if result:
             discord_bot, discord_channel_id = result
 
+    # Create Mattermost bot (it connects in its platform task)
+    mattermost_bot = create_mattermost_bot(config) if mm_ok else None
+
     # Pre-start all conductors so they're warm when messages arrive
     for c in conductors:
         if await ensure_conductor_running(c["name"], c["profile"]):
@@ -4269,6 +5408,7 @@ async def main():
             slack_channel_id=slack_channel_id,
             discord_bot=discord_bot,
             discord_channel_id=discord_channel_id,
+            mattermost_bot=mattermost_bot,
         )
     )
 
@@ -4281,6 +5421,7 @@ async def main():
             slack_channel_id=slack_channel_id,
             discord_bot=discord_bot,
             discord_channel_id=discord_channel_id,
+            mattermost_bot=mattermost_bot,
         )
     )
 
@@ -4303,6 +5444,11 @@ async def main():
             lambda: discord_bot.start(config["discord"]["bot_token"]),
         )))
         log.info("Discord bot started")
+    if mattermost_bot:
+        tasks.append(asyncio.create_task(_run_platform_task(
+            "Mattermost", mattermost_bot.run,
+        )))
+        log.info("Mattermost bot started")
 
     try:
         await asyncio.gather(*tasks)
@@ -4315,6 +5461,8 @@ async def main():
             await slack_handler.close_async()
         if discord_bot:
             await discord_bot.close()
+        if mattermost_bot:
+            await mattermost_bot.close()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/asheshgoplani/agent-deck/internal/sendqueue"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/watcher"
@@ -76,6 +79,24 @@ func handleWatcher(profile string, args []string) {
 		return
 	}
 
+	// Resolve the profile the way the TUI, web and every other command do:
+	// -p, AGENTDECK_PROFILE, a CLAUDE_CONFIG_DIR-inferred profile behind the
+	// #1790 guard, then default_profile. The raw -p value is "" when the flag
+	// is absent, and GetDBPathForProfile reads "" as the default profile, so
+	// without this a watcher went to a profile whose engine never runs it
+	// (#2740). help, install-skill, import and routes touch no profile
+	// state, so they skip the resolution and its #1790 warning.
+	switch args[0] {
+	case "help", "--help", "-h", "install-skill", "import", "routes":
+	default:
+		resolved, err := session.ResolveProfileForStorage(profile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to resolve profile: %v\n", err)
+			exitCLI(1)
+		}
+		profile = resolved
+	}
+
 	switch args[0] {
 	case "import":
 		handleWatcherImport(profile, args[1:])
@@ -89,6 +110,8 @@ func handleWatcher(profile string, args []string) {
 		handleWatcherList(profile, args[1:])
 	case "status":
 		handleWatcherStatus(profile, args[1:])
+	case "reload":
+		handleWatcherReload(profile, args[1:])
 	case "test":
 		handleWatcherTest(profile, args[1:])
 	case "routes":
@@ -96,7 +119,7 @@ func handleWatcher(profile string, args []string) {
 	case "install-skill":
 		if err := handleWatcherInstallSkill(profile, args[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	case "help", "--help", "-h":
 		printWatcherHelp()
@@ -104,11 +127,12 @@ func handleWatcher(profile string, args []string) {
 		fmt.Fprintf(os.Stderr, "Unknown watcher command: %s\n", args[0])
 		fmt.Fprintln(os.Stderr)
 		printWatcherHelp()
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
-// openWatcherDB opens the statedb for the given profile.
+// openWatcherDB opens the statedb for the given profile, already resolved by
+// handleWatcher: an empty name opens the default profile's.
 func openWatcherDB(profile string) (*statedb.StateDB, error) {
 	dbPath, err := session.GetDBPathForProfile(profile)
 	if err != nil {
@@ -121,6 +145,10 @@ func openWatcherDB(profile string) (*statedb.StateDB, error) {
 	if err := db.Migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate statedb: %w", err)
+	}
+	if err := db.BindProfile(statedb.ProfileNameForDir(filepath.Dir(dbPath))); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return db, nil
 }
@@ -140,15 +168,20 @@ func isValidWatcherType(t string) bool {
 
 // handleWatcherCreate creates a new watcher entry in statedb and writes meta.json.
 func handleWatcherCreate(profile string, args []string) {
-	fs := flag.NewFlagSet("watcher create", flag.ExitOnError)
+	fs := flag.NewFlagSet("watcher create", flag.ContinueOnError)
 	name := fs.String("name", "", "Watcher name (required)")
 	port := fs.Int("port", 0, "Port for webhook adapter")
 	topic := fs.String("topic", "", "Topic for ntfy or slack adapter")
 	// --secret is DEPRECATED and refused at runtime (audit M2): an inline secret
 	// leaks via /proc/<pid>/cmdline, `ps`, and shell history. Source the github
-	// HMAC secret from $GITHUB_WEBHOOK_SECRET or --secret-file (chmod 600).
-	secret := fs.String("secret", "", "DEPRECATED/insecure: use $GITHUB_WEBHOOK_SECRET or --secret-file")
-	secretFile := fs.String("secret-file", "", "Path to a chmod-600 file holding the github HMAC secret")
+	// or webhook secret from $GITHUB_WEBHOOK_SECRET / $WEBHOOK_SECRET or
+	// --secret-file (chmod 600).
+	secret := fs.String("secret", "", "DEPRECATED/insecure: use $GITHUB_WEBHOOK_SECRET / $WEBHOOK_SECRET or --secret-file")
+	secretFile := fs.String("secret-file", "", "Path to a chmod-600 file holding the github or webhook secret (webhook: generated when not given)")
+	noSecret := fs.Bool("no-secret", false, "webhook only: accept unsigned requests from local processes (not recommended)")
+	server := fs.String("server", "", "ntfy server URL for ntfy or slack adapter (default "+watcher.DefaultNtfyServer+")")
+	tokenFile := fs.String("token-file", "", "Path to a chmod-600 file holding an ntfy access token (or set $NTFY_TOKEN)")
+	randomTopic := fs.Bool("random-topic", false, "Generate a random, hard-to-guess topic for ntfy or slack adapter")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck watcher create <type> --name <name> [options]")
@@ -164,8 +197,8 @@ func handleWatcherCreate(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	remaining := fs.Args()
@@ -173,60 +206,80 @@ func handleWatcherCreate(profile string, args []string) {
 		fmt.Fprintln(os.Stderr, "Error: adapter type is required")
 		fmt.Fprintln(os.Stderr)
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 	adapterType := remaining[0]
 
 	// Validate type (T-16-01)
 	if !isValidWatcherType(adapterType) {
 		fmt.Fprintf(os.Stderr, "Error: unknown adapter type %q. Valid types: %v\n", adapterType, validWatcherTypes)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if *name == "" {
 		fmt.Fprintln(os.Stderr, "Error: --name is required")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Validate type-specific required flags
-	var githubSecret string
+	var githubSecret, webhookSecret, ntfyToken string
 	switch adapterType {
 	case "webhook":
 		if *port == 0 {
 			fmt.Fprintln(os.Stderr, "Error: --port is required for webhook adapter")
-			os.Exit(1)
+			exitCLI(1)
 		}
-	case "ntfy":
+		s, err := resolveWebhookSecret(*secret, *secretFile, *noSecret, os.Getenv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			exitCLI(1)
+		}
+		webhookSecret = s
+	case "ntfy", "slack":
+		if *topic != "" && *randomTopic {
+			fmt.Fprintln(os.Stderr, "Error: --topic and --random-topic cannot be used together")
+			exitCLI(1)
+		}
+		if *randomTopic {
+			t, err := watcher.RandomNtfyTopic()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				exitCLI(1)
+			}
+			*topic = t
+		}
 		if *topic == "" {
-			fmt.Fprintln(os.Stderr, "Error: --topic is required for ntfy adapter")
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "Error: --topic (or --random-topic) is required for %s adapter\n", adapterType)
+			exitCLI(1)
 		}
+		// Like the github secret, the token never comes from a CLI arg.
+		tok, err := resolveNtfyToken(*tokenFile, os.Getenv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			exitCLI(1)
+		}
+		ntfyToken = tok
 	case "github":
 		// Audit M2: never accept the HMAC secret as a process-visible CLI arg.
 		s, err := resolveGithubWebhookSecret(*secret, *secretFile, os.Getenv)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		githubSecret = s
-	case "slack":
-		if *topic == "" {
-			fmt.Fprintln(os.Stderr, "Error: --topic is required for slack adapter")
-			os.Exit(1)
-		}
 	}
 
 	db, err := openWatcherDB(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer db.Close()
 
 	configPath, err := session.WatcherNameDir(*name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error resolving watcher dir: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// A watcher is published as two artifacts that have to describe the same
@@ -243,17 +296,17 @@ func handleWatcherCreate(profile string, args []string) {
 	existing, err := db.LoadWatcherByName(*name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error checking for an existing watcher: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if existing != nil {
 		fmt.Fprintf(os.Stderr,
 			"Error: watcher %q already exists (type: %s). Edit %s to change its settings, or pick another --name.\n",
 			*name, existing.Type, filepath.Join(existing.ConfigPath, "watcher.toml"))
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Persist the adapter settings the runtime engine reads back from
-	// watcher.toml [source] (see internal/ui/home.go loadWatcherSourceSettings)
+	// watcher.toml [source] (see internal/watcher/host.go loadSourceSettings)
 	// BEFORE the watcher is published to the state db. Anything only held in a
 	// flag here is lost: the engine never sees it, the adapter's Setup fails at
 	// startup, and the watcher silently never runs. Writing first means a failed
@@ -264,23 +317,29 @@ func handleWatcherCreate(profile string, args []string) {
 	// the db check above cannot, because two concurrent creates of a fresh name
 	// both see no row. Creating watcher.toml is atomic and fails if the file
 	// exists, so at most one of them reaches the db and the surviving config and
-	// row always come from the same command. (webhook writes no [source] file
-	// and so has nothing that can disagree with its row.)
+	// row always come from the same command. Every adapter type writes one, so
+	// every create claims its name this way.
 	claimedName := true
 	switch adapterType {
+	case "webhook":
+		claimedName, err = writeWebhookWatcherSource(configPath, *port, webhookSecret)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing watcher config: %v\n", err)
+			exitCLI(1)
+		}
 	case "github":
 		// Audit M2: persist the resolved HMAC secret at 0600, never to a
 		// process arg / state.db.
 		claimedName, err = writeGithubWatcherSecret(configPath, githubSecret, *port)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing watcher secret: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	case "ntfy", "slack":
-		claimedName, err = writeTopicWatcherSource(configPath, adapterType, *topic)
+		claimedName, err = writeTopicWatcherSource(configPath, adapterType, *topic, *server, ntfyToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing watcher config: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 	if !claimedName {
@@ -299,7 +358,7 @@ func handleWatcherCreate(profile string, args []string) {
 			"Error: %s already exists and was left untouched; agent-deck never overwrites a watcher config.\n"+
 				"Set this watcher's values under [source] in that file, or remove the file and re-run to generate it.\n",
 			filepath.Join(configPath, "watcher.toml"))
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	now := time.Now()
@@ -316,7 +375,7 @@ func handleWatcherCreate(profile string, args []string) {
 
 	if err := db.SaveWatcher(&row); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving watcher: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if err := session.SaveWatcherMeta(&session.WatcherMeta{
@@ -325,10 +384,97 @@ func handleWatcherCreate(profile string, args []string) {
 		CreatedAt: now.Format(time.RFC3339),
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving watcher meta: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	fmt.Printf("Created watcher: %s (type: %s)\n", *name, adapterType)
+	if adapterType == "webhook" {
+		printWebhookSecretHelp(*name, filepath.Join(configPath, "watcher.toml"), *port, webhookSecret != "")
+	}
+	if adapterType == "ntfy" || adapterType == "slack" {
+		if *randomTopic {
+			// The topic is a bearer capability: point at it, never print it.
+			fmt.Printf("Generated a random topic; it is stored as topic under [source] in %s\n",
+				filepath.Join(configPath, "watcher.toml"))
+		}
+		if msg := watcher.PublicNtfyTopicWarning(adapterType, *server, *topic, ntfyToken); msg != "" {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+		}
+	}
+}
+
+// resolveWebhookSecret sources the webhook watcher's shared secret the same
+// way as the github one, from $WEBHOOK_SECRET or --secret-file (chmod 600),
+// never an inline --secret. With neither it generates a random one, so a new
+// webhook watcher only accepts signed requests; --no-secret opts out and
+// returns "".
+func resolveWebhookSecret(inlineSecret, secretFile string, noSecret bool, getenv func(string) string) (string, error) {
+	if strings.TrimSpace(inlineSecret) != "" {
+		return "", errors.New("--secret is insecure (visible in ps / /proc / shell history); " +
+			"provide the webhook secret via $WEBHOOK_SECRET or --secret-file <path> (chmod 600), or omit both to generate one")
+	}
+	env := getenv("WEBHOOK_SECRET")
+	if noSecret {
+		if env != "" || secretFile != "" {
+			return "", errors.New("--no-secret cannot be combined with $WEBHOOK_SECRET or --secret-file")
+		}
+		return "", nil
+	}
+	if env != "" {
+		if err := watcher.CheckWebhookSecret(env); err != nil {
+			return "", fmt.Errorf("$WEBHOOK_SECRET %v", err)
+		}
+		return strings.TrimSpace(env), nil
+	}
+	if secretFile != "" {
+		s, err := readSecretFile(secretFile)
+		if err != nil {
+			return "", err
+		}
+		if err := watcher.CheckWebhookSecret(s); err != nil {
+			return "", fmt.Errorf("--secret-file %s %v", secretFile, err)
+		}
+		return s, nil
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate webhook secret: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+// printWebhookSecretHelp tells the user where the webhook secret is stored and
+// how a sender signs with it. The secret itself is never printed, and the
+// examples read it from the file, so it never appears in a process's
+// arguments either.
+func printWebhookSecretHelp(name, tomlPath string, port int, hasSecret bool) {
+	if !hasSecret {
+		fmt.Printf("WARNING: webhook watcher %q accepts unsigned requests from any local process.\n", name)
+		fmt.Printf("To require a signature, add secret = \"<random hex, e.g. from: openssl rand -hex 32>\" under [source] in %s (chmod 600).\n", tomlPath)
+		return
+	}
+	fmt.Printf("Its secret is stored in %s ([source] secret, chmod 600); requests without it get 401.\n", tomlPath)
+	fmt.Println("Sign each request: X-Webhook-Timestamp is the unix time (within 5 minutes of this")
+	fmt.Println("machine's clock) and X-Webhook-Signature-256 is sha256=<hex HMAC-SHA256 of")
+	fmt.Println("timestamp, X-Webhook-Sender (\"\" if none) and body, joined by newlines>.")
+	fmt.Println("Each signature is accepted once (a replay gets 409). This example reads the")
+	fmt.Println("secret from the file, so it never appears on a command line:")
+	fmt.Println("python3 - <<'EOF'")
+	fmt.Println("import hashlib, hmac, re, time, urllib.request")
+	fmt.Printf("toml = open(%q).read()\n", tomlPath)
+	fmt.Println(`secret = re.search(r'^secret = "(.*)"$', toml, re.M).group(1).encode()`)
+	fmt.Println(`body, sender, ts = b'{"text":"hello"}', 'my-service', str(int(time.time()))`)
+	fmt.Println(`sig = hmac.new(secret, (ts + '\n' + sender + '\n').encode() + body, hashlib.sha256).hexdigest()`)
+	fmt.Printf("req = urllib.request.Request('http://127.0.0.1:%d/webhook', data=body, headers={\n", port)
+	fmt.Println(`    'X-Webhook-Timestamp': ts, 'X-Webhook-Sender': sender, 'X-Webhook-Signature-256': 'sha256=' + sig})`)
+	fmt.Println("print(urllib.request.urlopen(req).status)")
+	fmt.Println("EOF")
+	header := filepath.Join(filepath.Dir(tomlPath), "token-header")
+	fmt.Println("On a loopback bind a request may instead carry the secret itself as X-Webhook-Token,")
+	fmt.Println("kept in a chmod-600 header file. Any local process that sees such a request can")
+	fmt.Println("replay it; on any other bind the token is refused:")
+	fmt.Printf("  (umask 077; printf 'X-Webhook-Token: %%s\\n' \"$(sed -n 's/^secret = \"\\(.*\\)\"$/\\1/p' '%s')\" > '%s')\n", tomlPath, header)
+	fmt.Printf("  curl -sS -o /dev/null -w '%%{http_code}\\n' http://127.0.0.1:%d/webhook -H @'%s' -H 'X-Webhook-Sender: my-service' --data-binary 'hello'\n", port, header)
 }
 
 // resolveGithubWebhookSecret sources the GitHub webhook HMAC secret WITHOUT ever
@@ -351,30 +497,48 @@ func resolveGithubWebhookSecret(inlineSecret, secretFile string, getenv func(str
 		"set $GITHUB_WEBHOOK_SECRET or pass --secret-file <path> (chmod 600)")
 }
 
+// resolveNtfyToken sources the optional ntfy access token for an ntfy/slack
+// watcher the same way as the github secret: the NTFY_TOKEN env var, then
+// --token-file (which must be chmod 600). No token is not an error.
+func resolveNtfyToken(tokenFile string, getenv func(string) string) (string, error) {
+	if env := strings.TrimSpace(getenv("NTFY_TOKEN")); env != "" {
+		return env, nil
+	}
+	if tokenFile != "" {
+		return readSecretFileFlag("--token-file", tokenFile)
+	}
+	return "", nil
+}
+
 // readSecretFile reads a secret from path, refusing files that are group- or
 // world-accessible (any bit beyond 0600) so a leaked secret file is caught early.
 func readSecretFile(path string) (string, error) {
+	return readSecretFileFlag("--secret-file", path)
+}
+
+// readSecretFileFlag is readSecretFile with the flag name used in its errors.
+func readSecretFileFlag(flagName, path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", fmt.Errorf("cannot read --secret-file: %w", err)
+		return "", fmt.Errorf("cannot read %s: %w", flagName, err)
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return "", fmt.Errorf("--secret-file %s has insecure permissions %#o; chmod 600 it", path, perm)
+		return "", fmt.Errorf("%s %s has insecure permissions %#o; chmod 600 it", flagName, path, perm)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("cannot read --secret-file: %w", err)
+		return "", fmt.Errorf("cannot read %s: %w", flagName, err)
 	}
 	secret := strings.TrimSpace(string(data))
 	if secret == "" {
-		return "", fmt.Errorf("--secret-file %s is empty", path)
+		return "", fmt.Errorf("%s %s is empty", flagName, path)
 	}
 	return secret, nil
 }
 
 // writeGithubWatcherSecret writes the HMAC secret into the [source] table of
 // the effective watcher/<name>/watcher.toml at 0600, which is the location the
-// runtime engine loads it from (internal/ui/home.go loadWatcherSourceSettings).
+// runtime engine loads it from (internal/watcher/host.go loadSourceSettings).
 // Port is stored as a TOML string so it decodes into the engine's
 // map[string]string Settings. Audit M2.
 //
@@ -391,14 +555,37 @@ func writeGithubWatcherSecret(dir, secret string, port int) (bool, error) {
 		settings)
 }
 
+// writeWebhookWatcherSource persists the webhook --port into the [source]
+// table of watcher/<name>/watcher.toml. Without it the port given on the
+// command line never reaches the engine, and WebhookAdapter falls back to its
+// default 18460, so every webhook watcher contends for one port (#2532).
+// A non-empty secret is stored with it, in the same 0600 file.
+func writeWebhookWatcherSource(dir string, port int, secret string) (bool, error) {
+	settings := [][2]string{{"port", fmt.Sprintf("%d", port)}}
+	if secret != "" {
+		settings = append(settings, [2]string{"secret", secret})
+	}
+	return createWatcherSourceToml(dir,
+		"# Auto-generated by: agent-deck watcher create webhook\n",
+		settings)
+}
+
 // writeTopicWatcherSource persists the ntfy/slack --topic into the [source]
 // table of watcher/<name>/watcher.toml. Without it the topic given on the
 // command line never reaches the engine, whose adapters require
-// Settings["topic"] and fail Setup without it.
-func writeTopicWatcherSource(dir, adapterType, topic string) (bool, error) {
-	return createWatcherSourceToml(dir,
-		fmt.Sprintf("# Auto-generated by: agent-deck watcher create %s\n", adapterType),
-		[][2]string{{"topic", topic}})
+// Settings["topic"] and fail Setup without it. A non-empty server and access
+// token are stored alongside it (the file is 0600).
+func writeTopicWatcherSource(dir, adapterType, topic, server, token string) (bool, error) {
+	header := fmt.Sprintf("# Auto-generated by: agent-deck watcher create %s\n", adapterType)
+	settings := [][2]string{{"topic", topic}}
+	if server != "" {
+		settings = append(settings, [2]string{"server", server})
+	}
+	if token != "" {
+		header += "# Access token is stored here (chmod 600), never passed as a CLI arg.\n"
+		settings = append(settings, [2]string{"token", token})
+	}
+	return createWatcherSourceToml(dir, header, settings)
 }
 
 // createWatcherSourceToml writes a [source] table to watcher/<name>/watcher.toml
@@ -466,108 +653,252 @@ func renderWatcherSourceToml(header string, settings [][2]string) string {
 
 // handleWatcherStart marks a watcher as running in statedb.
 func handleWatcherStart(profile string, args []string) {
-	fs := flag.NewFlagSet("watcher start", flag.ExitOnError)
+	fs := flag.NewFlagSet("watcher start", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck watcher start <name>")
 	}
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "Error: watcher name is required")
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 	name := fs.Arg(0)
 
 	db, err := openWatcherDB(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer db.Close()
 
 	w, err := db.LoadWatcherByName(name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if w == nil {
 		fmt.Fprintf(os.Stderr, "Error: watcher %q not found\n", name)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if err := db.UpdateWatcherStatus(w.ID, "running"); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
-	fmt.Printf("Started watcher: %s (status will be picked up by TUI engine)\n", name)
+	// One TUI, web or web --no-tui process per profile owns the watcher
+	// engine (#2530), and applies a start or stop while it runs (#2739).
+	fmt.Printf("Started watcher: %s (%s)\n", name, watcherApplyHint)
 }
 
 // handleWatcherStop marks a watcher as stopped in statedb.
 func handleWatcherStop(profile string, args []string) {
-	fs := flag.NewFlagSet("watcher stop", flag.ExitOnError)
+	fs := flag.NewFlagSet("watcher stop", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck watcher stop <name>")
 	}
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "Error: watcher name is required")
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 	name := fs.Arg(0)
 
 	db, err := openWatcherDB(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer db.Close()
 
 	w, err := db.LoadWatcherByName(name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if w == nil {
 		fmt.Fprintf(os.Stderr, "Error: watcher %q not found\n", name)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if err := db.UpdateWatcherStatus(w.ID, "stopped"); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
-	fmt.Printf("Stopped watcher: %s\n", name)
+	fmt.Printf("Stopped watcher: %s (%s)\n", name, watcherApplyHint)
+}
+
+// watcherApplyHint says when a watcher change takes effect (#2739).
+const watcherApplyHint = "the profile's watcher engine, in an agent-deck TUI or web process, applies it within seconds; `agent-deck watcher reload` applies it now and reports what changed, or that an engine of an older agent-deck needs its process restarted"
+
+// watcherReloadResult is the JSON schema for `agent-deck watcher reload --json`.
+type watcherReloadResult struct {
+	Profile       string                `json:"profile"`
+	EngineRunning bool                  `json:"engine_running"`
+	OwnerPID      int                   `json:"owner_pid,omitempty"`
+	Applied       bool                  `json:"applied"`
+	Report        *watcher.ReloadReport `json:"report,omitempty"`
+	Message       string                `json:"message"`
+}
+
+// handleWatcherReload asks the profile's watcher engine to apply the watchers,
+// their [source] settings and clients.json now, and prints what it changed
+// (#2739). Exit status 1 when no engine answered, the engine could not read
+// the watchers, an adapter failed to start or clients.json did not parse.
+func handleWatcherReload(profile string, args []string) {
+	fs := flag.NewFlagSet("watcher reload", flag.ContinueOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	timeout := fs.Duration("timeout", 15*time.Second, "How long to wait for the engine to answer")
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck watcher reload [--json] [--timeout 15s]")
+		fmt.Println()
+		fmt.Println("Apply started, stopped and edited watchers and clients.json routes to the")
+		fmt.Println("profile's running watcher engine now, and retry watchers that failed to start.")
+		fmt.Println("The engine also applies changes by itself within seconds.")
+	}
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
+	}
+
+	res, failed, err := watcherReload(profile, *timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		exitCLI(1)
+	}
+
+	if *jsonOutput {
+		out, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		fmt.Println(res.Message)
+		if rep := res.Report; rep != nil {
+			for _, f := range rep.Failed {
+				fmt.Printf("  failed: %s\n", f)
+			}
+			if rep.RoutesError != "" {
+				fmt.Printf("  routes kept: %s\n", rep.RoutesError)
+			}
+		}
+	}
+	if failed {
+		exitCLI(1)
+	}
+}
+
+// watcherReload asks profile's engine owner to reload and waits up to
+// timeout for its answer. failed reports what makes `watcher reload` exit 1.
+func watcherReload(profile string, timeout time.Duration) (res watcherReloadResult, failed bool, err error) {
+	resolved, err := session.ResolveProfileForStorage(profile)
+	if err != nil {
+		return res, true, fmt.Errorf("resolving profile: %w", err)
+	}
+	res.Profile = resolved
+	pid, running, err := watcher.EngineOwnerPID(resolved)
+	if err != nil {
+		return res, true, err
+	}
+	res.EngineRunning, res.OwnerPID = running, pid
+	if !running {
+		res.Message = "No watcher engine runs for this profile. The agent-deck TUI or web process that starts one reads the current watchers and routes."
+		return res, false, nil
+	}
+	requested := time.Now()
+	token, err := watcher.RequestReload(resolved)
+	if err != nil {
+		return res, true, err
+	}
+	res.Report = waitWatcherReload(resolved, token, requested, timeout)
+	switch rep := res.Report; {
+	case rep == nil:
+		res.Message = fmt.Sprintf("The watcher engine (%s) did not answer within %s. An engine of an agent-deck older than this one applies watcher changes only when its process restarts.", watcherOwnerDesc(pid), timeout)
+		return res, true, nil
+	case rep.Error != "":
+		res.Applied = true
+		res.Message = "The watcher engine could not read the watchers: " + rep.Error
+		return res, true, nil
+	default:
+		res.Applied = true
+		res.Message = watcherReloadSummary(rep)
+		return res, len(rep.Failed) > 0 || rep.RoutesError != "", nil
+	}
+}
+
+// waitWatcherReload waits up to timeout for the engine's answer to token. An
+// answer to a later request (another `watcher reload` replaced this one's
+// token) from a pass that started after this one was made covers it too.
+func waitWatcherReload(profile, token string, requested time.Time, timeout time.Duration) *watcher.ReloadReport {
+	deadline := time.Now().Add(timeout)
+	for {
+		if rep, err := watcher.ReadReloadReport(profile); err == nil && rep != nil &&
+			(rep.Request == token || !rep.StartedAt.Before(requested)) {
+			return rep
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func watcherOwnerDesc(pid int) string {
+	if pid > 0 {
+		return fmt.Sprintf("pid %d", pid)
+	}
+	return "pid unknown"
+}
+
+// watcherReloadSummary is the one-line text form of rep.
+func watcherReloadSummary(rep *watcher.ReloadReport) string {
+	var parts []string
+	add := func(label string, names []string) {
+		if len(names) > 0 {
+			parts = append(parts, label+" "+strings.Join(names, ", "))
+		}
+	}
+	add("started", rep.Started)
+	add("stopped", rep.Stopped)
+	add("restarted", rep.Restarted)
+	if n := len(rep.Failed); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed to start", n))
+	}
+	if rep.RoutesReloaded {
+		parts = append(parts, "routes reloaded")
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("Watcher engine (pid %d) reloaded: nothing changed (%d watchers running).", rep.PID, rep.Unchanged)
+	}
+	return fmt.Sprintf("Watcher engine (pid %d) reloaded: %s; %d unchanged.", rep.PID, strings.Join(parts, "; "), rep.Unchanged)
 }
 
 // handleWatcherList lists all watchers with name, type, status, event rate, and health.
 func handleWatcherList(profile string, args []string) {
-	fs := flag.NewFlagSet("watcher list", flag.ExitOnError)
+	fs := flag.NewFlagSet("watcher list", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck watcher list [--json]")
 	}
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	db, err := openWatcherDB(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer db.Close()
 
 	watchers, err := db.LoadWatchers()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading watchers: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	cutoff := time.Now().Add(-time.Hour)
@@ -624,7 +955,7 @@ func handleWatcherList(profile string, args []string) {
 
 // handleWatcherStatus shows detailed info for a named watcher including recent events.
 func handleWatcherStatus(profile string, args []string) {
-	fs := flag.NewFlagSet("watcher status", flag.ExitOnError)
+	fs := flag.NewFlagSet("watcher status", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck watcher status <name> [--json]")
@@ -643,35 +974,38 @@ func handleWatcherStatus(profile string, args []string) {
 		}
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, flagArgs)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, flagArgs)); err != nil {
+		exitCLI(1)
 	}
 
 	if name == "" {
 		fmt.Fprintln(os.Stderr, "Error: watcher name is required")
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	db, err := openWatcherDB(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer db.Close()
 
 	w, err := db.LoadWatcherByName(name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if w == nil {
 		fmt.Fprintf(os.Stderr, "Error: watcher %q not found\n", name)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	meta, _ := session.LoadWatcherMeta(name)
 	events, _ := db.LoadWatcherEvents(w.ID, 10)
+	undelivered, undeliveredErr := watcherUndelivered(profile, w.ID)
+	refused, refusedErr := db.LoadWatcherDeliveryRefusals(w.ID)
+	now := time.Now()
 
 	if *jsonOutput {
 		type eventOut struct {
@@ -679,6 +1013,18 @@ func handleWatcherStatus(profile string, args []string) {
 			Sender    string `json:"sender"`
 			Subject   string `json:"subject"`
 			RoutedTo  string `json:"routed_to"`
+		}
+		type undeliveredOut struct {
+			Conductor        string `json:"conductor"`
+			Count            int    `json:"count"`
+			OldestQueuedAt   string `json:"oldest_queued_at"`
+			OldestAgeSeconds int64  `json:"oldest_age_seconds"`
+		}
+		type refusedOut struct {
+			Conductor      string `json:"conductor"`
+			Count          int    `json:"count"`
+			FirstRefusedAt string `json:"first_refused_at"`
+			LastRefusedAt  string `json:"last_refused_at"`
 		}
 		type output struct {
 			ID         string     `json:"id"`
@@ -690,16 +1036,52 @@ func handleWatcherStatus(profile string, args []string) {
 			CreatedAt  string     `json:"created_at"`
 			UpdatedAt  string     `json:"updated_at"`
 			Events     []eventOut `json:"recent_events"`
+			// Undelivered: routed events still waiting in the send queue for
+			// their conductor, per conductor (#2537). It is null when the
+			// queue could not be read, with UndeliveredError saying why, so
+			// a monitor does not read that as nothing waiting.
+			Undelivered      []undeliveredOut `json:"undelivered"`
+			UndeliveredError string           `json:"undelivered_error,omitempty"`
+			// Refused: routed events refused because this watcher's queue
+			// for a conductor was full, per conductor. They are stored in
+			// recent_events like the others but were never delivered. Null
+			// with RefusedError when the count could not be read.
+			Refused      []refusedOut `json:"refused"`
+			RefusedError string       `json:"refused_error,omitempty"`
 		}
 		out := output{
-			ID:         w.ID,
-			Name:       w.Name,
-			Type:       w.Type,
-			Status:     w.Status,
-			ConfigPath: w.ConfigPath,
-			Conductor:  w.Conductor,
-			CreatedAt:  w.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:  w.UpdatedAt.Format(time.RFC3339),
+			ID:          w.ID,
+			Name:        w.Name,
+			Type:        w.Type,
+			Status:      w.Status,
+			ConfigPath:  w.ConfigPath,
+			Conductor:   w.Conductor,
+			CreatedAt:   w.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:   w.UpdatedAt.Format(time.RFC3339),
+			Undelivered: []undeliveredOut{},
+			Refused:     []refusedOut{},
+		}
+		if refusedErr != nil {
+			out.Refused, out.RefusedError = nil, refusedErr.Error()
+		}
+		for _, r := range refused {
+			out.Refused = append(out.Refused, refusedOut{
+				Conductor:      r.Conductor,
+				Count:          r.Count,
+				FirstRefusedAt: r.FirstRefusedAt.UTC().Format(time.RFC3339),
+				LastRefusedAt:  r.LastRefusedAt.UTC().Format(time.RFC3339),
+			})
+		}
+		if undeliveredErr != nil {
+			out.Undelivered, out.UndeliveredError = nil, undeliveredErr.Error()
+		}
+		for _, p := range undelivered {
+			out.Undelivered = append(out.Undelivered, undeliveredOut{
+				Conductor:        p.Conductor,
+				Count:            p.Count,
+				OldestQueuedAt:   p.Oldest.UTC().Format(time.RFC3339),
+				OldestAgeSeconds: int64(now.Sub(p.Oldest).Seconds()),
+			})
 		}
 		for _, e := range events {
 			out.Events = append(out.Events, eventOut{
@@ -724,6 +1106,24 @@ func handleWatcherStatus(profile string, args []string) {
 	if w.Conductor != "" {
 		fmt.Printf("  Conductor: %s\n", w.Conductor)
 	}
+	switch {
+	case undeliveredErr != nil:
+		fmt.Printf("  Undelivered: unknown (%v)\n", undeliveredErr)
+	case len(undelivered) == 0:
+		fmt.Println("  Undelivered: none")
+	default:
+		for _, p := range undelivered {
+			fmt.Printf("  Undelivered: %d for %s, oldest queued %s ago\n",
+				p.Count, p.Conductor, now.Sub(p.Oldest).Round(time.Second))
+		}
+	}
+	if refusedErr != nil {
+		fmt.Printf("  Refused: unknown (%v)\n", refusedErr)
+	}
+	for _, r := range refused {
+		fmt.Printf("  Refused: %d for %s (delivery queue full, not delivered), first %s, last %s\n",
+			r.Count, r.Conductor, r.FirstRefusedAt.Format("2006-01-02 15:04:05"), r.LastRefusedAt.Format("2006-01-02 15:04:05"))
+	}
 	fmt.Println()
 
 	if len(events) == 0 {
@@ -741,37 +1141,51 @@ func handleWatcherStatus(profile string, args []string) {
 	}
 }
 
+// watcherUndelivered returns the watcher's routed events still waiting in the
+// profile's send queue for their conductor, per conductor (#2537).
+func watcherUndelivered(profile, watcherID string) ([]watcher.PendingDelivery, error) {
+	dbPath, err := session.GetDBPathForProfile(profile)
+	if err != nil {
+		return nil, err
+	}
+	pending, err := watcher.PendingDeliveries(sendqueue.Dir(filepath.Dir(dbPath)))
+	if err != nil {
+		return nil, err
+	}
+	return pending[watcherID], nil
+}
+
 // handleWatcherTest runs a synthetic event through the router for the named watcher.
 func handleWatcherTest(profile string, args []string) {
-	fs := flag.NewFlagSet("watcher test", flag.ExitOnError)
+	fs := flag.NewFlagSet("watcher test", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck watcher test <name>")
 	}
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "Error: watcher name is required")
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 	name := fs.Arg(0)
 
 	db, err := openWatcherDB(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer db.Close()
 
 	w, err := db.LoadWatcherByName(name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if w == nil {
 		fmt.Fprintf(os.Stderr, "Error: watcher %q not found\n", name)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Load clients.json and build router
@@ -806,20 +1220,20 @@ func handleWatcherTest(profile string, args []string) {
 
 // handleWatcherRoutes lists all routing rules from clients.json.
 func handleWatcherRoutes(profile string, args []string) {
-	fs := flag.NewFlagSet("watcher routes", flag.ExitOnError)
+	fs := flag.NewFlagSet("watcher routes", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck watcher routes [--json]")
 	}
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 	_ = profile
 
 	watcherDir, err := session.WatcherDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error resolving watcher directory: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	clientsPath := filepath.Join(watcherDir, "clients.json")
 
@@ -827,7 +1241,7 @@ func handleWatcherRoutes(profile string, args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading clients.json: %v\n", err)
 		fmt.Fprintln(os.Stderr, "Run 'agent-deck watcher import <channels.json>' to generate client routing rules.")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if *jsonOutput {
@@ -862,7 +1276,7 @@ func handleWatcherRoutes(profile string, args []string) {
 func handleWatcherImport(profile string, args []string) {
 	if len(args) != 1 {
 		fmt.Fprintln(os.Stderr, "Usage: agent-deck watcher import <path-to-channels.json>")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	inputPath := filepath.Clean(args[0])
@@ -871,12 +1285,12 @@ func handleWatcherImport(profile string, args []string) {
 	outputDir, err := session.WatcherDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error resolving watcher directory: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if err := importChannels(inputPath, outputDir); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -1066,10 +1480,11 @@ func printWatcherHelp() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  create <type> --name <name>   Create a new watcher (types: webhook, ntfy, github, slack)")
-	fmt.Println("  start <name>                  Mark a watcher as running (picked up by TUI engine)")
+	fmt.Println("  start <name>                  Mark a watcher as running (run by the profile's watcher engine)")
 	fmt.Println("  stop <name>                   Mark a watcher as stopped")
+	fmt.Println("  reload [--json]               Apply watcher and clients.json changes to the running engine now")
 	fmt.Println("  list [--json]                 List all watchers with status and event rate")
-	fmt.Println("  status <name> [--json]        Show detailed watcher info including recent events")
+	fmt.Println("  status <name> [--json]        Show watcher info, recent events and events not delivered yet")
 	fmt.Println("  test <name>                   Route a synthetic event to verify routing config")
 	fmt.Println("  routes [--json]               Show all routing rules from clients.json")
 	fmt.Println("  import <path>                 Migrate bash issue-watcher channels.json to Go watcher config")
@@ -1082,7 +1497,9 @@ func printWatcherHelp() {
 	fmt.Println()
 	fmt.Println("Examples (one per adapter type):")
 	fmt.Println()
-	fmt.Println("  # Generic HTTP webhook listening on port 9000")
+	fmt.Println("  # Generic HTTP webhook on 127.0.0.1:9000. Requests must be signed with a")
+	fmt.Println("  # secret: generated and stored in its watcher.toml unless given by")
+	fmt.Println("  # $WEBHOOK_SECRET or --secret-file (chmod 600):")
 	fmt.Println("  agent-deck watcher create webhook --name my-webhook --port 9000")
 	fmt.Println()
 	fmt.Println("  # GitHub repository webhook with HMAC-SHA256 verification")
@@ -1090,11 +1507,16 @@ func printWatcherHelp() {
 	fmt.Println("  GITHUB_WEBHOOK_SECRET=... agent-deck watcher create github --name gh-alerts")
 	fmt.Println("  agent-deck watcher create github --name gh-alerts --secret-file ~/.gh-webhook-secret")
 	fmt.Println()
-	fmt.Println("  # ntfy.sh push-notification topic")
-	fmt.Println("  agent-deck watcher create ntfy --name phone-alerts --topic my-private-topic")
+	fmt.Println("  # ntfy push-notification topic. On the public https://ntfy.sh anyone who")
+	fmt.Println("  # knows the topic can read and post to it, so use a random topic:")
+	fmt.Println("  agent-deck watcher create ntfy --name phone-alerts --random-topic")
+	fmt.Println("  # or an access-protected topic on your own ntfy server (token from the")
+	fmt.Println("  # environment or a chmod-600 file, never a CLI arg):")
+	fmt.Println("  NTFY_TOKEN=... agent-deck watcher create ntfy --name phone-alerts \\")
+	fmt.Println("      --server https://ntfy.example.com --topic phone-alerts")
 	fmt.Println()
 	fmt.Println("  # Slack-bridged via ntfy topic (see skill for Cloudflare Worker setup)")
-	fmt.Println("  agent-deck watcher create slack --name team-slack --topic my-slack-topic")
+	fmt.Println("  agent-deck watcher create slack --name team-slack --random-topic")
 	fmt.Println()
 	fmt.Println("After creating, activate and inspect:")
 	fmt.Println("  agent-deck watcher start <name>")

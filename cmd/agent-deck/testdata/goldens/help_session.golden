@@ -15,7 +15,7 @@ Commands:
   handoff <id>            Build a cross-tool handoff prompt from the session's conversation (read-only)
   switch-preview <id>     Preview switch capability, fidelity and refusals (read-only, no mutation)
   attach <id>             Attach to session interactively
-  focus <id> [--attach]   Signal the running TUI to select (or --attach) a session
+  focus <id> [--attach]   Signal the running TUI to select (or --attach) a session (--remote <name> for a remote's session)
   recent [--limit N]      List sessions most-recently-used first (same last_accessed the TUI's alternate/MRU keys use)
   show [id]               Show session details (auto-detect current if no id)
   viewers [id]            List the terminals attached to a session (who is viewing it)
@@ -24,9 +24,17 @@ Commands:
   set <id> <field> <value>  Update session property
   switch <id> --to-harness <harness> [--to-account <account>]  Switch account or create a confirmed fresh cross-harness target
   switch-account <id> <account>  Switch Claude account and migrate the conversation
+  switch-settle <id>             Finish a switch hands-free: ready, prompts, plugins, kick, verify
   move <id> <path>        Move session to a new path (migrates Claude history)
   send <id> <message>     Send a message to a running session (--queue: never silently lost, see send-status; --image <path>)
+  ref <source> <target>   Type a short reference to <source> into <target>'s composer, not sent (--print: only print it)
+  image-upload <id>       Stage an attachment from stdin (--name <uuid>.png --json; max 20 MiB)
+  command [id] "/cmd ..."  Run a Claude slash command (/model, /compact, /clear, /exit, skills) and verify the outcome
+  commands [id]           List the slash commands and skills a Claude session can run (--json)
   send-status <send-id>   State of a queued send: queued, typed, submitted, landed or failed
+  queue list <session>    List durable queued sends (--json)
+  queue release <id>      Send a queued entry now, with confirmed delivery evidence (--json)
+  queue cancel <id>       Cancel an unsent entry or report its delivery (--json)
   approve <id> [choice]   Resolve a visible Codex approval prompt
   output <id>             Get the last response from a session
   context [id]            Show what is loaded into the agent's context, ranked by cost
@@ -65,6 +73,7 @@ Examples:
   agent-deck session set-title-lock SCRUM-351 off        # Re-enable title sync
   agent-deck session output my-project                 # Get last response from session
   agent-deck session output my-project --json          # Get response as JSON
+  agent-deck session ref auth-fix reviewer             # Hand reviewer a reference to auth-fix (not sent)
   agent-deck session context my-project                # What is in the agent's context
   agent-deck session context my-project --tab breakdown # Ranked by token cost
   agent-deck session context my-project --json         # Full report with provenance
@@ -80,7 +89,7 @@ Set command fields:
   path               Project path
   command            Command to run
   tool               Tool type (claude, gemini, shell, etc.)
-  wrapper            Wrapper command (use {command} to include tool command)
+  wrapper            Wrapper command (use {command} to include tool command; an unquoted {command} after a prefix gets a compound command (&&, ;, |, export ...) as one bash -c argv, so for remote use --ssh or quote {command})
   claude-session-id  Claude conversation ID (for fork/resume)
   favorite           Favourite flag: true or false (favorite in list/show --json)
   gemini-session-id  Gemini conversation ID (for resume)

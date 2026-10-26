@@ -79,7 +79,7 @@ const defaultVerifyTimeout = 30 * time.Second
 // fully exercisable from here: the TUI is a second renderer over the same
 // report, never a second implementation.
 func handleSessionContext(profile string, args []string) {
-	fs := flag.NewFlagSet("session context", flag.ExitOnError)
+	fs := flag.NewFlagSet("session context", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Emit the report as JSON (stable schema; carries provenance on every figure)")
 	quiet := fs.Bool("quiet", false, "One-line summary: the gauge figure and how many items you can act on")
 	quietShort := fs.Bool("q", false, "One-line summary (short for --quiet)")
@@ -145,8 +145,8 @@ func handleSessionContext(profile string, args []string) {
 		fmt.Println("  5  --verify: nothing could be graded, so no agreement is claimed (never read this as a pass)")
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(contextExitError)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(contextExitError)
 	}
 
 	quietMode := *quiet || *quietShort
@@ -158,7 +158,7 @@ func handleSessionContext(profile string, args []string) {
 	// behind the vocabulary they define.
 	if *glossary {
 		printContextGlossary(out)
-		os.Exit(contextExitOK)
+		exitCLI(contextExitOK)
 	}
 
 	tabName := strings.ToLower(strings.TrimSpace(*tab))
@@ -166,7 +166,7 @@ func handleSessionContext(profile string, args []string) {
 	case contextTabOverview, contextTabBreakdown, contextTabVerify:
 	default:
 		out.Error(fmt.Sprintf("unknown --tab %q: expected overview, breakdown or verify", *tab), ErrCodeInvalidOperation)
-		os.Exit(contextExitError)
+		exitCLI(contextExitError)
 	}
 
 	identifier := fs.Arg(0)
@@ -177,7 +177,7 @@ func handleSessionContext(profile string, args []string) {
 	_, instances, _, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(contextExitError)
+		exitCLI(contextExitError)
 	}
 
 	inst, errMsg, errCode := ResolveSessionOrCurrent(identifier, instances)
@@ -189,13 +189,13 @@ func handleSessionContext(profile string, args []string) {
 		// adapter, which is the honest reading of "what can this thing report".
 		if *capsOnly {
 			printContextCapabilityCatalogue(out, reg, host, profile)
-			os.Exit(contextExitOK)
+			exitCLI(contextExitOK)
 		}
 		out.Error(contextResolutionHint(errMsg, errCode, identifier, profile), errCode)
 		if errCode == ErrCodeNotFound {
-			os.Exit(contextExitNotFound)
+			exitCLI(contextExitNotFound)
 		}
-		os.Exit(contextExitError)
+		exitCLI(contextExitError)
 	}
 
 	if *capsOnly {
@@ -204,17 +204,17 @@ func handleSessionContext(profile string, args []string) {
 			// No adapter at all, not even the fallback: say so plainly rather
 			// than inventing a screen. This is honest degradation, not failure.
 			printContextUnsupported(out, inst.Tool, capsErr)
-			os.Exit(contextExitOK)
+			exitCLI(contextExitOK)
 		}
 		view := contextCapabilitiesView(identifier, inst.Title, profile, inst.Tool)
 		out.Print(renderContextCapabilities(caps, inst.Tool), buildContextCapabilitiesJSON(view, caps))
-		os.Exit(contextExitOK)
+		exitCLI(contextExitOK)
 	}
 
 	req, warnings, err := sessionhost.BuildRequest(inst, instances, sessionhost.RequestOptions{SessionRef: contextSessionRef(identifier, inst.Title)})
 	if err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(contextExitError)
+		exitCLI(contextExitError)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -224,12 +224,12 @@ func handleSessionContext(profile string, args []string) {
 	if err != nil {
 		if errors.Is(err, ctxinspect.ErrUnsupported) {
 			printContextUnsupported(out, inst.Tool, err)
-			os.Exit(contextExitOK)
+			exitCLI(contextExitOK)
 		}
 		// A parse failure, an unreadable transcript: a real failure, reported
 		// as one. It must never degrade into a report full of zeroes.
 		out.Error(fmt.Sprintf("inspecting the context of session %q: %v", inst.Title, err), ErrCodeInvalidOperation)
-		os.Exit(contextExitError)
+		exitCLI(contextExitError)
 	}
 
 	view := contextView{
@@ -247,11 +247,11 @@ func handleSessionContext(profile string, args []string) {
 	// prints is the one a human would read out.
 	if quietMode && !*jsonOutput && strings.TrimSpace(*item) == "" && !*verifyLive {
 		fmt.Println(renderContextQuiet(view))
-		os.Exit(contextExitStatus(rep, *strict))
+		exitCLI(contextExitStatus(rep, *strict))
 	}
 
 	if *verifyLive {
-		os.Exit(runContextVerify(out, view, contextLivePane(inst), contextVerifyOptions{
+		exitCLI(runContextVerify(out, view, contextLivePane(inst), contextVerifyOptions{
 			Yes:       *verifyYes,
 			Timeout:   *verifyTimeout,
 			ReadyWait: *verifyReadyWait,
@@ -263,17 +263,17 @@ func handleSessionContext(profile string, args []string) {
 		ri, findErr := findContextItem(rep, *item)
 		if findErr != nil {
 			out.Error(findErr.Error(), ErrCodeNotFound)
-			os.Exit(contextExitNotFound)
+			exitCLI(contextExitNotFound)
 		}
 		out.Print(renderContextItem(view, ri), buildContextItemJSON(view, ri))
-		os.Exit(contextExitStatus(rep, *strict))
+		exitCLI(contextExitStatus(rep, *strict))
 	}
 
 	if *jsonOutput {
 		// The tab selects a human view; the JSON document is always the whole
 		// report, so a consumer never has to know which tab produced it.
 		out.Print("", buildContextJSON(view))
-		os.Exit(contextExitStatus(rep, *strict))
+		exitCLI(contextExitStatus(rep, *strict))
 	}
 
 	switch tabName {
@@ -284,7 +284,7 @@ func handleSessionContext(profile string, args []string) {
 	default:
 		out.Print(renderContextOverview(view), nil)
 	}
-	os.Exit(contextExitStatus(rep, *strict))
+	exitCLI(contextExitStatus(rep, *strict))
 }
 
 // contextExitStatus maps a produced report to an exit code.
@@ -371,9 +371,9 @@ func contextResolutionHint(msg, code, identifier, profile string) string {
 	if p := strings.TrimSpace(profile); p != "" {
 		scope = fmt.Sprintf("profile %q", p)
 	}
-	if detected := GetCurrentSessionID(); detected != "" {
-		return fmt.Sprintf("no session was named, so agent-deck inspected the one it is running inside: it read the id %q out of the tmux session name (agentdeck_<title>_%s), and %s has no session with that id. %s",
-			detected, detected, scope, next)
+	if strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")) != "" || currentAgentDeckTmuxName() != "" {
+		return fmt.Sprintf("no session was named, so agent-deck looked for the one it is running inside, and %s has none: %s. %s",
+			scope, msg, next)
 	}
 	return fmt.Sprintf("no session was named, and this shell is not inside an agent-deck session, so there was nothing to auto-detect. %s", next)
 }

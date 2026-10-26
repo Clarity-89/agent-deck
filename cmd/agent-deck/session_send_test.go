@@ -36,7 +36,22 @@ func (m *mockStatusChecker) GetStatus() (string, error) {
 	return m.statuses[i], err
 }
 
+// fastWaitForCompletion shrinks waitForCompletion's 1s grace and 2s poll
+// interval for the scripted-checker tests below. The checker is driven by
+// call count, not wall time, so every test still walks the same status and
+// error sequence; it just no longer sleeps 2s between scripted polls.
+// Never call it from a t.Parallel test: it mutates the package var
+// waitForCompletionTiming, which every waitForCompletion caller reads.
+func fastWaitForCompletion(t *testing.T) {
+	t.Helper()
+	saved := waitForCompletionTiming
+	waitForCompletionTiming.grace = time.Millisecond
+	waitForCompletionTiming.poll = 5 * time.Millisecond
+	t.Cleanup(func() { waitForCompletionTiming = saved })
+}
+
 func TestWaitForCompletion_ImmediateWaiting(t *testing.T) {
+	fastWaitForCompletion(t)
 	mock := &mockStatusChecker{
 		statuses: []string{"waiting"},
 	}
@@ -236,6 +251,7 @@ func TestShouldSkipConductorHeartbeatSend_DisabledThresholdNeverSkips(t *testing
 }
 
 func TestWaitForCompletion_ActiveThenWaiting(t *testing.T) {
+	fastWaitForCompletion(t)
 	mock := &mockStatusChecker{
 		statuses: []string{"active", "active", "waiting"},
 	}
@@ -249,6 +265,7 @@ func TestWaitForCompletion_ActiveThenWaiting(t *testing.T) {
 }
 
 func TestWaitForCompletion_ActiveThenIdle(t *testing.T) {
+	fastWaitForCompletion(t)
 	mock := &mockStatusChecker{
 		statuses: []string{"active", "idle"},
 	}
@@ -262,6 +279,7 @@ func TestWaitForCompletion_ActiveThenIdle(t *testing.T) {
 }
 
 func TestWaitForCompletion_ActiveThenInactive(t *testing.T) {
+	fastWaitForCompletion(t)
 	mock := &mockStatusChecker{
 		statuses: []string{"active", "inactive"},
 	}
@@ -275,6 +293,7 @@ func TestWaitForCompletion_ActiveThenInactive(t *testing.T) {
 }
 
 func TestWaitForCompletion_TransientErrors(t *testing.T) {
+	fastWaitForCompletion(t)
 	mock := &mockStatusChecker{
 		statuses: []string{"", "", "waiting"},
 		errors:   []error{fmt.Errorf("tmux error"), fmt.Errorf("tmux error"), nil},
@@ -289,6 +308,7 @@ func TestWaitForCompletion_TransientErrors(t *testing.T) {
 }
 
 func TestWaitForCompletion_SessionDeath(t *testing.T) {
+	fastWaitForCompletion(t)
 	// When GetStatus returns 5+ consecutive errors, the session is dead.
 	// waitForCompletion should return ("error", nil) instead of hanging.
 	mock := &mockStatusChecker{
@@ -313,6 +333,7 @@ func TestWaitForCompletion_SessionDeath(t *testing.T) {
 }
 
 func TestWaitForCompletion_TransientRecovery(t *testing.T) {
+	fastWaitForCompletion(t)
 	// Fewer than 5 consecutive errors should recover when a valid status follows.
 	mock := &mockStatusChecker{
 		statuses: []string{"", "", "", "waiting"},
@@ -328,11 +349,13 @@ func TestWaitForCompletion_TransientRecovery(t *testing.T) {
 }
 
 func TestWaitForCompletion_Timeout(t *testing.T) {
+	fastWaitForCompletion(t)
 	mock := &mockStatusChecker{
 		statuses: []string{"active"}, // Stays active forever
 	}
-	// Use a very short timeout so the test doesn't block
-	_, err := waitForCompletion(mock, 2*time.Second)
+	// A short timeout against the 5ms poll: many "active" polls, then the
+	// deadline, so the test doesn't block
+	_, err := waitForCompletion(mock, 200*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}
@@ -1645,7 +1668,7 @@ func TestNoWaitSendOptions_EnablesVerifyDelivery(t *testing.T) {
 
 func TestSendInitialKeysChecked_SingleLineMessageSendsUnchecked(t *testing.T) {
 	mock := &mockSendRetryTarget{}
-	if err := sendInitialKeysChecked(mock, "one line", send.ExpectedPasteMarkerLineBreaks("one line")); err != nil {
+	if err := sendInitialKeysChecked(mock, "one line", send.ExpectedPasteMarkerLineBreaks("one line"), false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := atomic.LoadInt32(&mock.sendKeysCalls); got != 1 {
@@ -1657,7 +1680,7 @@ func TestSendInitialKeysChecked_WithholdsEnterOnTruncatedMarker(t *testing.T) {
 	message := "line one\nline two\nline three"
 	expected := send.ExpectedPasteMarkerLineBreaks(message)
 	mock := &mockSendRetryTarget{panes: []string{"❯ [Pasted text #1 +1 lines]\n"}}
-	err := sendInitialKeysChecked(mock, message, expected)
+	err := sendInitialKeysChecked(mock, message, expected, false)
 	if err == nil || !strings.Contains(err.Error(), "prompt truncated in transit") {
 		t.Fatalf("want a truncation error, got %v", err)
 	}
@@ -1667,7 +1690,7 @@ func TestSendInitialKeysChecked_IntactMarkerSendsCleanly(t *testing.T) {
 	message := "line one\nline two\nline three"
 	expected := send.ExpectedPasteMarkerLineBreaks(message)
 	mock := &mockSendRetryTarget{panes: []string{"❯ [Pasted text #1 +2 lines]\n"}}
-	if err := sendInitialKeysChecked(mock, message, expected); err != nil {
+	if err := sendInitialKeysChecked(mock, message, expected, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

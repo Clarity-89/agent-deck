@@ -8,11 +8,11 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/asheshgoplani/agent-deck/internal/docker"
 	"github.com/asheshgoplani/agent-deck/internal/openclaw"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/termtext"
 )
 
 // handleOpenClaw dispatches openclaw subcommands.
@@ -39,7 +39,7 @@ func handleOpenClaw(profile string, args []string) {
 		fmt.Fprintf(os.Stderr, "Unknown openclaw command: %s\n", args[0])
 		fmt.Fprintln(os.Stderr)
 		printOpenClawHelp()
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -54,41 +54,48 @@ func printOpenClawHelp() {
 	fmt.Println("  send           Send a message to an agent")
 	fmt.Println("  help           Show this help")
 	fmt.Println()
+	fmt.Println("The gateway password is sent in the clear over ws://, so a ws:// gateway_url")
+	fmt.Println("must be loopback (127.0.0.0/8, ::1, localhost) or tailnet (100.64.0.0/10,")
+	fmt.Println("fd7a:115c:a1e0::/48, *.ts.net). Use wss:// for any other host, or pass")
+	fmt.Println("--insecure (or set allow_insecure = true under [openclaw]) to allow it anyway.")
+	fmt.Println()
 	fmt.Println("Aliases: openclaw, oc")
 }
 
 // --- sync ---
 
 func handleOpenClawSync(profile string, args []string) {
-	fs := flag.NewFlagSet("openclaw sync", flag.ExitOnError)
+	fs := flag.NewFlagSet("openclaw sync", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
-	if err := fs.Parse(args); err != nil {
-		os.Exit(2)
+	insecure := addOpenClawInsecureFlag(fs)
+	if err := parseCLIFlags(fs, args); err != nil {
+		exitCLI(2)
 	}
 
 	cfg := loadOpenClawConfig()
+	clientOpts := openClawClientOptions(cfg, *insecure)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	client := openclaw.NewClient(cfg.GatewayURL, cfg.Password)
+	client := openclaw.NewClient(cfg.GatewayURL, cfg.Password, clientOpts...)
 	if err := client.Connect(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to connect to gateway: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer client.Close()
 
 	agentsResult, err := client.ListAgents(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to list agents: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Load existing sessions
 	storage, instances, groupsData, err := loadSessionData(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load sessions: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	groupName := cfg.GroupName
@@ -103,7 +110,7 @@ func handleOpenClawSync(profile string, args []string) {
 
 		if existing == nil {
 			// Create new session
-			command := buildOpenClawBridgeCommand(agent.ID)
+			command := buildOpenClawBridgeCommand(agent.ID, *insecure)
 			inst := session.NewInstanceWithGroupAndTool(agentDisplayName, os.Getenv("HOME"), groupName, "openclaw")
 			inst.Command = command
 
@@ -143,7 +150,7 @@ func handleOpenClawSync(profile string, args []string) {
 	groupTree.CreateGroup(groupName)
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to save sessions: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if *jsonOutput {
@@ -156,76 +163,72 @@ func handleOpenClawSync(profile string, args []string) {
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(result); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to write JSON output: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	} else {
 		fmt.Printf("Synced %d agents (%d new, %d updated)\n", len(agentsResult.Agents), created, updated)
 	}
 }
 
-func buildOpenClawBridgeCommand(agentID string) string {
-	return docker.ShellJoinArgs([]string{
-		"agent-deck",
-		"openclaw",
-		"bridge",
-		"--agent",
-		agentID,
-	})
+// buildOpenClawBridgeCommand is the command of a synced bridge session. With
+// insecure (sync ran with --insecure) the bridge gets --insecure too, so it can
+// reach the same plain ws:// gateway that sync just used.
+func buildOpenClawBridgeCommand(agentID string, insecure bool) string {
+	args := []string{"agent-deck", "openclaw", "bridge"}
+	if insecure {
+		args = append(args, "--insecure")
+	}
+	return docker.ShellJoinArgs(append(args, "--agent", agentID))
 }
 
 // --- bridge ---
 
 func handleOpenClawBridge(args []string) {
-	fs := flag.NewFlagSet("openclaw bridge", flag.ExitOnError)
+	fs := flag.NewFlagSet("openclaw bridge", flag.ContinueOnError)
 	agentID := fs.String("agent", "", "Agent ID to bridge")
 	agentName := fs.String("name", "", "Agent display name (optional)")
-	if err := fs.Parse(args); err != nil {
-		os.Exit(2)
+	insecure := addOpenClawInsecureFlag(fs)
+	if err := parseCLIFlags(fs, args); err != nil {
+		exitCLI(2)
 	}
 
 	if *agentID == "" {
 		fmt.Fprintln(os.Stderr, "Usage: agent-deck openclaw bridge --agent <id>")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	cfg := loadOpenClawConfig()
+	clientOpts := openClawClientOptions(cfg, *insecure)
 
-	if err := openclaw.RunBridge(cfg.GatewayURL, cfg.Password, *agentID, *agentName); err != nil {
+	if err := openclaw.RunBridge(cfg.GatewayURL, cfg.Password, *agentID, *agentName, clientOpts...); err != nil {
 		fmt.Fprintf(os.Stderr, "Bridge error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
 // --- status ---
 
-// remoteNewlineStripper removes line breaks from gateway-supplied strings.
-// Redundant with the IsControl filter in displayRemote; kept as its final step
-// so static analysis recognises displayRemote as an output sanitiser.
-var remoteNewlineStripper = strings.NewReplacer("\r", "", "\n", "")
-
 // displayRemote makes a string reported by the OpenClaw gateway safe to print
-// on one terminal line: every control character (ESC, C1 codes, CR, LF, ...)
-// is dropped.
-func displayRemote(s string) string {
-	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return -1
-		}
-		return r
-	}, s)
-	return remoteNewlineStripper.Replace(s)
-}
+// on one terminal line (see termtext.Clean).
+func displayRemote(s string) string { return termtext.Clean(s) }
 
 func handleOpenClawStatus(args []string) {
+	fs := flag.NewFlagSet("openclaw status", flag.ContinueOnError)
+	insecure := addOpenClawInsecureFlag(fs)
+	if err := parseCLIFlags(fs, args); err != nil {
+		exitCLI(2)
+	}
+
 	cfg := loadOpenClawConfig()
+	clientOpts := openClawClientOptions(cfg, *insecure)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	client := openclaw.NewClient(cfg.GatewayURL, cfg.Password)
+	client := openclaw.NewClient(cfg.GatewayURL, cfg.Password, clientOpts...)
 	if err := client.Connect(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Gateway: OFFLINE (%v)\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer client.Close()
 
@@ -254,12 +257,12 @@ func handleOpenClawStatus(args []string) {
 					if status.Connected {
 						state = "connected"
 					}
-					entry := fmt.Sprintf("  %s: %s", name, state)
+					entry := fmt.Sprintf("  %s: %s", displayRemote(name), state)
 					if status.Guilds > 0 {
 						entry += fmt.Sprintf(" (%d guilds)", status.Guilds)
 					}
 					if status.Error != "" {
-						entry += fmt.Sprintf(" [error: %s]", status.Error)
+						entry += fmt.Sprintf(" [error: %s]", displayRemote(status.Error))
 					}
 					found = append(found, entry)
 				}
@@ -285,7 +288,7 @@ func handleOpenClawStatus(args []string) {
 			if agent.ID == agentsResult.DefaultID {
 				defaultMarker = " (default)"
 			}
-			fmt.Printf("  %s: %s%s\n", agent.ID, name, defaultMarker)
+			fmt.Printf("  %s: %s%s\n", displayRemote(agent.ID), displayRemote(name), defaultMarker)
 		}
 	}
 
@@ -314,28 +317,30 @@ func handleOpenClawStatus(args []string) {
 // --- list ---
 
 func handleOpenClawList(args []string) {
-	fs := flag.NewFlagSet("openclaw list", flag.ExitOnError)
+	fs := flag.NewFlagSet("openclaw list", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
-	if err := fs.Parse(args); err != nil {
-		os.Exit(2)
+	insecure := addOpenClawInsecureFlag(fs)
+	if err := parseCLIFlags(fs, args); err != nil {
+		exitCLI(2)
 	}
 
 	cfg := loadOpenClawConfig()
+	clientOpts := openClawClientOptions(cfg, *insecure)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	client := openclaw.NewClient(cfg.GatewayURL, cfg.Password)
+	client := openclaw.NewClient(cfg.GatewayURL, cfg.Password, clientOpts...)
 	if err := client.Connect(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to connect to gateway: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer client.Close()
 
 	result, err := client.ListAgents(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to list agents: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if *jsonOutput {
@@ -343,7 +348,7 @@ func handleOpenClawList(args []string) {
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(result); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to write JSON output: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		return
 	}
@@ -358,35 +363,37 @@ func handleOpenClawList(args []string) {
 		if agent.Identity != nil && agent.Identity.Emoji != "" {
 			emoji = agent.Identity.Emoji + " "
 		}
-		fmt.Printf("  %s%s (%s)%s\n", emoji, name, agent.ID, defaultMarker)
+		fmt.Printf("  %s%s (%s)%s\n", displayRemote(emoji), displayRemote(name), displayRemote(agent.ID), defaultMarker)
 	}
 }
 
 // --- send ---
 
 func handleOpenClawSend(args []string) {
-	fs := flag.NewFlagSet("openclaw send", flag.ExitOnError)
+	fs := flag.NewFlagSet("openclaw send", flag.ContinueOnError)
 	agentID := fs.String("agent", "", "Agent ID to send to")
-	if err := fs.Parse(args); err != nil {
-		os.Exit(2)
+	insecure := addOpenClawInsecureFlag(fs)
+	if err := parseCLIFlags(fs, args); err != nil {
+		exitCLI(2)
 	}
 
 	if *agentID == "" || fs.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "Usage: agent-deck openclaw send --agent <id> <message>")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	message := strings.Join(fs.Args(), " ")
 
 	cfg := loadOpenClawConfig()
+	clientOpts := openClawClientOptions(cfg, *insecure)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	client := openclaw.NewClient(cfg.GatewayURL, cfg.Password)
+	client := openclaw.NewClient(cfg.GatewayURL, cfg.Password, clientOpts...)
 	if err := client.Connect(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to connect to gateway: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer client.Close()
 
@@ -400,13 +407,32 @@ func handleOpenClawSend(args []string) {
 
 	if err := client.AgentSend(ctx, params); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to send message: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	fmt.Printf("Message sent to %s\n", *agentID)
 }
 
 // --- Helpers ---
+
+// addOpenClawInsecureFlag registers --insecure on an openclaw subcommand.
+func addOpenClawInsecureFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("insecure", false,
+		"Allow sending the gateway password over plain ws:// to a host that is not loopback or tailnet")
+}
+
+// openClawClientOptions checks the gateway URL before anything connects: a
+// plain ws:// gateway must be loopback or tailnet unless --insecure or
+// allow_insecure is set, because the password would cross the network
+// unencrypted. It exits with the refusal otherwise.
+func openClawClientOptions(cfg *session.OpenClawSettings, insecure bool) []openclaw.ClientOption {
+	allow := insecure || cfg.AllowInsecure
+	if err := openclaw.CheckGatewayURL(cfg.GatewayURL, allow); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		exitCLI(1)
+	}
+	return []openclaw.ClientOption{openclaw.WithAllowInsecure(allow)}
+}
 
 func loadOpenClawConfig() *session.OpenClawSettings {
 	config, err := session.LoadUserConfig()
@@ -457,14 +483,19 @@ func findOpenClawSession(instances []*session.Instance, agentID string) *session
 	return nil
 }
 
+// resolveAgentName picks the gateway's display name for an agent. `openclaw
+// sync` stores it as the session title, which `list` and the TUI print later,
+// so it is cleaned here, once, before it is persisted.
 func resolveAgentName(agent openclaw.AgentSummary) string {
-	if agent.Identity != nil && agent.Identity.Name != "" {
-		return agent.Identity.Name
+	if agent.Identity != nil {
+		if name := termtext.Clean(agent.Identity.Name); name != "" {
+			return name
+		}
 	}
-	if agent.Name != "" {
-		return agent.Name
+	if name := termtext.Clean(agent.Name); name != "" {
+		return name
 	}
-	return agent.ID
+	return termtext.Clean(agent.ID)
 }
 
 func formatDuration(d time.Duration) string {

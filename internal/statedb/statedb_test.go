@@ -724,6 +724,49 @@ func TestElectPrimary_Failover(t *testing.T) {
 	}
 }
 
+// TestElectPrimary_NoHeartbeatRow is the regression test for a phantom primary.
+// A process whose heartbeat row is missing (RegisterInstance failed, or another
+// instance's CleanDeadInstances deleted it after a missed heartbeat) used to win
+// the election while its claim UPDATE matched zero rows. It reported
+// isPrimary=true without recording it, so the next instance also won and two
+// primaries ran.
+func TestElectPrimary_NoHeartbeatRow(t *testing.T) {
+	db := newTestDB(t)
+
+	// No RegisterInstance: there is no row for db.pid.
+	isPrimary, err := db.ElectPrimary(30 * time.Second)
+	if err != nil {
+		t.Fatalf("ElectPrimary: %v", err)
+	}
+	if !isPrimary {
+		t.Fatal("First instance should become primary")
+	}
+
+	var primaries int
+	if err := db.DB().QueryRow(
+		"SELECT COUNT(*) FROM instance_heartbeats WHERE pid = ? AND is_primary = 1", db.pid,
+	).Scan(&primaries); err != nil {
+		t.Fatalf("Count primaries: %v", err)
+	}
+	if primaries != 1 {
+		t.Fatalf("ElectPrimary returned true but recorded %d primary rows for pid %d, want 1", primaries, db.pid)
+	}
+
+	// A second, registered instance must now lose the election.
+	firstPID := db.pid
+	db.pid = pickDeadPID(firstPID)
+	if err := db.RegisterInstance(false); err != nil {
+		t.Fatalf("RegisterInstance (second): %v", err)
+	}
+	isPrimary, err = db.ElectPrimary(30 * time.Second)
+	if err != nil {
+		t.Fatalf("ElectPrimary (second): %v", err)
+	}
+	if isPrimary {
+		t.Error("Second instance became primary while the first (live) instance also believes it is primary")
+	}
+}
+
 func TestResignPrimary(t *testing.T) {
 	db := newTestDB(t)
 
@@ -1822,6 +1865,27 @@ func TestSaveWatcherEvent_BodyRoundTrip(t *testing.T) {
 	}
 	if rows[0].Subject != "first line" {
 		t.Errorf("Subject: want %q, got %q", "first line", rows[0].Subject)
+	}
+}
+
+// TestHasWatcherEvent: the engine asks whether an event is stored before it
+// queues the event for its conductor (#2537).
+func TestHasWatcherEvent(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.SaveWatcher(&WatcherRow{ID: "w1", Name: "has-event", Type: "webhook", CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+		t.Fatalf("SaveWatcher: %v", err)
+	}
+	if has, err := db.HasWatcherEvent("w1", "dk-1"); err != nil || has {
+		t.Fatalf("before storing: %v, %v; want false", has, err)
+	}
+	if _, err := db.SaveWatcherEvent("w1", "dk-1", "alice", "s", "demo", "", "b", 500); err != nil {
+		t.Fatalf("SaveWatcherEvent: %v", err)
+	}
+	if has, err := db.HasWatcherEvent("w1", "dk-1"); err != nil || !has {
+		t.Fatalf("after storing: %v, %v; want true", has, err)
+	}
+	if has, _ := db.HasWatcherEvent("w2", "dk-1"); has {
+		t.Fatal("another watcher's event with the same key reported as stored")
 	}
 }
 

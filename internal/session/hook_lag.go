@@ -229,7 +229,19 @@ func (i *Instance) absorbCompletedTurnSample() {
 	}
 	confirmed := i.noteHookLagSampleLocked()
 	if confirmed && i.Status == StatusRunning {
-		i.Status = StatusWaiting
+		// Same shell rule as the UpdateStatus flip (shellHoldsTurn).
+		i.mu.Unlock()
+		work, holds := i.shellHoldsTurn()
+		i.mu.Lock()
+		switch {
+		case i.Status != StatusRunning:
+			// Changed while unlocked (Kill, a newer pass): leave it.
+		case holds:
+			i.bgWork = work
+			i.bgWorkActive = true
+		default:
+			i.Status = StatusWaiting
+		}
 	} else if !confirmed && i.hookLagFlipped && i.Status == StatusWaiting {
 		i.Status = StatusRunning
 	}
@@ -304,6 +316,7 @@ func (i *Instance) reconcileSubstate(sub Substate) Substate {
 	i.mu.Lock()
 	status, lagged := i.Status, i.hookLag.observed(i.hookLastUpdate)
 	bgActive := i.bgWorkActive
+	watching := i.bgWork.Watching()
 	// A blocking hook can precede the menu paint. Both live and cached
 	// accessors must disclose the conflicting previous spinner as unknown.
 	if sub == SubstateRunning && (status == StatusWaiting || status == StatusIdle) &&
@@ -311,6 +324,15 @@ func (i *Instance) reconcileSubstate(sub Substate) Substate {
 		sub = SubstateNone
 	}
 	i.mu.Unlock()
+	if watching && (status == StatusWaiting || status == StatusIdle) {
+		switch sub {
+		case SubstateNone, SubstateIdleAtEmptyPrompt, SubstateBackgroundWork, SubstateWatching, SubstateHookLag:
+			return SubstateWatching
+		}
+	}
+	if sub == SubstateWatching && status == StatusRunning && !bgActive {
+		sub = SubstateNone
+	}
 	return reconcileBackgroundSubstate(reconcileSubstateWithStatus(status, sub, lagged), status, bgActive)
 }
 

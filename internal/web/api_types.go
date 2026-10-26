@@ -14,16 +14,19 @@ const (
 	ErrCodeInternalError    = "INTERNAL_ERROR"
 	ErrCodeNotImplemented   = "NOT_IMPLEMENTED"
 	ErrCodeReadOnly         = "READ_ONLY"
+	ErrCodeFileLinkRefused  = "FILE_LINK_REFUSED"
 )
 
 // CreateSessionRequest is the body for POST /api/sessions.
 type CreateSessionRequest struct {
-	Title           string `json:"title"`
-	Tool            string `json:"tool"`
-	ProjectPath     string `json:"projectPath"`
-	GroupPath       string `json:"groupPath,omitempty"`
-	ModelID         string `json:"modelId,omitempty"`
-	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	Title           string   `json:"title"`
+	Tool            string   `json:"tool"`
+	ProjectPath     string   `json:"projectPath"`
+	CreateDir       bool     `json:"createDir,omitempty"`
+	CreateDirPaths  []string `json:"createDirPaths,omitempty"`
+	GroupPath       string   `json:"groupPath,omitempty"`
+	ModelID         string   `json:"modelId,omitempty"`
+	ReasoningEffort string   `json:"reasoningEffort,omitempty"`
 }
 
 // CreateGroupRequest is the body for POST /api/groups.
@@ -144,6 +147,14 @@ type SettingsResponse struct {
 	// ConfirmLinkOpen reports whether every other host still confirms.
 	TrustedDomains  []string `json:"trustedDomains"`
 	ConfirmLinkOpen bool     `json:"confirmLinkOpen"`
+	// FileLinkRoots are the `[web] file_link_roots` directories whose
+	// file:// links open through GET /api/files (issue #2676). Empty means
+	// file links only copy their path.
+	FileLinkRoots []string `json:"fileLinkRoots"`
+	// FileLinkHost is this machine's hostname: a file://<host>/path link
+	// (what `ls --hyperlink` emits) is this machine's file only when the
+	// host matches.
+	FileLinkHost string `json:"fileLinkHost"`
 
 	// ModelCatalog carries the same model and effort lists the TUI dialog
 	// uses, keyed by picker tool name, so the web dialog shows models the

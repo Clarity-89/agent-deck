@@ -74,6 +74,9 @@ type Bus struct {
 	// keepCorrupt (Options.KeepCorrupt) makes recovery leave a malformed
 	// line inside committed history in place instead of truncating from it.
 	keepCorrupt bool
+	// syncDurable makes the bus fsync its checkpoint, drops and directory
+	// writes (the comms ledger); the status bus keeps rename-only writes.
+	syncDurable bool
 	// maxBytes (Options.MaxBytes) bounds the retained log; 0 = unbounded.
 	// totalBytes is the sum of sealed segment sizes plus the active file.
 	maxBytes   int64
@@ -84,6 +87,7 @@ type Bus struct {
 
 	queue          chan queuedFrame
 	closeCh        chan struct{}
+	syncReq        chan struct{} // Flush: append what is queued and fsync now (cap 1)
 	closeWg        sync.WaitGroup
 	subWg          sync.WaitGroup // running subscriptions; Close waits for them before closing files
 	publishMu      sync.RWMutex
@@ -110,6 +114,7 @@ type Bus struct {
 }
 
 type queuedFrame struct {
+	eventID   string
 	profile   string
 	kind      string
 	sessionID string
@@ -155,16 +160,44 @@ func disabledBus() *Bus {
 // typically the value returned by busDir(); tests pass an isolated temp dir.
 // Open recovers the last-assigned Cursor by reading the tail of the log, so
 // it is durable and monotonic across restarts.
+//
+// The log holds what sessions and the Mac app exchange (browser requests
+// and replies among them), so it is private to its user: the directory is
+// 0o700 and every file 0o600. A log written by an older core with 0o755 /
+// 0o644 is tightened when it is opened.
 func Open(dir string) (*Bus, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("events: create bus dir: %w", err)
 	}
-	return openWith(dir, 0o644, false)
+	tightenBusModes(dir)
+	return openWith(dir, 0o600, false, false)
+}
+
+// tightenBusModes makes an existing log private: the directory and its
+// subdirectories 0o700, every regular file 0o600. Best effort: a file it
+// cannot change keeps its mode (the bus still opens).
+func tightenBusModes(dir string) {
+	_ = os.Chmod(dir, 0o700)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		switch {
+		case entry.IsDir():
+			tightenBusModes(path)
+		case entry.Type().IsRegular():
+			if info, err := entry.Info(); err == nil && info.Mode().Perm()&0o077 != 0 {
+				_ = os.Chmod(path, 0o600)
+			}
+		}
+	}
 }
 
 // openWith is Open with the file mode every created file gets and the
 // recovery policy for a malformed line inside committed history.
-func openWith(dir string, mode os.FileMode, keepCorrupt bool) (*Bus, error) {
+func openWith(dir string, mode os.FileMode, keepCorrupt, syncDurable bool) (*Bus, error) {
 	b := &Bus{
 		dir:          dir,
 		maxSegBytes:  defaultMaxSegBytes,
@@ -173,8 +206,10 @@ func openWith(dir string, mode os.FileMode, keepCorrupt bool) (*Bus, error) {
 		enabled:      true,
 		fileMode:     mode,
 		keepCorrupt:  keepCorrupt,
+		syncDurable:  syncDurable,
 		queue:        make(chan queuedFrame, defaultQueueCap),
 		closeCh:      make(chan struct{}),
+		syncReq:      make(chan struct{}, 1),
 	}
 	lockFile, err := os.OpenFile(filepath.Join(dir, "writer.lock"), os.O_CREATE|os.O_RDWR, mode)
 	if err != nil {
@@ -365,7 +400,7 @@ func recoverActiveSegment(dir string, mode os.FileMode, keepCorrupt bool) (Curso
 // durable reports whether this bus fsyncs its checkpoint, drops and
 // directory writes: the private (ledger) bus does; the status bus keeps the
 // cheaper rename-only behaviour it always had.
-func (b *Bus) durable() bool { return b.fileMode == 0o600 }
+func (b *Bus) durable() bool { return b.syncDurable }
 
 // sealedBytes sums the sizes of sealed segments.
 func sealedBytes(sealed []sealedSegment) int64 {
@@ -410,6 +445,7 @@ func countLines(dir, name string) int {
 	if err != nil {
 		return 0
 	}
+	countedBytes.Add(int64(len(data)))
 	n := 0
 	for _, b := range data {
 		if b == '\n' {
@@ -450,9 +486,8 @@ func listSealedSegments(dir string) ([]sealedSegment, error) {
 	return out, nil
 }
 
-// genEventID returns a short, unique-enough random id. Collisions are
-// harmless (EventID is informational; Cursor is the ordering/identity key),
-// so 8 random bytes is ample.
+// genEventID returns a random id for correlation and deduplication. Cursor
+// remains the durable ordering key.
 func genEventID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -480,25 +515,42 @@ func (b *Bus) Publish(kind, sessionID string, data any) {
 	b.enqueue(qf)
 }
 
-func (b *Bus) enqueue(qf queuedFrame) {
+// PublishWithID enqueues a frame and returns its event_id for request/ack
+// correlation. An empty ID means the frame was not accepted. Call Flush to
+// confirm durability before reporting the request as queued.
+func (b *Bus) PublishWithID(kind, sessionID string, data any) string {
+	raw, err := marshalData(data)
+	if err != nil {
+		return ""
+	}
+	id := genEventID()
+	if !b.enqueue(queuedFrame{eventID: id, kind: kind, sessionID: sessionID, data: raw, ts: time.Now()}) {
+		return ""
+	}
+	return id
+}
+
+func (b *Bus) enqueue(qf queuedFrame) bool {
 	if b == nil || !b.enabled || b.closed.Load() || b.failed.Load() {
-		return
+		return false
 	}
 	b.publishMu.RLock()
 	defer b.publishMu.RUnlock()
 	if b.abandoned.Load() {
 		b.dropped.Add(1)
-		return
+		return false
 	}
 	if b.closed.Load() || b.failed.Load() {
-		return
+		return false
 	}
 	select {
 	case b.queue <- qf:
 		b.published.Add(1)
 		b.enqueued.Add(1)
+		return true
 	default:
 		b.dropped.Add(1)
+		return false
 	}
 }
 
@@ -514,6 +566,12 @@ func (b *Bus) Flush(timeout time.Duration) bool {
 	target := b.enqueued.Load()
 	if b.synced.Load() >= target {
 		return true
+	}
+	// Every frame counted in target is already in the queue (enqueue sends
+	// before it counts), so the writer drains it when it takes this request.
+	select {
+	case b.syncReq <- struct{}{}:
+	default: // a request is already pending
 	}
 	deadline := time.Now().Add(timeout)
 	for b.synced.Load() < target {
@@ -638,6 +696,16 @@ func (b *Bus) writerLoop() {
 			flush(false)
 		case <-syncTicker.C:
 			flush(true)
+		case <-b.syncReq:
+			// Flush: append everything queued so far, then fsync. Bounded to
+			// the frames present now so a busy producer cannot starve it.
+			for n := len(b.queue); n > 0; n-- {
+				batch = append(batch, <-b.queue)
+				if len(batch) == maxWriteBatch {
+					flush(false)
+				}
+			}
+			flush(true)
 		case <-b.closeCh:
 			for {
 				select {
@@ -656,7 +724,8 @@ func (b *Bus) writerLoop() {
 }
 
 // writeBatch takes the cross-process lock once for up to maxWriteBatch frames.
-// Sync runs on the one-second tick and at shutdown, never per output line.
+// Sync runs on the one-second tick, on a Flush request and at shutdown,
+// never per output line.
 func (b *Bus) writeBatch(batch []queuedFrame, sync bool) {
 	if b.abandoned.Load() {
 		return
@@ -723,9 +792,12 @@ func (b *Bus) dropAccepted(n uint64) {
 // appendFrameLocked runs inside one batch's disk and in-process locks.
 func (b *Bus) appendFrameLocked(qf queuedFrame) error {
 	next := b.cursor + 1
+	if qf.eventID == "" {
+		qf.eventID = genEventID()
+	}
 	f := Frame{
 		Cursor:    next,
-		EventID:   genEventID(),
+		EventID:   qf.eventID,
 		TS:        qf.ts.UnixMilli(),
 		Kind:      qf.kind,
 		SessionID: qf.sessionID,

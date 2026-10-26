@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // NotificationEntry represents a waiting session in the notification bar
@@ -63,7 +65,7 @@ func (nm *NotificationManager) Add(inst *Instance) error {
 	// Create entry
 	tmuxName := ""
 	if ts := inst.GetTmuxSession(); ts != nil {
-		tmuxName = ts.Name
+		tmuxName = ts.TmuxName()
 	}
 	entry := &NotificationEntry{
 		SessionID:    inst.ID,
@@ -178,10 +180,10 @@ func (nm *NotificationManager) FormatBar() string {
 		if nm.showAll {
 			// Show status icon when in show_all mode
 			icon := statusIcon(e.Status)
-			formatted = fmt.Sprintf("[%s] %s %s", e.AssignedKey, icon, e.Title)
+			formatted = fmt.Sprintf("[%s] %s %s", e.AssignedKey, icon, tmux.FormatLiteral(e.Title))
 		} else {
 			// Original format without icons (backward compatible)
-			formatted = fmt.Sprintf("[%s] %s", e.AssignedKey, e.Title)
+			formatted = fmt.Sprintf("[%s] %s", e.AssignedKey, tmux.FormatLiteral(e.Title))
 		}
 		parts = append(parts, formatted)
 	}
@@ -306,7 +308,7 @@ func (nm *NotificationManager) SyncFromInstances(instances []*Instance, currentS
 	for _, inst := range sessionSet {
 		tmuxName := ""
 		if ts := inst.GetTmuxSession(); ts != nil {
-			tmuxName = ts.Name
+			tmuxName = ts.TmuxName()
 		}
 		entry := &NotificationEntry{
 			SessionID:    inst.ID,

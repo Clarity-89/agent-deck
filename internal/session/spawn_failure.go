@@ -311,18 +311,32 @@ const (
 func (i *Instance) startFastDeathWatcher(command string, gen uint64, wake <-chan struct{}, sess *tmux.Session, id, tool string, logger *slog.Logger, probeTool, probeMarker string) {
 	lifecycleLogPath := GetSessionIDLifecycleLogPath()
 	failureDir := spawnFailureDir()
-	i.spawnWatchers.Add(1)
-	go func() {
-		defer i.spawnWatchers.Done()
-		i.watchForFastDeath(command, gen, wake, sess, id, tool, logger, lifecycleLogPath, failureDir, probeTool, probeMarker)
-	}()
+	exitReceiptPath := i.trackedCommandExitReceiptPath()
+	i.goSpawnWatcher(func() {
+		i.watchForFastDeath(command, gen, wake, sess, id, tool, logger, lifecycleLogPath, failureDir, probeTool, probeMarker, exitReceiptPath)
+	})
 }
 
+// waitForFastDeathWatchers blocks until every goroutine a spawn started and
+// tracks in spawnWatchers has returned: the fast-death watcher and the
+// ownership attribution pass. Bump the generation first (bumpSpawnGenAndBarrier)
+// so they stop at their next wake instead of running out their window.
 func (i *Instance) waitForFastDeathWatchers() {
 	i.spawnWatchers.Wait()
 }
 
-func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan struct{}, sess *tmux.Session, id, tool string, logger *slog.Logger, lifecycleLogPath, failureDir string, probeTool, probeMarker string) {
+// retireFastDeathWatchers supersedes the previous spawn's watcher and joins it
+// before tmux.Session.Start runs again on the same session (#2805). The watcher
+// reads sess.Name (Exists, IsPaneDead, CapturePane) with no lock, and Start
+// rewrites Name when the old tmux session still exists, so without the join a
+// restart races a watcher still holding the previous spawn. The bump closes the
+// watcher's wake channel, so it returns after at most the tmux call it is in.
+func (i *Instance) retireFastDeathWatchers() {
+	i.bumpSpawnGen(false)
+	i.waitForFastDeathWatchers()
+}
+
+func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan struct{}, sess *tmux.Session, id, tool string, logger *slog.Logger, lifecycleLogPath, failureDir string, probeTool, probeMarker, exitReceiptPath string) {
 	if sess == nil {
 		return
 	}
@@ -391,6 +405,12 @@ func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan str
 		if i.spawnGen.Load() != gen {
 			return
 		}
+		// A tracked one-shot command that ran to completion left its dead
+		// pane and exit status behind on purpose. That is the command's
+		// result, reported as process-exited, not a spawn failure.
+		if trackedCommandExitObserved(sess, exitReceiptPath) {
+			return
+		}
 
 		// Session is gone — but sess.Exists() shells out to tmux, so a
 		// teardown may well have started during that call: killInternal and
@@ -449,19 +469,21 @@ func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan str
 		// part that must be ordered against teardown, not the diagnostics.
 		if writeErr != nil {
 			logger.Warn("spawn_failure_record_write_failed",
-				slog.String("instance_id", logging.SanitizeValue(id)),
-				slog.String("error", logging.SanitizeValue(writeErr.Error())))
+				slog.String("instance_id", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(id), "\n", ""), "\r", "")),
+				slog.String("error", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(writeErr.Error()), "\n", ""), "\r", "")))
 		}
 		// Every value here is session-supplied: the tool and command come from
 		// user config, and dying_output is raw captured pane content — newlines
 		// and control characters in it would otherwise forge log records
-		// (CodeQL go/log-injection).
+		// (CodeQL go/log-injection). Secrets are redacted first (env values,
+		// then credential-shaped options); the outer ReplaceAll pair is the
+		// line-break strip in the form CodeQL models.
 		logger.Error("spawn_died_fast",
-			slog.String("instance_id", logging.SanitizeValue(id)),
-			slog.String("tool", logging.SanitizeValue(tool)),
-			slog.String("command", logging.SanitizeValue(redactSpawnFailureDiagnostic(command))),
+			slog.String("instance_id", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(id), "\n", ""), "\r", "")),
+			slog.String("tool", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(tool), "\n", ""), "\r", "")),
+			slog.String("command", strings.ReplaceAll(strings.ReplaceAll(logging.RedactCommandEnv(redactSpawnFailureDiagnostic(command)), "\n", ""), "\r", "")),
 			slog.Int64("elapsed_ms", elapsed),
-			slog.String("dying_output", logging.SanitizeValue(redactSpawnFailureDiagnostic(lastSnapshot))))
+			slog.String("dying_output", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(redactSpawnFailureDiagnostic(lastSnapshot)), "\n", ""), "\r", "")))
 		return
 	}
 }

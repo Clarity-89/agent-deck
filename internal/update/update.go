@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/optiming"
 )
 
 const (
@@ -35,8 +36,8 @@ const (
 	DefaultCheckInterval = 1 * time.Hour
 )
 
-// checkInterval stores the configurable interval (set via SetCheckInterval
-// or SetCheckIntervalDuration)
+// checkInterval stores the configurable interval (set via
+// SetCheckIntervalDuration)
 var checkInterval = DefaultCheckInterval
 
 // apiBaseURL is the base URL for GitHub API calls. Overridable in tests, and
@@ -67,13 +68,6 @@ var bridgeScriptInstaller func() error
 // internal/session and avoids an import cycle. When nil (non-CLI callers),
 // UpdateBridgePy falls back to the default XDG/legacy resolution.
 var conductorDirResolver func() (string, error)
-
-// SetCheckInterval sets the update check interval from config, in hours.
-func SetCheckInterval(hours int) {
-	if hours > 0 {
-		checkInterval = time.Duration(hours) * time.Hour
-	}
-}
 
 // SetCheckIntervalDuration sets the update check interval directly. Used to
 // wire [updates].check_interval (a duration string, default 90s) so the
@@ -324,7 +318,7 @@ func fetchRecentReleases(limit int) ([]Release, error) {
 func CountReleasesBehind(currentVersion string, releases []Release) int {
 	behind := 0
 	for _, r := range releases {
-		if CompareVersions(r.TagName, currentVersion) > 0 {
+		if ReleaseSupersedes(r.TagName, currentVersion) {
 			behind++
 		}
 	}
@@ -350,14 +344,8 @@ func CachedUpdateInfo(currentVersion string) (*UpdateInfo, error) {
 	if cache == nil || cache.LatestVersion == "" {
 		return nil, nil
 	}
-	info := &UpdateInfo{
-		CurrentVersion: currentVersion,
-		LatestVersion:  cache.LatestVersion,
-		DownloadURL:    cache.DownloadURL,
-		ReleaseURL:     cache.ReleaseURL,
-		ReleasesBehind: cache.ReleasesBehind,
-		Available:      CompareVersions(currentVersion, cache.LatestVersion) < 0,
-	}
+	info := &UpdateInfo{CurrentVersion: currentVersion}
+	applyCacheToInfo(info, cache, currentVersion)
 	return info, nil
 }
 
@@ -387,6 +375,8 @@ func fetchLatestRelease() (*Release, error) {
 // should keep using its cached copy. newETag is the response's ETag, to
 // remember for the next call regardless of whether it was a 200 or a 304.
 func fetchLatestReleaseConditional(etag string) (release *Release, newETag string, notModified bool, err error) {
+	done := optiming.StartResult("update.check")
+	defer func() { done(err != nil) }()
 	url := fmt.Sprintf("%s/repos/%s/releases/latest", apiBaseURL, GitHubRepo)
 
 	resp, authed, err := githubAPIGetConditional(url, etag)
@@ -539,6 +529,30 @@ func splitPreRelease(v string) (core, pre string) {
 	return core, pre
 }
 
+// ReleaseSupersedes reports whether installing release over current is an
+// upgrade. It is CompareVersions(release, current) > 0, plus one case
+// precedence alone misses: a local build ("1.16.29+local.20261018.abc") is
+// replaced by the published release of the same version (#2710).
+// CompareVersions ignores build metadata, so on its own it calls the two
+// equal and the local build would never be offered its own release. Other
+// build metadata, and a release tag that itself carries "+", stay equal.
+func ReleaseSupersedes(release, current string) bool {
+	switch CompareVersions(release, current) {
+	case 1:
+		return true
+	case 0:
+		return IsLocalBuild(current) && !strings.Contains(release, "+")
+	}
+	return false
+}
+
+// IsLocalBuild reports whether v carries the "+local" build metadata that
+// tools/dist-local stamps on unpublished builds.
+func IsLocalBuild(v string) bool {
+	_, build, ok := strings.Cut(strings.TrimSpace(v), "+")
+	return ok && (build == "local" || strings.HasPrefix(build, "local."))
+}
+
 // comparePreRelease orders two pre-release tags the way semver 2.0 §11
 // does: dot-separated identifiers compared left to right, numeric ones as
 // numbers (so rc.2 < rc.10), numeric below alphanumeric, and a tag that is
@@ -601,13 +615,23 @@ func compareNumericIdentifiers(a, b string) int {
 
 // applyCacheToInfo fills info from a cached (or just-confirmed-unchanged)
 // release: used both when the cache is still fresh and when a conditional
-// poll comes back 304 Not Modified.
+// poll comes back 304 Not Modified. The cached ReleasesBehind is only used
+// when the cache was written by this same version: after an upgrade it still
+// counts how far the old binary was behind, so it is left at 0 (unknown).
 func applyCacheToInfo(info *UpdateInfo, cache *UpdateCache, currentVersion string) {
 	info.LatestVersion = cache.LatestVersion
 	info.DownloadURL = cache.DownloadURL
 	info.ReleaseURL = cache.ReleaseURL
-	info.ReleasesBehind = cache.ReleasesBehind
-	info.Available = CompareVersions(currentVersion, cache.LatestVersion) < 0
+	info.ReleasesBehind = 0
+	if cacheWrittenBy(cache, currentVersion) {
+		info.ReleasesBehind = cache.ReleasesBehind
+	}
+	info.Available = ReleaseSupersedes(cache.LatestVersion, currentVersion)
+}
+
+// cacheWrittenBy reports whether cache was last written by currentVersion.
+func cacheWrittenBy(cache *UpdateCache, currentVersion string) bool {
+	return strings.TrimPrefix(cache.CurrentVersion, "v") == strings.TrimPrefix(currentVersion, "v")
 }
 
 // CheckForUpdate checks if a new version is available
@@ -626,8 +650,9 @@ func CheckForUpdate(currentVersion string, forceCheck bool) (*UpdateInfo, error)
 	cache, cacheErr := loadCache()
 	haveCache := cacheErr == nil
 
-	// Try to use cache first (unless force check)
-	if !forceCheck && haveCache && time.Since(cache.CheckedAt) < checkInterval {
+	// Try to use cache first (unless force check). A cache written by another
+	// version (the user upgraded) is polled again so ReleasesBehind is recounted.
+	if !forceCheck && haveCache && time.Since(cache.CheckedAt) < checkInterval && cacheWrittenBy(cache, currentVersion) {
 		applyCacheToInfo(info, cache, currentVersion)
 		return info, nil
 	}
@@ -653,6 +678,15 @@ func CheckForUpdate(currentVersion string, forceCheck bool) (*UpdateInfo, error)
 		}
 		applyCacheToInfo(info, cache, currentVersion)
 		refreshed := *cache
+		if !cacheWrittenBy(cache, currentVersion) {
+			// The release is unchanged but this binary is not the one that
+			// counted; recount (0 on failure, like the 200 path).
+			info.ReleasesBehind = 0
+			if recent, recentErr := fetchRecentReleases(recentReleasesLimit); recentErr == nil {
+				info.ReleasesBehind = CountReleasesBehind(currentVersion, recent)
+			}
+			refreshed.ReleasesBehind = info.ReleasesBehind
+		}
 		refreshed.CheckedAt = time.Now()
 		refreshed.CurrentVersion = currentVersion
 		if newETag != "" {
@@ -700,7 +734,7 @@ func CheckForUpdate(currentVersion string, forceCheck bool) (*UpdateInfo, error)
 	info.ReleaseURL = release.HTMLURL
 	info.ReleasesBehind = releasesBehind
 	info.PublishingVersion = publishingVersion
-	info.Available = CompareVersions(currentVersion, latestVersion) < 0
+	info.Available = ReleaseSupersedes(latestVersion, currentVersion)
 
 	// Don't persist a mid-publish answer. Caching it would pin the user to the
 	// older release for a full checkInterval (an hour by default) after the real
@@ -725,83 +759,13 @@ func CheckForUpdate(currentVersion string, forceCheck bool) (*UpdateInfo, error)
 	return info, nil
 }
 
-// CheckForUpdateAsync checks for updates in the background
-// Returns a channel that will receive the result
-func CheckForUpdateAsync(currentVersion string) <-chan *UpdateInfo {
-	ch := make(chan *UpdateInfo, 1)
-
-	go func() {
-		info, err := CheckForUpdate(currentVersion, false)
-		if err != nil {
-			// On error, return no update available
-			ch <- &UpdateInfo{Available: false, CurrentVersion: currentVersion}
-		} else {
-			ch <- info
-		}
-		close(ch)
-	}()
-
-	return ch
-}
-
-// PerformUpdate downloads and installs the latest version
-func PerformUpdate(downloadURL string) error {
-	if downloadURL == "" {
-		return fmt.Errorf("no download URL available for %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-
-	execPath, upgradeCmd, managed, err := detectHomebrewManagedInstall()
-	if err != nil {
-		return fmt.Errorf("failed to detect install type: %w", err)
-	}
-	if managed {
-		return fmt.Errorf("homebrew-managed install detected at %s; use `%s`", execPath, upgradeCmd)
-	}
-
-	// Download the release
-	fmt.Printf("Downloading from %s...\n", downloadURL)
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(downloadURL)
-	if err != nil {
-		return fmt.Errorf("failed to download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status %d", resp.StatusCode)
-	}
-
-	// Create temp file for download
-	tmpFile, err := os.CreateTemp("", "agent-deck-update-*.tar.gz")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	// Copy download to temp file
-	fmt.Println("Downloading...")
-	_, err = io.Copy(tmpFile, resp.Body)
-	tmpFile.Close()
-	if err != nil {
-		return fmt.Errorf("failed to save download: %w", err)
-	}
-
-	// Extract the binary from tarball
-	fmt.Println("Extracting...")
-	binaryData, err := extractBinaryFromTarGz(tmpPath)
-	if err != nil {
-		return fmt.Errorf("failed to extract: %w", err)
-	}
-
-	return installSelfUpdateBinary(execPath, binaryData)
-}
-
 // PerformVerifiedUpdate downloads, verifies, extracts, and installs a release
 // binary for the requested platform. It fails closed: checksum download,
 // missing-entry, or hash mismatch errors occur before the installed binary is
 // touched.
-func PerformVerifiedUpdate(release *Release, goos, goarch string) error {
+func PerformVerifiedUpdate(release *Release, goos, goarch string) (err error) {
+	done := optiming.StartResult("update.install")
+	defer func() { done(err != nil) }()
 	execPath, upgradeCmd, managed, err := detectHomebrewManagedInstall()
 	if err != nil {
 		return fmt.Errorf("failed to detect install type: %w", err)
@@ -1065,16 +1029,6 @@ func FormatChangelogForDisplay(entries []ChangelogEntry) string {
 
 	sb.WriteString("\n━━━━━━━━━━━━━━━━━━\n")
 	return sb.String()
-}
-
-// extractBinaryFromTarGz extracts the agent-deck binary from a .tar.gz file.
-func extractBinaryFromTarGz(tarPath string) ([]byte, error) {
-	file, err := os.Open(tarPath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	return extractBinaryFromTarGzReader(file)
 }
 
 // extractBinaryFromTarGzBytes extracts the agent-deck binary from an in-memory

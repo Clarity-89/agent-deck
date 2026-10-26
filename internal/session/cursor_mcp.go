@@ -20,7 +20,7 @@ func GetCursorConfigDir() string {
 	if err != nil || home == "" {
 		return ""
 	}
-	return filepath.Join(home, ".cursor")
+	return sandboxedToolDir("Cursor config dir", filepath.Join(home, ".cursor"))
 }
 
 // cursorProjectMCPPath resolves <project>/.cursor/mcp.json from a session project directory.
@@ -157,11 +157,10 @@ func WriteCursorProjectMCP(projectPath string, enabledNames []string) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(mcpFile)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create .cursor directory: %w", err)
-	}
-	if err := WriteMergedMcpJSONFile(mcpFile, enabledNames, ""); err != nil {
+	// No MkdirAll here: .cursor may be a link out of the project, and nothing
+	// may be created before the containment check. The lock and the atomic
+	// write create the directory once the check has passed.
+	if err := writeMergedMcpJSONFileWithin(filepath.Dir(filepath.Dir(mcpFile)), mcpFile, enabledNames, ""); err != nil {
 		return err
 	}
 	return nil
@@ -181,13 +180,21 @@ func WriteCursorGlobalMCP(enabledNames []string) error {
 		return fmt.Errorf("create cursor config dir: %w", err)
 	}
 
-	var rawConfig map[string]interface{}
-	if data, err := os.ReadFile(configFile); err == nil {
-		if err := json.Unmarshal(data, &rawConfig); err != nil {
-			rawConfig = make(map[string]interface{})
-		}
-	} else {
-		rawConfig = make(map[string]interface{})
+	lock, err := AcquireConfigFileLock(configFile)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
+	// A read or parse failure aborts: writing an empty map back would wipe
+	// the user's mcp.json.
+	rawConfig, err := readJSONObjectConfig(configFile)
+	if err != nil {
+		return err
+	}
+	existing, err := objectFieldForUpdate(rawConfig, "mcpServers", configFile+" mcpServers")
+	if err != nil {
+		return err
 	}
 
 	availableMCPs := GetAvailableMCPs()
@@ -237,7 +244,17 @@ func WriteCursorGlobalMCP(enabledNames []string) error {
 		}
 	}
 
-	rawConfig["mcpServers"] = mcpServers
+	// Keep servers the user added outside the agent-deck catalog (#146).
+	merged := make(map[string]interface{}, len(existing)+len(mcpServers))
+	for name, cfg := range existing {
+		if _, managed := availableMCPs[name]; !managed {
+			merged[name] = cfg
+		}
+	}
+	for name, cfg := range mcpServers {
+		merged[name] = cfg
+	}
+	rawConfig["mcpServers"] = merged
 
 	newData, err := json.MarshalIndent(rawConfig, "", "  ")
 	if err != nil {

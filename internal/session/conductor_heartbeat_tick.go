@@ -160,13 +160,15 @@ func SaveHeartbeatTickState(name string, st HeartbeatTickState) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
 }
 
 // InboxSnapshot returns the pending count and content identity in one read.
+// A record the session already read the result of (it is withdrawn at the
+// next drain, inbox_result_read.go) is not pending; an unparseable line is.
 func InboxSnapshot(sessionID string) (int, string, error) {
 	data, err := os.ReadFile(InboxPathFor(sessionID))
 	if os.IsNotExist(err) {
@@ -175,15 +177,23 @@ func InboxSnapshot(sessionID string) (int, string, error) {
 	if err != nil {
 		return 0, "", err
 	}
+	reads := loadResultReads(sessionID)
 	count := 0
+	h := sha256.New()
 	for _, line := range bytes.Split(data, []byte{'\n'}) {
-		if len(bytes.TrimSpace(line)) > 0 {
-			count++
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
 		}
+		var ev TransitionNotificationEvent
+		if json.Unmarshal(line, &ev) == nil && reads.covers(ev) {
+			continue
+		}
+		count++
+		h.Write(line)
+		h.Write([]byte{'\n'})
 	}
 	if count == 0 {
 		return 0, "", nil
 	}
-	digest := sha256.Sum256(data)
-	return count, fmt.Sprintf("%x", digest), nil
+	return count, fmt.Sprintf("%x", h.Sum(nil)), nil
 }

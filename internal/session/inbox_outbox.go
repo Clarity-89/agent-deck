@@ -133,7 +133,9 @@ func TurnFingerprint(e TransitionNotificationEvent) string {
 		if hash := strings.TrimSpace(e.LastOutputHash); hash != "" {
 			signal += "|" + hash
 		}
-	case e.OutputHashStale:
+	case e.OutputHashStale && !strings.HasPrefix(strings.TrimSpace(e.LastOutputHash), "pi-run:"):
+		// A pi-run signal names its run for good: the hash TTL never turns it into
+		// a timestamp, or an aborted run's identity would depend on one.
 		signal = "flip|" + flip + "|" + emitInstantSignal(e.Timestamp)
 	case strings.TrimSpace(e.LastOutputHash) != "":
 		signal = "turn|" + strings.TrimSpace(e.LastOutputHash)
@@ -182,7 +184,7 @@ func commitToInbox(parentSessionID string, event TransitionNotificationEvent) (s
 	}
 
 	path := InboxPathFor(parentSessionID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return event, inboxCommitAdded, err
 	}
 	fileLock, err := AcquireConfigFileLock(path)
@@ -435,7 +437,7 @@ func (s *DeadLetterSink) writeMissedOnce(event TransitionNotificationEvent) {
 	if reason == "" {
 		reason = deadLetterReasonUnresolvable
 	}
-	if err := os.MkdirAll(filepath.Dir(s.missedPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.missedPath), 0o700); err != nil {
 		commsLog.Warn("dead_letter_missed_log_mkdir_failed",
 			slog.String("child", event.ChildSessionID), slog.String("error", err.Error()))
 		return
@@ -466,7 +468,7 @@ func (s *DeadLetterSink) writeMissedOnce(event TransitionNotificationEvent) {
 // across daemon processes. appended is true only for a newly installed record.
 func writeDeadLetter(event TransitionNotificationEvent) (appended bool, err error) {
 	path := DeadLetterPathFor(event.ChildSessionID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return false, err
 	}
 	fileLock, err := AcquireConfigFileLock(path)
@@ -488,7 +490,7 @@ func writeDeadLetter(event TransitionNotificationEvent) (appended bool, err erro
 	if err != nil {
 		return false, err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return false, err
 	}
@@ -769,11 +771,21 @@ func (n *TransitionNotifier) wakeCommittedInbox(parent *Instance, event Transiti
 			slog.String("parent", parentID), slog.String("turn", event.TurnFingerprint))
 		return
 	}
+	// A notice withdraws itself when the parent already read the result it
+	// announces (`session output <child>` after the child finished): the
+	// wake would start a turn with nothing new in it. The record stays
+	// queued; the drain retires it unshown.
+	if loadResultReads(parentID).covers(event) {
+		_ = BumpInboxStats(parentID, func(s *InboxStats) { s.WakeupsWithdrawn++ })
+		commsLog.Debug("wake_nudge_withdrawn_result_read",
+			slog.String("parent", parentID), slog.String("child", event.ChildSessionID), slog.String("turn", event.TurnFingerprint))
+		return
+	}
 	// Issue #2469, design principle 1: only the tiers listed in [inbox]
 	// wake_on (default: urgent) wake the parent. An info record stays durably
 	// queued and rides the parent's next turn or the info digest; it is never
 	// lost, it just does not buy a turn of its own.
-	if !ResolveInboxConfig(parent.Title).WakesFor(event.Tier) {
+	if !ResolveInboxConfigForInstance(parent).WakesFor(event.Tier) {
 		_ = BumpInboxStats(parentID, func(s *InboxStats) { s.WakeupsSuppressed++ })
 		commsLog.Debug("wake_nudge_skipped_tier",
 			slog.String("parent", parentID), slog.String("tier", event.Tier), slog.String("turn", event.TurnFingerprint))

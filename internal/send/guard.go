@@ -13,10 +13,25 @@ import (
 //
 // Treating these as operator drafts would make every automated send hold and
 // Ctrl+C an actually-empty composer (issue #1409).
+//
+// While a turn runs with input queued behind it, Claude shows its own hint in
+// the empty composer instead:
+//
+//	❯ Press up to edit queued messages
+//
+// That is Claude's acknowledgement of earlier queued input, not a draft;
+// reading it as one refused every further send to a busy target (ASK-95).
 func IsComposerPlaceholder(text string) bool {
 	t := strings.TrimSpace(text)
+	if strings.EqualFold(t, ClaudeQueuedHint) {
+		return true
+	}
 	return strings.HasPrefix(t, `Try "`) && strings.HasSuffix(t, `"`)
 }
+
+// ClaudeQueuedHint is the composer placeholder Claude Code renders while it
+// holds input behind the running turn.
+const ClaudeQueuedHint = "Press up to edit queued messages"
 
 // ComposerDraft returns the normalized operator draft sitting in the visible
 // composer, and whether a composer is visible at all.
@@ -51,6 +66,17 @@ func ComposerDraft(raw string, strip func(string) string) (draft string, compose
 	return body, true
 }
 
+// ComposerShowsQueuedHint reports whether the visible composer shows Claude's
+// queued-messages hint: it holds no draft, but input is waiting behind the
+// turn. Same raw/strip contract as ComposerDraft.
+func ComposerShowsQueuedHint(raw string, strip func(string) string) bool {
+	if strip == nil {
+		strip = func(s string) string { return s }
+	}
+	body, ok := CurrentComposerPrompt(strip(raw))
+	return ok && strings.EqualFold(NormalizePromptText(body), ClaudeQueuedHint)
+}
+
 // ComposerHasDraft reports whether the visible composer holds operator input.
 // This is the shared "is the composer busy?" check automated senders must run
 // before injecting keystrokes into the pane (issue #1409). Same raw/strip
@@ -82,7 +108,15 @@ type ComposerGuardOptions struct {
 	// Strip is applied to raw captured pane content before composer
 	// introspection (pass tmux.StripANSI). nil means identity.
 	Strip func(string) string
+	// Draft reads the operator draft out of a raw capture for the target's
+	// TUI, with ComposerDraft's contract. nil means ComposerDraft (Claude);
+	// Codex targets pass CodexComposerDraft (issue #2536).
+	Draft ComposerDraftReader
 }
+
+// ComposerDraftReader extracts the operator draft from a raw (ANSI-bearing)
+// pane capture and reports whether a composer is visible at all.
+type ComposerDraftReader func(raw string, strip func(string) string) (draft string, composerVisible bool)
 
 // ComposerGuardResult reports what the guard did.
 type ComposerGuardResult struct {
@@ -106,6 +140,12 @@ type ComposerGuardResult struct {
 	// marker still present), which fails safe — the gate then withholds the
 	// Enter nudge.
 	ComposerPasteMarkerFree bool
+	// SuggestionShown is true when the guard's last successful capture
+	// showed a Claude prompt suggestion in the (empty) composer. The caller
+	// types its message over it and must confirm, before pressing Enter,
+	// that the composer now holds that message rather than the suggestion
+	// (TypedComposerCheck).
+	SuggestionShown bool
 }
 
 // saveReconfirmDelay is the settle time before the save-step re-capture. A
@@ -129,8 +169,8 @@ const saveReconfirmDelay = 50 * time.Millisecond
 // foreign marker that renders later be misattributed as ours (#1778 review
 // finding 2). Mirror ComposerHoldsPasteMarker's choice here so the two
 // producers of this evidence never disagree.
-func composerProvenanceFree(raw string, strip func(string) string) bool {
-	draft, visible := ComposerDraft(raw, strip)
+func composerProvenanceFree(raw string, strip func(string) string, read ComposerDraftReader) bool {
+	draft, visible := read(raw, strip)
 	if visible {
 		return draft == ""
 	}
@@ -146,6 +186,10 @@ func GuardComposerDraft(t ComposerGuardTarget, opts ComposerGuardOptions) Compos
 	if strip == nil {
 		strip = func(s string) string { return s }
 	}
+	read := opts.Draft
+	if read == nil {
+		read = ComposerDraft
+	}
 	poll := opts.PollInterval
 	if poll <= 0 {
 		poll = 250 * time.Millisecond
@@ -160,8 +204,8 @@ func GuardComposerDraft(t ComposerGuardTarget, opts ComposerGuardOptions) Compos
 			// An unreadable pane cannot authorize input.
 			return ComposerGuardResult{Held: time.Since(start), Refused: true}
 		}
-		if composerProvenanceFree(raw, strip) {
-			return ComposerGuardResult{Held: time.Since(start), ComposerPasteMarkerFree: true}
+		if composerProvenanceFree(raw, strip, read) {
+			return clearComposerResult(start, raw)
 		}
 		if !time.Now().Before(deadline) {
 			break
@@ -179,8 +223,13 @@ func GuardComposerDraft(t ComposerGuardTarget, opts ComposerGuardOptions) Compos
 	// Reclassify one settled frame without modifying the composer.
 	time.Sleep(saveReconfirmDelay)
 	raw, err := t.CapturePaneFresh()
-	if err == nil && composerProvenanceFree(raw, strip) {
-		return ComposerGuardResult{Held: time.Since(start), ComposerPasteMarkerFree: true}
+	if err == nil && composerProvenanceFree(raw, strip, read) {
+		return clearComposerResult(start, raw)
 	}
 	return ComposerGuardResult{Held: time.Since(start), Refused: true}
+}
+
+// clearComposerResult is GuardComposerDraft's go-ahead for the capture raw.
+func clearComposerResult(start time.Time, raw string) ComposerGuardResult {
+	return ComposerGuardResult{Held: time.Since(start), ComposerPasteMarkerFree: true, SuggestionShown: ComposerBodyIsSuggestion(raw)}
 }

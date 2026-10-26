@@ -7,16 +7,16 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
-	"time"
+	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/atomicfile"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/mcppool"
 	"github.com/asheshgoplani/agent-deck/internal/safeio"
+	"github.com/asheshgoplani/agent-deck/internal/sandboxguard"
 )
 
 var mcpCatLog = logging.ForComponent(logging.CompMCP)
@@ -29,27 +29,26 @@ type MCPServerConfig struct {
 	Env     map[string]string `json:"env,omitempty"`
 	URL     string            `json:"url,omitempty"`     // For HTTP transport
 	Headers map[string]string `json:"headers,omitempty"` // For HTTP transport (e.g., Authorization)
+	OAuth   *MCPOAuthConfig   `json:"oauth,omitempty"`   // For HTTP transport with a pre-registered OAuth client
+}
+
+// httpMCPServerConfig builds the Claude-format entry for an HTTP/SSE MCP.
+func httpMCPServerConfig(def MCPDef) MCPServerConfig {
+	return MCPServerConfig{
+		Type:    def.GetTransport(),
+		URL:     def.URL,
+		Headers: def.Headers,
+		OAuth:   def.OAuth.claudeOAuth(),
+	}
 }
 
 // getExternalSocketPath returns the socket path if an external pool socket exists and is alive
-// This allows CLI commands to use sockets created by the TUI without needing pool initialization
+// This allows CLI commands to use sockets created by the TUI without needing pool initialization.
+// It looks only in this user's private pool socket dir and only accepts sockets
+// owned by this uid (mcppool.ExternalSocketPath); the old shared
+// /tmp/agentdeck-mcp-<name>.sock location is never trusted.
 func getExternalSocketPath(mcpName string) string {
-	socketPath := filepath.Join("/tmp", fmt.Sprintf("agentdeck-mcp-%s.sock", mcpName))
-
-	// Check if socket file exists
-	if _, err := os.Stat(socketPath); os.IsNotExist(err) {
-		return ""
-	}
-
-	// Check if socket is alive (accepting connections)
-	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
-	if err != nil {
-		mcpCatLog.Debug("socket_not_alive", slog.String("socket", socketPath), slog.Any("error", err))
-		return ""
-	}
-	conn.Close()
-
-	return socketPath
+	return mcppool.ExternalSocketPath(mcpName)
 }
 
 // tryPoolSocket attempts to resolve an MCP to a pool socket in order of preference:
@@ -162,27 +161,76 @@ func readExistingLocalMCPServers(mcpFile string) (map[string]json.RawMessage, er
 }
 
 // writeJSONFileAtomic writes JSON data to path atomically (symlink-preserving,
-// via atomicfile.WriteFile), guaranteeing exactly one trailing newline and
+// via atomicfile.WriteFileWithin: the real file must stay under root, the
+// project directory the file belongs to), guaranteeing exactly one trailing newline and
 // skipping the write entirely when the on-disk bytes already match.
 // json.MarshalIndent emits no trailing newline, so without this a restart
 // rewrote a byte-identical-except-for-the-missing-\n file, leaving a persistent
 // one-byte git diff (issue #1627). Skipping the atomic replace when nothing
 // changed also avoids needless filesystem churn.
-func writeJSONFileAtomic(path string, data []byte, perm os.FileMode) error {
+func writeJSONFileAtomic(root, path string, data []byte, perm os.FileMode) error {
 	if len(data) == 0 || data[len(data)-1] != '\n' {
 		data = append(data, '\n')
 	}
-	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
-		return nil
+	// Check containment before reading: the unchanged-content shortcut must
+	// not turn a refusal into success, nor read through a link out of root.
+	if err := atomicfile.CheckWithin(root, path); err != nil {
+		return withProjectMCPOptOut(err)
 	}
-	return atomicfile.WriteFile(path, data, perm)
+	// A cleaned absolute path holds ".." only inside a name; such a path just
+	// skips the shortcut. The guard is the traversal check CodeQL
+	// go/path-injection recognises.
+	// A file looser than perm is rewritten even when its bytes match, so an
+	// .mcp.json left world-readable by an older agent-deck is tightened
+	// through the same symlink-safe replace.
+	if !strings.Contains(path, "..") {
+		if st, statErr := os.Stat(path); statErr == nil {
+			if st.Mode().Perm()&^perm == 0 {
+				if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
+					return nil
+				}
+			} else {
+				mcpCatLog.Info("project_mcp_permissions_tightened",
+					slog.String("path", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(path), "\n", ""), "\r", "")),
+					slog.String("from", fmt.Sprintf("%o", st.Mode().Perm())),
+					slog.String("to", fmt.Sprintf("%o", perm)))
+			}
+		}
+	}
+	return withProjectMCPOptOut(atomicfile.WriteFileWithin(root, path, data, perm))
+}
+
+// withProjectMCPOptOut adds the way out to a refusal to write a project MCP
+// config through a symlink that leaves the project. One setting covers every
+// project writer (.mcp.json, .cursor/mcp.json, opencode.json).
+func withProjectMCPOptOut(err error) error {
+	if !errors.Is(err, atomicfile.ErrOutsideRoot) {
+		return err
+	}
+	return fmt.Errorf("%w; set manage_mcp_json = false in config.toml to stop agent-deck writing project MCP config files", err)
 }
 
 // WriteMergedMcpJSONFile writes enabled MCPs from config.toml to mcpFile using the
 // Claude/Cursor JSON shape {"mcpServers":{...}}. It preserves entries not defined in
 // config.toml. When pluginPinClaudeProfile is non-empty (Claude project .mcp.json),
-// refreshes stale plugin version pins before merging (#960).
+// refreshes stale plugin version pins before merging (#960). The file must stay
+// inside its own directory: a symlink leading elsewhere is refused.
 func WriteMergedMcpJSONFile(mcpFile string, enabledNames []string, pluginPinClaudeProfile string) error {
+	return writeMergedMcpJSONFileWithin(filepath.Dir(mcpFile), mcpFile, enabledNames, pluginPinClaudeProfile)
+}
+
+// writeMergedMcpJSONFileWithin is WriteMergedMcpJSONFile for a file below
+// projectRoot (e.g. <project>/.cursor/mcp.json): the real file written, after
+// following symlinks in the file and its parent directories, must lie under
+// projectRoot.
+func writeMergedMcpJSONFileWithin(projectRoot, mcpFile string, enabledNames []string, pluginPinClaudeProfile string) error {
+	// The lock file beside mcpFile is opened with O_CREATE, so both paths are
+	// checked before either is touched.
+	for _, p := range []string{mcpFile, mcpFile + ".lock"} {
+		if err := atomicfile.CheckWithin(projectRoot, p); err != nil {
+			return withProjectMCPOptOut(err)
+		}
+	}
 	// Same read-modify-write class as the .claude.json writers: this reads the
 	// existing servers, merges, and writes the whole file back. The web local
 	// scope and the TUI both reach it, so it takes the same per-path lock.
@@ -197,7 +245,11 @@ func WriteMergedMcpJSONFile(mcpFile string, enabledNames []string, pluginPinClau
 
 	if pluginPinClaudeProfile != "" {
 		if _, err := RefreshStalePluginPins(mcpFile, []string{pluginPinClaudeProfile}); err != nil {
-			mcpCatLog.Warn("plugin_pin_refresh_failed", "path", mcpFile, "error", err)
+			mcpCatLog.Warn("plugin_pin_refresh_failed",
+				// The inline ReplaceAll calls are no-ops after SanitizeValue; they are
+				// the newline barrier CodeQL go/log-injection recognises at the sink.
+				slog.String("path", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(mcpFile), "\n", ""), "\r", "")),
+				slog.String("error", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(err.Error()), "\n", ""), "\r", "")))
 		}
 	}
 
@@ -216,16 +268,9 @@ func WriteMergedMcpJSONFile(mcpFile string, enabledNames []string, pluginPinClau
 					}
 				}
 
-				transport := def.Transport
-				if transport == "" {
-					transport = "http"
-				}
-				agentDeckServers[name] = MCPServerConfig{
-					Type:    transport,
-					URL:     def.URL,
-					Headers: def.Headers,
-				}
-				mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", "local"), slog.String("transport", transport), slog.String("url", def.URL))
+				cfg := httpMCPServerConfig(def)
+				agentDeckServers[name] = cfg
+				mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", "local"), slog.String("transport", cfg.Type), slog.String("url", def.URL))
 				continue
 			}
 
@@ -279,9 +324,11 @@ func WriteMergedMcpJSONFile(mcpFile string, enabledNames []string, pluginPinClau
 		return fmt.Errorf("failed to marshal mcp json: %w", err)
 	}
 
-	if err := writeJSONFileAtomic(mcpFile, data, 0644); err != nil {
+	// 0600: the file carries MCP env values, which are often tokens.
+	if err := writeJSONFileAtomic(projectRoot, mcpFile, data, 0o600); err != nil {
 		return fmt.Errorf("failed to save mcp json: %w", err)
 	}
+	excludeProjectMCPFromGit(projectRoot, mcpFile)
 
 	return nil
 }
@@ -606,12 +653,9 @@ func buildManagedMCPServers(enabledNames []string, scope string) map[string]MCPS
 					mcpCatLog.Warn("http_server_start_failed", slog.String("mcp", name), slog.String("scope", scope), slog.Any("error", err))
 				}
 			}
-			transport := def.Transport
-			if transport == "" {
-				transport = "http"
-			}
-			mcpServers[name] = MCPServerConfig{Type: transport, URL: def.URL, Headers: def.Headers}
-			mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", scope), slog.String("transport", transport), slog.String("url", def.URL))
+			cfg := httpMCPServerConfig(def)
+			mcpServers[name] = cfg
+			mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", scope), slog.String("transport", cfg.Type), slog.String("url", def.URL))
 			continue
 		}
 		if socketCfg, used := tryPoolSocket(pool, name, scope); used {
@@ -724,11 +768,11 @@ func clearProjectMCPsLocked(projectPath string) error {
 // This is the ROOT config that Claude ALWAYS reads, regardless of CLAUDE_CONFIG_DIR setting.
 // MCPs defined here apply to ALL Claude sessions globally.
 func GetUserMCPRootPath() string {
-	home, err := os.UserHomeDir()
+	p, err := sandboxguard.HomeJoin("Claude root config (~/.claude.json)", ".claude.json")
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".claude.json")
+	return p
 }
 
 // WriteUserMCP writes MCPs to ~/.claude.json (ROOT config)
@@ -764,16 +808,9 @@ func writeUserMCPLocked(enabledNames []string) error {
 					}
 				}
 
-				transport := def.Transport
-				if transport == "" {
-					transport = "http" // default to http if URL is set
-				}
-				mcpServers[name] = MCPServerConfig{
-					Type:    transport,
-					URL:     def.URL,
-					Headers: def.Headers,
-				}
-				mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", "user"), slog.String("transport", transport), slog.String("url", def.URL))
+				cfg := httpMCPServerConfig(def)
+				mcpServers[name] = cfg
+				mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", "user"), slog.String("transport", cfg.Type), slog.String("url", def.URL))
 				continue
 			}
 

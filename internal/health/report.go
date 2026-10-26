@@ -25,8 +25,11 @@ type ProcessReport struct {
 	Flags  []string                `json:"flags"`
 }
 type Budgets struct {
-	StatusPassMS        float64 `json:"status_pass_ms_exclusive"`
-	OpenFDs             int     `json:"open_fds_exclusive"`
+	StatusPassMS float64 `json:"status_pass_ms_exclusive"`
+	OpenFDs      int     `json:"open_fds_exclusive"`
+	// OpenFDsPerSession is added to OpenFDs for each session the process
+	// manages (capped at four fifths of its RLIMIT_NOFILE).
+	OpenFDsPerSession   int     `json:"open_fds_per_session"`
 	TmuxCallsPerSession int     `json:"tmux_calls_per_session"`
 	RemotePollMS        float64 `json:"remote_poll_ms_exclusive"`
 	// OpenFDsSupport is OpenFDsSampled when any sample in the window counted
@@ -106,7 +109,7 @@ func numeric(s Sample) map[string]float64 {
 // final line. Missing and corrupt data are explicitly reported as unknown.
 func Report(dir string, since time.Duration) (Summary, error) {
 	now := time.Now().UTC()
-	result := Summary{Budgets: Budgets{StatusPassMS: float64(StatusPassBudget / time.Millisecond), OpenFDs: DescriptorBudget, TmuxCallsPerSession: 2, RemotePollMS: float64(RemotePollBudget / time.Millisecond)}, Version: 1, Since: now.Add(-since), Processes: []ProcessReport{}, Flags: []string{}}
+	result := Summary{Budgets: Budgets{StatusPassMS: float64(StatusPassBudget / time.Millisecond), OpenFDs: DescriptorBudget, OpenFDsPerSession: DescriptorsPerSession, TmuxCallsPerSession: 2, RemotePollMS: float64(RemotePollBudget / time.Millisecond)}, Version: 1, Since: now.Add(-since), Processes: []ProcessReport{}, Flags: []string{}}
 	if since <= 0 {
 		return result, fmt.Errorf("since must be a positive duration")
 	}
@@ -175,6 +178,9 @@ func Report(dir string, since time.Duration) (Summary, error) {
 		values := map[string][]float64{}
 		flagSet := map[string]bool{}
 		add := func(s string) { flagSet[s] = true }
+		// worstFDs is the sample furthest over its descriptor budget.
+		var worstFDs *Sample
+		worstOver := 0
 		for _, s := range samples {
 			for name, value := range numeric(s) {
 				values[name] = append(values[name], value)
@@ -182,12 +188,15 @@ func Report(dir string, since time.Duration) (Summary, error) {
 			if s.StatusPassMS != nil && *s.StatusPassMS >= float64(StatusPassBudget/time.Millisecond) {
 				add("status pass exceeds 250 ms budget")
 			}
-			if s.OpenFDs != nil && *s.OpenFDs >= DescriptorBudget {
-				add("descriptor count exceeds 512 budget")
+			if s.OpenFDs != nil {
+				if over := *s.OpenFDs - descriptorBudgetOf(s); over >= 0 && (worstFDs == nil || over > worstOver) {
+					worst := s
+					worstFDs, worstOver = &worst, over
+				}
 			}
 			sampledFDs = sampledFDs || s.OpenFDs != nil
 			unsupportedFDs = unsupportedFDs || s.OpenFDsSupport == OpenFDsUnsupported
-			if s.Sessions != nil && s.TmuxCalls != nil && *s.TmuxCalls > int64(2*(*s.Sessions)) {
+			if s.Sessions != nil && s.TmuxCalls != nil && tmuxCallsOverBudget(*s.Sessions, *s.TmuxCalls) {
 				add("tmux calls exceed twice the session count")
 			}
 			for name, r := range s.Remotes {
@@ -199,11 +208,14 @@ func Report(dir string, since time.Duration) (Summary, error) {
 				}
 			}
 		}
+		if worstFDs != nil {
+			add(fmt.Sprintf(descriptorBudgetFlag+" (%d open, budget %d)", *worstFDs.OpenFDs, descriptorBudgetOf(*worstFDs)))
+		}
 		if now.Sub(p.Latest.Timestamp) > 2*time.Minute {
 			add("stale: latest sample is older than 2 minutes")
 		}
 		if fds := values["open_fds"]; len(fds) > 1 && fds[len(fds)-1] > fds[0] {
-			add("descriptor growth observed")
+			add(descriptorGrowthFlag)
 		}
 		for name, v := range values {
 			sort.Float64s(v)
@@ -234,6 +246,9 @@ func Format(s Summary) string {
 	var b strings.Builder
 	b.WriteString("Runtime health\n")
 	descriptors := fmt.Sprintf("descriptors <%d", s.Budgets.OpenFDs)
+	if s.Budgets.OpenFDsPerSession > 0 {
+		descriptors += fmt.Sprintf(" + %d per session", s.Budgets.OpenFDsPerSession)
+	}
 	if s.Budgets.OpenFDsSupport == OpenFDsUnsupported {
 		descriptors = "descriptors unsupported on this platform"
 	}
@@ -283,9 +298,58 @@ func Format(s Summary) string {
 		for _, name := range remoteNames {
 			fmt.Fprintf(&b, "    remote %s latest outcome: %s\n", strconv.QuoteToASCII(name), strconv.QuoteToASCII(p.Latest.Remotes[name].Outcome))
 		}
+		overBudget, growing := false, false
 		for _, flag := range p.Flags {
 			fmt.Fprintf(&b, "    %s\n", flag)
+			overBudget = overBudget || strings.HasPrefix(flag, descriptorBudgetFlag)
+			growing = growing || flag == descriptorGrowthFlag
+		}
+		if overBudget {
+			writeDescriptorHint(&b, p, growing)
 		}
 	}
 	return b.String()
+}
+
+// descriptorBudgetFlag prefixes the flag a process gets when a sample's
+// descriptor count was over budget; Format follows it with a hint.
+const descriptorBudgetFlag = "descriptor count exceeds budget"
+
+// descriptorGrowthFlag is the flag a process gets when its latest descriptor
+// count is above its first one in the window.
+const descriptorGrowthFlag = "descriptor growth observed"
+
+// writeDescriptorHint explains what an over-budget descriptor count means
+// and how to find what holds the descriptors (#2668). A live lsof breakdown
+// only helps while the latest sample is still over budget; a breach seen
+// only in earlier samples is reported as historical. A count that is over
+// budget and still rising is called out as a likely leak rather than a
+// limit to raise.
+func writeDescriptorHint(b *strings.Builder, p ProcessReport, growing bool) {
+	latest := p.Latest
+	limit := "the soft open-file limit (ulimit -n)"
+	if latest.OpenFDsLimit != nil {
+		limit = fmt.Sprintf("the soft open-file limit (ulimit -n = %d)", *latest.OpenFDsLimit)
+	}
+	fmt.Fprintf(b, "    hint: the budget is %d + %d per session, capped at 80%% of %s.\n", DescriptorBudget, DescriptorsPerSession, limit)
+	b.WriteString("      It is advisory: nothing fails until the count reaches that limit; past it, opening files, sockets and tmux pipes fails.\n")
+	current := latest.OpenFDs != nil && *latest.OpenFDs >= descriptorBudgetOf(latest)
+	if !current {
+		if latest.OpenFDs != nil {
+			fmt.Fprintf(b, "      The breach is historical: the latest sample (%d open) is back within its budget of %d.\n", *latest.OpenFDs, descriptorBudgetOf(latest))
+		} else {
+			b.WriteString("      The breach is historical: the latest sample has no descriptor count.\n")
+		}
+		b.WriteString("      A breakdown taken now cannot show what held them; take one when the footer warns again.\n")
+		b.WriteString("      Details: docs/runtime-health.md#descriptor-budget\n")
+		return
+	}
+	if fds, ok := p.Stats["open_fds"]; ok && growing {
+		fmt.Fprintf(b, "      The count is still rising (from %.0f to %d open in this window). Growth that does not follow the session count is a descriptor leak, not a limit to raise.\n", fds.Min, *latest.OpenFDs)
+		b.WriteString("      Please report it with the breakdown below.\n")
+	} else {
+		b.WriteString("      Rerun agent-deck health later; a count that keeps growing points to a leak.\n")
+	}
+	fmt.Fprintf(b, "      See what holds them: lsof -p %d | awk 'NR>1 {print $5}' | sort | uniq -c | sort -rn\n", latest.PID)
+	b.WriteString("      Restarting the process resets the count. Details: docs/runtime-health.md#descriptor-budget\n")
 }

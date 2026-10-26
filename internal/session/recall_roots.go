@@ -58,7 +58,7 @@ func RecallClaudeRoots() []reader.Root {
 		}
 	}
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
-		add("", filepath.Join(home, ".claude"))
+		add("", sandboxedToolDir("Claude config dir (~/.claude)", filepath.Join(home, ".claude")))
 	}
 	add("", os.Getenv("CLAUDE_CONFIG_DIR"))
 	if cfg != nil {
@@ -207,8 +207,14 @@ func RecallRoots() []reader.Root {
 	}
 	add(reader.HarnessCodex, "", os.Getenv("CODEX_HOME"))
 	if home != "" {
-		add(reader.HarnessCodex, "", filepath.Join(home, ".codex"))
-		add(reader.HarnessPi, "", filepath.Join(home, ".pi"))
+		// keep() is checked here as well as in add so the guard only sees
+		// the dirs this call will actually stat.
+		if keep(reader.HarnessCodex) {
+			add(reader.HarnessCodex, "", sandboxedToolDir("Codex home (~/.codex)", filepath.Join(home, ".codex")))
+		}
+		if keep(reader.HarnessPi) {
+			add(reader.HarnessPi, "", sandboxedToolDir("Pi dir (~/.pi)", filepath.Join(home, ".pi")))
+		}
 	}
 	if dir := strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR")); dir != "" {
 		add(reader.HarnessPi, "", filepath.Dir(ExpandPath(dir)))
@@ -228,20 +234,15 @@ func openCodeStorageDir(home string) string {
 	if home == "" {
 		return ""
 	}
-	return filepath.Join(home, ".local", "share", "opencode", "storage")
+	return sandboxedToolDir("OpenCode storage dir (~/.local/share/opencode)", filepath.Join(home, ".local", "share", "opencode", "storage"))
 }
 
-// RecallContainedPath is the recall containment check for any harness: a
+// recallContainedIn is the recall containment check for any harness: a
 // transcript path a hook or journal reports is accepted only when a
-// registered reader locates it under one of the recall roots (lexically
-// and after symlink resolution, the same fail-closed shape as
-// ValidateTranscriptPath). It returns the resolved path and the harness.
-func RecallContainedPath(path string) (string, string, bool) {
-	return recallContainedIn(path, RecallRoots())
-}
-
-// recallContainedIn is RecallContainedPath against roots resolved by the
-// caller, so a batch of notifies walks the roots once.
+// registered reader locates it under one of roots (lexically and after
+// symlink resolution, the same fail-closed shape as ValidateTranscriptPath).
+// It returns the resolved path and the harness. The caller resolves roots,
+// so a batch of notifies walks them once.
 func recallContainedIn(path string, roots []reader.Root) (string, string, bool) {
 	if strings.TrimSpace(path) == "" {
 		return "", "", false

@@ -80,16 +80,17 @@ func ParseNetDev(content string) (rxTotal, txTotal uint64) {
 	return
 }
 
-// collectNetworkDarwin uses netstat -ib to get network counters on macOS.
-// netstat -ib was observed to intermittently wedge for tens of seconds (cause
-// unconfirmed; likely degraded interface state), so it is bounded by a context
-// timeout: on timeout the process is killed and the cycle reports stats
-// unavailable rather than hanging the collector.
+// collectNetworkDarwin uses netstat -ibn to get network counters on macOS.
+// Without -n, netstat -ib resolves every interface address (including
+// link-local IPv6) through reverse DNS, which was observed to wedge for
+// seconds to tens of seconds. -n keeps the output numeric; the run is still
+// bounded by a context timeout so a wedged netstat is killed and the cycle
+// reports stats unavailable rather than hanging the collector.
 func collectNetworkDarwin() NetworkStat {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "netstat", "-ib").Output()
+	out, err := exec.CommandContext(ctx, "netstat", "-ibn").Output()
 	if err != nil {
 		return NetworkStat{}
 	}
@@ -98,7 +99,7 @@ func collectNetworkDarwin() NetworkStat {
 	return computeNetworkDelta(rx, tx)
 }
 
-// parseNetstatDarwin parses `netstat -ib` output on macOS.
+// parseNetstatDarwin parses `netstat -ibn` output on macOS.
 // Returns total rx/tx bytes across non-loopback interfaces.
 func parseNetstatDarwin(output string) (rxTotal, txTotal uint64) {
 	lines := strings.Split(output, "\n")
@@ -106,26 +107,30 @@ func parseNetstatDarwin(output string) (rxTotal, txTotal uint64) {
 		return
 	}
 
-	// Find column indices from header
+	// Find column positions from header, counted from the right: the
+	// Address column is blank on utun/gif/stf link rows, which shifts every
+	// later column when counting from the left. The counter columns always
+	// hold a value (a number or "-").
 	header := lines[0]
 	fields := strings.Fields(header)
-	ibytesIdx, obytesIdx := -1, -1
+	ibytesFromEnd, obytesFromEnd := -1, -1
 	for i, f := range fields {
 		switch f {
 		case "Ibytes":
-			ibytesIdx = i
+			ibytesFromEnd = len(fields) - 1 - i
 		case "Obytes":
-			obytesIdx = i
+			obytesFromEnd = len(fields) - 1 - i
 		}
 	}
-	if ibytesIdx == -1 || obytesIdx == -1 {
+	if ibytesFromEnd == -1 || obytesFromEnd == -1 {
 		return
 	}
+	minCols := max(ibytesFromEnd, obytesFromEnd) + 2 // Name + counters
 
 	seen := make(map[string]bool)
 	for _, line := range lines[1:] {
 		cols := strings.Fields(line)
-		if len(cols) <= obytesIdx {
+		if len(cols) < minCols {
 			continue
 		}
 
@@ -136,11 +141,11 @@ func parseNetstatDarwin(output string) (rxTotal, txTotal uint64) {
 		}
 		seen[iface] = true
 
-		rx, err := strconv.ParseUint(cols[ibytesIdx], 10, 64)
+		rx, err := strconv.ParseUint(cols[len(cols)-1-ibytesFromEnd], 10, 64)
 		if err != nil {
 			continue
 		}
-		tx, err := strconv.ParseUint(cols[obytesIdx], 10, 64)
+		tx, err := strconv.ParseUint(cols[len(cols)-1-obytesFromEnd], 10, 64)
 		if err != nil {
 			continue
 		}

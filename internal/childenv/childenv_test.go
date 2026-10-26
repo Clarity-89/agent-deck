@@ -1,10 +1,12 @@
 package childenv
 
 import (
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Issue #1163: the filter must strip every TELEGRAM_* var and any inherited
@@ -43,4 +45,44 @@ func TestFilterEnv_DoesNotMutateInput(t *testing.T) {
 	in := []string{"TELEGRAM_X=1", "PATH=/bin"}
 	_ = FilterEnv(in, "/child")
 	assert.Equal(t, []string{"TELEGRAM_X=1", "PATH=/bin"}, in)
+}
+
+// Issue #2683: a tmux server or worker started from inside a Claude Code
+// background job must not hand that job's CLAUDE_JOB_DIR to its children, or
+// every pane's hooks would look like they came from a background worker.
+func TestFilterEnv_StripsClaudeJobDir(t *testing.T) {
+	out := FilterEnv([]string{"CLAUDE_JOB_DIR=/home/u/.claude/jobs/abc", "PATH=/bin"}, "")
+	for _, kv := range out {
+		assert.False(t, strings.HasPrefix(kv, "CLAUDE_JOB_DIR="), "CLAUDE_JOB_DIR leaked: %s", kv)
+	}
+	assert.Contains(t, out, "PATH=/bin")
+}
+
+func TestWithoutClaudeJobDir(t *testing.T) {
+	t.Setenv("CLAUDE_JOB_DIR", "")
+	require.NoError(t, os.Unsetenv("CLAUDE_JOB_DIR"))
+	assert.Nil(t, WithoutClaudeJobDir(), "absent var: inherit unchanged")
+
+	t.Setenv("CLAUDE_JOB_DIR", "/home/u/.claude/jobs/abc")
+	t.Setenv("TELEGRAM_KEEP", "1")
+	out := WithoutClaudeJobDir()
+	require.NotNil(t, out)
+	for _, kv := range out {
+		assert.False(t, strings.HasPrefix(kv, "CLAUDE_JOB_DIR="), "CLAUDE_JOB_DIR leaked: %s", kv)
+	}
+	assert.Contains(t, out, "TELEGRAM_KEEP=1", "tmux env keeps every other var")
+}
+
+// #2897: the detached self re-exec keeps the caller's env (it finishes the
+// caller's own command) minus the bg job marker and the named variables.
+func TestSelfReexecFilter(t *testing.T) {
+	in := []string{"PATH=/bin", "CLAUDE_CONFIG_DIR=/c", "TELEGRAM_X=1", "CLAUDE_JOB_DIR=/j", "AGENTDECK_INSTANCE_ID=abc", "AGENTDECK_INSTANCE_IDX=keep"}
+	got := SelfReexecFilter(in, "AGENTDECK_INSTANCE_ID")
+	want := []string{"PATH=/bin", "CLAUDE_CONFIG_DIR=/c", "TELEGRAM_X=1", "AGENTDECK_INSTANCE_IDX=keep"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("SelfReexecFilter = %q, want %q", got, want)
+	}
+	if len(in) != 6 || in[3] != "CLAUDE_JOB_DIR=/j" {
+		t.Fatalf("input mutated: %q", in)
+	}
 }

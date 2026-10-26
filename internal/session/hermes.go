@@ -21,6 +21,9 @@ type hermesHookControl struct {
 	Generation            string `json:"generation"`
 	NextSequence          uint64 `json:"next_sequence"`
 	InitialMessagePending bool   `json:"initial_message_pending,omitempty"`
+	// CwdRoots are the entry's directories as its hook sees them; the hook
+	// handler records an own-session id only from an event inside them.
+	CwdRoots []string `json:"cwd_roots,omitempty"`
 }
 type hermesHookSeed struct {
 	Status                string `json:"status"`
@@ -134,7 +137,7 @@ func (i *Instance) seedHermesHookGeneration(status string, pending bool) (string
 	}
 	// The control rename is the invalidation boundary. The seed is already
 	// durable and both possible writer scopes are locked when it becomes live.
-	if err := atomicHermesJSON(filepath.Join(scope, i.ID+".generation.json"), hermesHookControl{Generation: generation, InitialMessagePending: pending}); err != nil {
+	if err := atomicHermesJSON(filepath.Join(scope, i.ID+".generation.json"), hermesHookControl{Generation: generation, InitialMessagePending: pending, CwdRoots: i.hermesCwdRoots()}); err != nil {
 		return "", err
 	}
 	// Keep the synchronous status path aligned with the committed seed. The
@@ -184,6 +187,11 @@ func pruneHermesAbandonedScope(instanceID, dir string) {
 	if _, err := os.Stat(filepath.Join(dir, instanceID+".generation.json")); err == nil {
 		return
 	}
+	// The abandoned scope's own-session record moves to the active scope when
+	// that has none (a sandbox toggle must not lose the conversation a later
+	// restart resumes), and is removed otherwise, so it does not outlive the
+	// switch and the sandbox directory can be removed.
+	moveHermesOwnedSessionFromAbandonedScope(instanceID, dir)
 	lockPath := filepath.Join(dir, instanceID+".lock")
 	f, err := os.OpenFile(lockPath, os.O_RDWR, 0600)
 	if err != nil {
@@ -384,10 +392,11 @@ func (i *Instance) buildHermesCommand(baseCommand string) string {
 	// passthrough so those sessions get it too (mirrors buildCodexCommand).
 	// Title is user-editable and could contain shell metacharacters ($(...),
 	// backticks, $VAR — all of which stay live inside %q's double quotes), so
-	// it needs shellescape's single quotes. ID is regex-constrained and Tool
-	// is guaranteed "hermes" by the guard above.
+	// it needs shellescape's single quotes. ID is quoted as well (it is loaded
+	// from stored state without a charset check); Tool is guaranteed "hermes"
+	// by the guard above.
 	agentdeckEnvPrefix := fmt.Sprintf("AGENTDECK_INSTANCE_ID=%s AGENTDECK_TITLE=%s AGENTDECK_TOOL=%s AGENTDECK_PROFILE=%s ",
-		i.ID, shellescape.Quote(i.Title), i.Tool, shellescape.Quote(sessionProfileEnvValue()))
+		shellescape.Quote(i.ID), shellescape.Quote(i.Title), i.Tool, shellescape.Quote(sessionProfileEnvValue()))
 	envPrefix += agentdeckEnvPrefix
 
 	// Passthrough: custom command from CLI (not the bare name)
@@ -397,10 +406,10 @@ func (i *Instance) buildHermesCommand(baseCommand string) string {
 
 	cmd := GetToolCommand("hermes")
 
-	// Resume the captured hermes session when known. Hermes mints a fresh ID per
-	// launch and never exports it, so HermesSessionID is captured from
-	// `hermes sessions list` at restart time (see Instance.Restart). Empty on a
-	// first launch or an intentional fresh restart, which starts a new session.
+	// Resume this entry's own hermes session when known. HermesSessionID is
+	// recorded from the entry's own hook events (issue #2582, see
+	// hermes_session_persist.go). Empty on a first launch, an intentional fresh
+	// restart, or when ownership was never established: a new session starts.
 	if i.HermesSessionID != "" {
 		cmd += " --resume " + shellescape.Quote(i.HermesSessionID)
 	}
@@ -508,4 +517,25 @@ func GetHermesGatewayURL() string {
 		}
 	}
 	return DiscoverHermesGatewayURL()
+}
+
+// moveHermesOwnedSessionFromAbandonedScope moves the own-session record out
+// of the abandoned scope dir into the other scope, unless that already holds
+// one, in which case the abandoned record is removed.
+func moveHermesOwnedSessionFromAbandonedScope(instanceID, dir string) {
+	src := filepath.Join(dir, instanceID+hermesOwnedSessionSuffix)
+	if _, err := os.Stat(src); err != nil {
+		return
+	}
+	active := GetHooksDir()
+	if filepath.Clean(dir) == filepath.Clean(GetHooksDir()) {
+		active = filepath.Join(GetHooksDir(), "sandbox", instanceID)
+	}
+	dst := filepath.Join(active, instanceID+hermesOwnedSessionSuffix)
+	if _, err := os.Stat(dst); os.IsNotExist(err) {
+		if err := os.MkdirAll(active, 0700); err == nil && os.Rename(src, dst) == nil {
+			return
+		}
+	}
+	_ = os.Remove(src)
 }

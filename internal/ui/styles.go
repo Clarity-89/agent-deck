@@ -597,6 +597,7 @@ func StatusIndicator(status string) string {
 // source of truth; the switch below is the fallback for names the registry
 // does not know (issue #2136).
 func ToolIcon(tool string) string {
+	tool = session.CanonicalToolName(tool)
 	if icon := session.ToolIconFor(tool); icon != "" {
 		return icon
 	}
@@ -640,6 +641,7 @@ func ToolIcon(tool string) string {
 // set color = "<lipgloss value>" in config. The switch below is the fallback
 // for names the registry does not know (issue #2136).
 func ToolColor(tool string) lipgloss.Color {
+	tool = session.CanonicalToolName(tool)
 	if c, ok := paletteColor(session.ToolColorFor(tool)); ok {
 		return c
 	}
@@ -770,21 +772,4 @@ func RenderLogoCompact(running, waiting, idle int) string {
 		LogoBorderStyle.Render(" │ ") +
 		RenderLogoIndicator(indicators[2]) + " " +
 		bracketStyle.Render("⟩")
-}
-
-// RenderLogoLarge renders the large logo for empty state
-// Shows REAL status: running=●, waiting=◐, idle=○
-// Format:
-//
-//	┌──┬──┬──┐
-//	│● │◐ │○ │
-//	└──┴──┴──┘
-func RenderLogoLarge(running, waiting, idle int) string {
-	indicators := getLogoIndicators(running, waiting, idle)
-	top := LogoBorderStyle.Render("┌──┬──┬──┐")
-	mid := LogoBorderStyle.Render("│") + RenderLogoIndicator(indicators[0]) + LogoBorderStyle.Render(" │") +
-		RenderLogoIndicator(indicators[1]) + LogoBorderStyle.Render(" │") +
-		RenderLogoIndicator(indicators[2]) + LogoBorderStyle.Render(" │")
-	bot := LogoBorderStyle.Render("└──┴──┴──┘")
-	return top + "\n" + mid + "\n" + bot
 }

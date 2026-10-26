@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -53,8 +54,20 @@ const (
 	// clears the override (back to group/global resolution). See
 	// Instance.EffectiveContextLevel.
 	FieldContextLevel = "context-level"
+	// FieldPromptSuggestions persists the per-session override for Claude
+	// Code prompt suggestions: children-off, on or off. Empty clears it (back
+	// to the profile/[launch] config). See prompt_suggestions.go.
+	FieldPromptSuggestions = "prompt-suggestions"
+	// FieldWaitTimeout sets the per-session wait timer (ASK-119): a Go
+	// duration of at least 1m, "off" (or 0) to disable it for this session,
+	// or empty to use [sessions] wait_timeout. Live. See wait_timer.go.
+	FieldWaitTimeout = "wait-timeout"
 	// FieldFavorite marks a session as a favourite (true/false). Live.
 	FieldFavorite = "favorite"
+	// FieldIntendedSwitch marks the session's current account+model as
+	// switched on purpose (value = reason) for DefaultIntendedSwitchTTL, for a
+	// switch made in the TUI. Empty clears. Live. See intended_switch.go.
+	FieldIntendedSwitch = "intended-switch"
 )
 
 var ValidMutableFields = []string{
@@ -82,7 +95,10 @@ var ValidMutableFields = []string{
 	FieldPin,
 	FieldModel,
 	FieldContextLevel,
+	FieldPromptSuggestions,
+	FieldWaitTimeout,
 	FieldFavorite,
+	FieldIntendedSwitch,
 }
 
 type FieldRestartPolicy int
@@ -95,7 +111,7 @@ const (
 func RestartPolicyFor(field string) FieldRestartPolicy {
 	switch field {
 	case FieldCommand, FieldWrapper, FieldTool, FieldChannels, FieldPlugins, FieldExtraArgs, FieldPath,
-		FieldSkipPermissions, FieldAutoMode, FieldAccount, FieldModel, FieldContextLevel,
+		FieldSkipPermissions, FieldAutoMode, FieldAccount, FieldModel, FieldContextLevel, FieldPromptSuggestions,
 		// Resume flags are baked into the next spawn command.
 		FieldToolSessionID:
 		return FieldRestartRequired
@@ -198,10 +214,20 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		// flag can only become true again through the CLI passthrough
 		// route that actually validates it.
 		inst.SubcommandPassthrough = false
+		inst.TrackCommandExit = false
 
 	case FieldTool:
 		oldValue = inst.Tool
-		inst.Tool = value
+		if inst.Tool == "opencode" {
+			oldValue = inst.OpenCodeCommandName()
+		}
+		inst.Tool = CanonicalToolName(value)
+		if value == "opencode2" || (oldValue == "opencode2" && value == "opencode") {
+			inst.Command = value
+		} else if oldValue == "opencode2" && inst.Tool != "opencode" {
+			inst.Command = ""
+		}
+		inst.TrackCommandExit = false
 		// Leaving claude → drop encoded ClaudeOptions so a same-submit
 		// skip/auto toggle (Tool applies last) doesn't leave ghost flags
 		// for a future shell→claude switch. UnmarshalClaudeOptions
@@ -387,15 +413,17 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 			inst.GenericSessionCommand = scope.Command
 			inst.GenericSessionLocation = scope.Location
 		}
-		// Optional write-through when TUI/long-lived process registered global DB.
-		// Full SaveWithGroups still works for CLI (GetGlobal nil) via the
-		// genericSessionIDCleared flag above. A failure is recorded rather than
+		// Write-through to the store the instance was loaded from (or the
+		// global one for an instance that has none; skipped when neither
+		// exists). A later full SaveWithGroups still applies the value via
+		// the genericSessionIDCleared flag above. A failure is recorded rather than
 		// dropped: the CLI reports it, and nothing else can tell an id that
 		// reached disk from one that only ever lived in this process.
-		if db := statedb.GetGlobal(); db != nil {
-			err := db.WriteGenericSessionBinding(
+		if err := inst.withOwningStateDB(func(db *statedb.StateDB) error {
+			return db.WriteGenericSessionBinding(
 				inst.ID, value, inst.GenericSessionTool, inst.GenericSessionCommand,
 				inst.GenericSessionLocation, inst.GenericDetectedAt)
+		}); !errors.Is(err, errNoStateDB) {
 			inst.setGenericSessionPersistError(err)
 			if err != nil {
 				return oldValue, nil, &MutationError{
@@ -450,6 +478,15 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		// Restart required (see RestartPolicyFor) — the in-flight
 		// conversation is lost, that's the documented Option 1 tradeoff.
 		oldValue = inst.setAccountThreadSafe(candidate)
+		// A new switch is not covered by an earlier intent (the CLI re-marks
+		// it after SetField when --intended is given), and the resumed
+		// conversation still ends in the old account's rejection, which must
+		// not keep the session limited on the new one. A no-op set changes
+		// neither.
+		if oldValue != candidate {
+			inst.IntendedSwitch = nil
+			inst.resetLimitVerdict(time.Now())
+		}
 
 	case FieldIdleTimeout:
 		// #1143: parses a Go duration like "30m"; 0 (or "0", "") disables.
@@ -460,6 +497,15 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 			return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
 		}
 		inst.IdleTimeoutSecs = secs
+
+	case FieldWaitTimeout:
+		// ASK-119: live; the wait timer's next tick reads the new value.
+		oldValue = inst.WaitTimeout
+		norm, perr := normalizeWaitTimeout(value)
+		if perr != nil {
+			return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
+		}
+		inst.WaitTimeout = norm
 
 	case FieldContextLevel:
 		// #2260: empty clears the override (inherit group/global); anything
@@ -475,6 +521,18 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 				return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
 			}
 			inst.ContextLevel = norm
+		}
+
+	case FieldPromptSuggestions:
+		// Restart-required: the setting is an env var in the spawn command.
+		oldValue = inst.PromptSuggestions
+		inst.PromptSuggestions = ""
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			mode, perr := NormalizePromptSuggestions(trimmed)
+			if perr != nil {
+				return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
+			}
+			inst.PromptSuggestions = mode
 		}
 
 	case FieldModel:
@@ -498,6 +556,22 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 			}
 		} else if aerr := inst.ApplyLaunchModel(trimmed); aerr != nil {
 			return oldValue, nil, &MutationError{Field: field, Msg: aerr.Error()}
+		}
+		// Same as FieldAccount: a real change drops the old intent and
+		// resets the transcript limit verdict; a no-op set does neither.
+		if inst.LaunchModelID() != oldValue {
+			inst.IntendedSwitch = nil
+			inst.resetLimitVerdict(time.Now())
+		}
+
+	case FieldIntendedSwitch:
+		if inst.IntendedSwitch != nil {
+			oldValue = inst.IntendedSwitch.Reason
+		}
+		if reason := strings.TrimSpace(value); reason == "" {
+			inst.IntendedSwitch = nil
+		} else {
+			inst.MarkIntendedSwitch(reason, DefaultIntendedSwitchTTL, time.Now())
 		}
 
 	case FieldFavorite:

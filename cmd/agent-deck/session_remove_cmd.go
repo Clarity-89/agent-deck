@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/asheshgoplani/agent-deck/internal/events"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 )
@@ -18,7 +19,7 @@ import (
 //
 // Claude transcripts under ~/.claude/projects/<slug>/ are never touched.
 func handleSessionRemove(profile string, args []string) {
-	fs := flag.NewFlagSet("session remove", flag.ExitOnError)
+	fs := flag.NewFlagSet("session remove", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -41,8 +42,8 @@ func handleSessionRemove(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	quietMode := *quiet || *quietShort
@@ -51,7 +52,7 @@ func handleSessionRemove(profile string, args []string) {
 	storage, instances, groups, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if *allErrored {
@@ -62,16 +63,16 @@ func handleSessionRemove(profile string, args []string) {
 	identifier := fs.Arg(0)
 	if identifier == "" {
 		out.Error("usage: session remove <id|title> OR --all-errored", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	inst, errMsg, errCode := ResolveSession(identifier, instances)
 	if inst == nil {
 		out.Error(errMsg, errCode)
 		if errCode == ErrCodeNotFound {
-			os.Exit(2)
+			exitCLI(2)
 		}
-		os.Exit(1)
+		exitCLI(1)
 		return
 	}
 
@@ -83,7 +84,7 @@ func handleSessionRemove(profile string, args []string) {
 			),
 			ErrCodeInvalidOperation,
 		)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Always kill the tmux scope + its process tree before deleting the
@@ -95,6 +96,7 @@ func handleSessionRemove(profile string, args []string) {
 	//
 	// KillAndWait runs the SIGTERM→SIGKILL escalation synchronously so
 	// the kill completes before this short-lived CLI exits.
+	saveStoppedBeforeRemoval(storage, inst)
 	_ = inst.KillAndWait()
 	inst.RecordTelemetryEnd(telemetry.EndDelete)
 
@@ -111,13 +113,12 @@ func handleSessionRemove(profile string, args []string) {
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
 	if err := storage.RemoveSessionAndVerify(inst.ID, instances, groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
-	// Best-effort transition-notifier cleanup for issue #910 — see the
-	// matching block in handleRemove for rationale.
-	_, _ = session.SweepInboxesForChildSession(inst.ID)
-	_, _ = session.RemoveNotifyStateRecord(inst.ID)
+	// Best-effort cleanup for the removed row (issue #910 sweep,
+	// macapp.session.closed) — see the matching block in handleRemove.
+	session.CleanupRemovedSession(storage.Profile(), inst.ID)
 
 	out.Success(fmt.Sprintf("Removed session: %s", inst.Title), map[string]interface{}{
 		"success": true,
@@ -210,14 +211,18 @@ func bulkRemoveSessions(
 	removed := make([]removedSessionRow, 0, len(doomed))
 	removedIDs := make([]string, 0, len(doomed))
 	for _, inst := range doomed {
+		saveStoppedBeforeRemoval(storage, inst)
 		_ = inst.KillAndWait()
 		if pruneWorktree {
 			pruneSessionWorktree(inst)
 		}
 		if err := storage.DeleteInstance(inst.ID); err != nil {
 			out.Error(fmt.Sprintf("failed to remove session %s: %v", inst.ID, err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitBulkRemove(1)
 		}
+		// Clean up per deleted row, right away: a later failure exits, and
+		// the rows already deleted must still be swept and announced.
+		session.CleanupRemovedSession(storage.Profile(), inst.ID)
 		removedIDs = append(removedIDs, inst.ID)
 		removed = append(removed, map[string]interface{}{"id": inst.ID, "title": inst.Title})
 	}
@@ -231,18 +236,55 @@ func bulkRemoveSessions(
 	groupTree := session.NewGroupTreeWithGroups(remaining, groups)
 	if err := storage.SaveGroupsOnly(groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitBulkRemove(1)
 	}
 
 	for _, id := range removedIDs {
 		if exists, _ := storage.InstanceExists(id); exists {
 			_ = storage.DeleteInstance(id)
 		}
-		// Best-effort transition-notifier cleanup (issue #910).
-		_, _ = session.SweepInboxesForChildSession(id)
-		_, _ = session.RemoveNotifyStateRecord(id)
 	}
 	return removed
+}
+
+// exitBulkRemove exits a bulk remove that failed part way. os.Exit skips
+// main's deferred events drain, so the macapp.session.closed frames of the
+// rows already deleted are flushed first.
+func exitBulkRemove(code int) {
+	_ = events.CloseDefault()
+	exitCLI(code)
+}
+
+// warnRemovedSessionCleanup prints the best-effort cleanup outcome of a
+// removed session to stderr (never in --json mode).
+func warnRemovedSessionCleanup(r session.RemovedSessionCleanup, id string, jsonOutput bool) {
+	if jsonOutput {
+		return
+	}
+	if r.InboxErr != nil {
+		fmt.Fprintf(os.Stderr, "warn: inbox sweep for %s failed: %v\n", id, r.InboxErr)
+	} else if r.InboxSwept > 0 {
+		fmt.Fprintf(os.Stderr, "swept %d stale inbox event(s) for removed session\n", r.InboxSwept)
+	}
+	if r.NotifyStateErr != nil {
+		fmt.Fprintf(os.Stderr, "warn: notify-state sweep for %s failed: %v\n", id, r.NotifyStateErr)
+	}
+}
+
+// saveStoppedBeforeRemoval saves the row as stopped before a removal kills
+// the session (#2806). The row is deleted only after the kill and, with a
+// worktree, after `git worktree remove`, which can take longer than the
+// notify daemon's 5 s death grace on a big tree. Until then the daemon would
+// read the old row with no pane and tell the parent the child "exited while
+// idle". A stopped row is a deliberate end, so it never does. Best-effort: a
+// failed write leaves the old behavior.
+func saveStoppedBeforeRemoval(storage *session.Storage, inst *session.Instance) {
+	if storage == nil || inst == nil {
+		return
+	}
+	if db := storage.GetDB(); db != nil {
+		_ = db.WriteStatus(inst.ID, string(session.StatusStopped), inst.Tool)
+	}
 }
 
 // pruneSessionWorktree kills the session and removes its git worktree (if any).

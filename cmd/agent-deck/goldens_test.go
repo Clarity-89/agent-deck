@@ -14,6 +14,8 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/asheshgoplani/agent-deck/internal/triggers"
 )
 
 // updateGoldensFlag is a `go test`-recognized flag alternative to the
@@ -235,6 +239,10 @@ func safeSpecs() []goldenSpec {
 		{"watcher_status_missing", []string{"-p", goldensProfile, "watcher", "status", "missing"}, 1},
 		{"watcher_status_missing_json", []string{"-p", goldensProfile, "watcher", "status", "missing", "--json"}, 1},
 
+		{"triggers_json", []string{"-p", goldensProfile, "triggers", "--json"}, 0},
+		{"triggers_all_json", []string{"-p", goldensProfile, "triggers", "--all", "--json"}, 0},
+		{"triggers_fires_json", []string{"-p", goldensProfile, "triggers", "fires", "systemd:agentdeck-overnight", "--json"}, 0},
+
 		{"completion_bash", []string{"completion", "bash"}, 0},
 		{"completion_zsh", []string{"completion", "zsh"}, 0},
 		{"completion_fish", []string{"completion", "fish"}, 0},
@@ -256,12 +264,12 @@ func helpSpecs() []goldenSpec {
 		"telegram-doctor", "profile", "update", "telemetry", "debug-dump", "migrate-paths",
 		"uninstall", "completion", "costs", "config", "inbox", "feedback",
 		"watcher", "openclaw", "system", "mcp-proxy", "hooks", "hook-handler", "codex-notify",
-		"notify-daemon", "run-task",
+		"notify-daemon", "run-task", "open", "file", "browser", "triggers",
 	}
 
 	subcommands := []string{
 		"session start", "session stop", "session restart", "session fork", "session attach",
-		"session show", "session viewers", "session context",
+		"session show", "session viewers", "session context", "session focus",
 		"fleet status", "fleet recover",
 		"mcp list", "mcp attached", "mcp attach", "mcp detach",
 		"skill list", "skill attached", "skill attach", "skill detach", "skill source", "skill source list",
@@ -287,6 +295,13 @@ func helpSpecs() []goldenSpec {
 		"watcher test", "watcher routes",
 		"agent adopt", "system stats",
 		"costs sync", "costs summary", "costs recompute",
+		"costs daily", "costs sessions", "costs models", "costs groups", "costs budgets",
+		"file bundle",
+		// Probed by clients (the macOS app) for feature detection.
+		"session image-upload", "session send-status", "session queue",
+		"usage statusline", "recall timeline", "recall follow",
+		"events follow", "events publish",
+		"triggers list", "triggers scan", "triggers mute", "triggers unmute", "triggers run", "triggers fires",
 	}
 
 	all := append(append([]string{}, topLevel...), subcommands...)
@@ -365,6 +380,11 @@ func scrubWithEpoch(s, home string, normalizeEpoch bool) string {
 		// last_accessed field in dumpStateDBRows.
 		s = regexp.MustCompile(`([:\[,]\s*)\d{10,13}(\s*[,\]}])`).ReplaceAllString(s, "${1}<EPOCH>${2}")
 	}
+	// The local host's name is a JSON value in `triggers --json` (row
+	// "host" and the "hosts" key); it differs on every machine.
+	if host := triggers.Hostname(); host != "" {
+		s = strings.ReplaceAll(s, `"`+host+`"`, `"<HOST>"`)
+	}
 	version := regexp.QuoteMeta(Version)
 	s = regexp.MustCompile(`(^|[^0-9.])v?`+version+`($|[^0-9.])`).ReplaceAllString(s, "${1}<VERSION>${2}")
 	return s
@@ -393,10 +413,10 @@ func goldensBinary(t *testing.T) string {
 			bin += ".exe"
 		}
 		goldensBinPath = bin
-		cmd := exec.Command("go", "build", "-o", bin, "./cmd/agent-deck")
-		cmd.Dir = goldensRepoRoot(t)
-		if out, buildErr := cmd.CombinedOutput(); buildErr != nil {
-			goldensBinErr = &buildFailure{err: buildErr, output: string(out)}
+		// The package's prebuilt CLI under the name the goldens expect,
+		// instead of a second `go build` of the same package.
+		if linkErr := linkOrCopyExecutable(channelsCLIBinary(t), bin); linkErr != nil {
+			goldensBinErr = &buildFailure{err: linkErr, output: "link prebuilt agent-deck"}
 			return
 		}
 	})
@@ -425,16 +445,6 @@ type buildFailure struct {
 
 func (b *buildFailure) Error() string { return b.err.Error() + "\n" + b.output }
 
-func goldensRepoRoot(t *testing.T) string {
-	t.Helper()
-	dir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	// cmd/agent-deck -> repo root
-	return filepath.Clean(filepath.Join(dir, "..", ".."))
-}
-
 // --- sandbox ------------------------------------------------------------
 
 // goldensSandbox sets up the two-step sandbox HOME (see local-only-common.md)
@@ -456,7 +466,42 @@ func goldensSandbox(t *testing.T) (home string, env []string) {
 	seedGoldensStore(t, home)
 
 	env = os.Environ()
+	env = hermeticGoldensTmux(t, env)
 	return home, env
+}
+
+// hermeticGoldensTmux points the subprocess at a private TMUX_TMPDIR whose
+// default socket is a stale socket file (nothing listens on it), so every
+// tmux query the binary makes answers "no server running on <path>": a
+// deterministic, known-empty server. Without it the goldens inherited the
+// host's tmux state: on a machine with no default socket file the probe
+// fails with "error connecting to ... (No such file or directory)", which is
+// unknown rather than empty, so absent error rows (golden-sess-4) were
+// refreshed and came out status_source "live" instead of "cached", while a
+// runner with a default socket produced the recorded golden.
+func hermeticGoldensTmux(t *testing.T, env []string) []string {
+	t.Helper()
+	tmuxTmpdir, err := os.MkdirTemp("", "ad-goldens-tmux-")
+	if err != nil {
+		t.Fatalf("creating private tmux directory: %v", err)
+	}
+	t.Cleanup(func() { cleanupPrivateTmux(t, tmuxTmpdir) })
+	socketDir := filepath.Join(tmuxTmpdir, fmt.Sprintf("tmux-%d", os.Getuid()))
+	if err := os.Mkdir(socketDir, 0o700); err != nil {
+		t.Fatalf("creating private tmux socket directory: %v", err)
+	}
+	listener, err := net.Listen("unix", filepath.Join(socketDir, "default"))
+	if err != nil {
+		t.Fatalf("creating stale private tmux socket: %v", err)
+	}
+	// Keep the socket file after closing so connects get ECONNREFUSED,
+	// which tmux reports as "no server running".
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatalf("closing stale private tmux socket: %v", err)
+	}
+	env = filterEnv(env, "TMUX", "TMUX_PANE", "TMUX_TMPDIR")
+	return append(env, "TMUX_TMPDIR="+tmuxTmpdir)
 }
 
 func runGoldens(t *testing.T, bin string, env []string, args []string) (stdout string, exitCode int) {
@@ -475,10 +520,26 @@ func runGoldensIn(t *testing.T, bin string, env []string, dir string, args []str
 	return stdout, exitCode
 }
 
+// withBinaryFirstOnPath puts the binary under test first on PATH, so an
+// agent-deck installed on the machine running the tests can never show up
+// as an older copy shadowing it (doctor's PATH check) in a golden.
+func withBinaryFirstOnPath(env []string, bin string) []string {
+	out := make([]string, 0, len(env)+1)
+	path := ""
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
+			path = v
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "PATH="+filepath.Dir(bin)+string(os.PathListSeparator)+path)
+}
+
 func runGoldensStreamsIn(t *testing.T, bin string, env []string, dir string, args []string) (stdout, stderr string, exitCode int) {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
-	cmd.Env = env
+	cmd.Env = withBinaryFirstOnPath(env, bin)
 	cmd.Dir = dir
 	var out, errOut strings.Builder
 	cmd.Stdout = &out

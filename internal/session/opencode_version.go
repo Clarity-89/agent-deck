@@ -14,8 +14,8 @@ import (
 // OpenCode 2.x reshaped the root command's flags. It rejects the 1.x
 // -m/--model, --agent and --port flags ("Unrecognized flag: --port in command
 // opencode") and exits at once, so a session launched with any of them dies
-// before the TUI draws (spawn_died_fast). In 2.x the model and agent are
-// picked inside the TUI, and events come from a shared background service
+// before the TUI draws (spawn_died_fast). In 2.x model and agent overrides
+// are applied through the session API, and events come from a shared service
 // rather than a per-TUI --port server.
 //
 // buildOpenCodeCommand therefore asks the binary a launch will run for its
@@ -92,7 +92,7 @@ func probeOpenCodeBinaryMajorVersion(binary string) (int, bool) {
 // through: `env [VAR=value...] opencode` runs opencode with those assignments
 // applied, PATH included.
 func (i *Instance) openCodeLaunchBinary() (string, bool) {
-	words, ok := shellwords.Split(GetToolCommand("opencode"))
+	words, ok := shellwords.Split(i.openCodeForkBinary())
 	if !ok {
 		return "", false
 	}
@@ -155,12 +155,21 @@ func isExecutableFile(path string) bool {
 }
 
 // openCodeRejectsV1LaunchFlags reports whether this session's OpenCode is 2.x
-// or newer. Sandboxed and SSH sessions run a binary this host cannot see, so
-// they keep the 1.x flags.
+// or newer. The explicit opencode2 launcher is always v2, even when it cannot
+// be probed locally. Other sandboxed and SSH launchers keep the 1.x flags.
 func (i *Instance) openCodeRejectsV1LaunchFlags() bool {
+	if openCodeExecutableBase(i.openCodeForkBinary()) == "opencode2" {
+		return true
+	}
 	if i.IsSandboxed() || i.IsSSH() {
 		return false
 	}
 	major, ok := probeOpenCodeMajorVersion(i)
 	return ok && major >= 2
+}
+
+// SupportsOpenCodeQueue reports whether the configured local binary supports
+// OpenCode's session-bound native queue API, using the launch version probe.
+func (i *Instance) SupportsOpenCodeQueue() bool {
+	return i != nil && i.Tool == "opencode" && i.openCodeRejectsV1LaunchFlags()
 }

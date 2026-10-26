@@ -33,34 +33,19 @@ func applyAssertDone(message string, enabled bool) string {
 	return message + assertDoneInstruction
 }
 
-// preAcceptLaunchTrust seeds Claude Code's per-directory trust flag
-// (projects[dir].hasTrustDialogAccepted) in the root ~/.claude.json before
-// the launch spawn, for claude-tool instances only — no other tool shows
-// this prompt. Keyed by realpath, matching the loadout trust seed (#1149),
-// since Claude resolves the cwd through symlinks. Best-effort: a failure is
-// reported to stderr and never blocks launch, matching every other
-// PreAcceptClaudeTrust call site.
-func preAcceptLaunchTrust(inst *session.Instance) {
-	if inst.Tool != "claude" {
-		return
-	}
-	trustDir := inst.EffectiveWorkingDir()
-	if real, err := filepath.EvalSymlinks(trustDir); err == nil {
-		trustDir = real
-	}
-	if err := session.PreAcceptClaudeTrust(session.GetUserMCPRootPath(), trustDir); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: folder trust pre-seed for %q failed (Claude launch may stall on the trust prompt): %v\n", trustDir, err)
-	}
-}
-
 // handleLaunch combines add + start + optional send into a single command.
 // It creates a new session, starts it, and optionally sends an initial message.
 func handleLaunch(profile string, args []string) {
+	// launch --provider creates a sandbox remote and launches there.
+	if !helpRequested(args) && launchProviderRequested(args) {
+		handleLaunchProvider(profile, args)
+		return
+	}
 	handleLaunchCommand(profile, args, nil)
 }
 
 func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.FlagSet)) {
-	fs := flag.NewFlagSet("launch", flag.ExitOnError)
+	fs := flag.NewFlagSet("launch", flag.ContinueOnError)
 	title := fs.String("title", "", "Session title (defaults to folder name; an explicit title is locked against Claude's session-name sync)")
 	titleShort := fs.String("t", "", "Session title (short)")
 	group := fs.String("group", "", "Group path (defaults to parent folder)")
@@ -72,6 +57,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	messageShort := fs.String("m", "", "Initial message to send (short)")
 	messageFile := fs.String("message-file", "", "Read the initial message from a file ('-' for stdin); avoids shell quoting of long prompts")
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready before sending message")
+	ignoreBudget := fs.Bool("ignore-budget", false, ignoreBudgetFlagHelp)
 	assertDone := fs.Bool("assert-done", false, "Append a completion-sentinel instruction to the message (default on for -c claude)")
 	noAssertDone := fs.Bool("no-assert-done", false, "Disable the completion-sentinel instruction")
 	parent := fs.String("parent", "", "Parent session (creates sub-session; group is cwd-derived by default — auto-inherits the parent's group for git worktree children or with --inherit-group)")
@@ -171,6 +157,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	idleTimeout := fs.String("idle-timeout", "", "Auto-stop session after this duration of no tmux output (Go duration: 30m, 1h, 24h). 0 or unset = disabled")
 
 	createDir := fs.Bool("create-dir", false, "Create the project directory when it does not exist")
+	trustFolder := fs.Bool("trust-folder", false, "Let agent-deck mark this folder trusted for the tool (adds it to [security] trusted_folders in config.toml)")
 	capabilities := fs.Bool("capabilities", false, "Report authoritative creation fields and host catalogs (requires --json)")
 	startupQuery := fs.String("startup-query", "", "Claude startup query, delivered once on initial start")
 	var additionalPaths []string
@@ -198,6 +185,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		fmt.Println("  agent-deck launch . -c codex --model gpt-5.5")
 		fmt.Println("  agent-deck launch . -c claude --model claude-opus-5 --effort high")
 		fmt.Println("  agent-deck launch . -c claude --skip-permissions --chrome --continue   # the dialog's Claude Options rows")
+		fmt.Println("  agent-deck launch --provider docker /home/dev -c claude   # on a new sandbox (see 'agent-deck provider')")
 		fmt.Println("  agent-deck launch . -c gemini --yolo --sandbox")
 		fmt.Println("  agent-deck launch . -c gemini --model gemini-3.1-pro-preview")
 		fmt.Println("  agent-deck launch . -c claude -m \"Explain this codebase\"")
@@ -218,13 +206,13 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// this check must happen before any launch or fallback resolution begins.
 	if err := checkFlagValueNotFlag(fs, args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Reorder args: move path to end so flags are parsed correctly
 
-	if err := fs.Parse(normalizeCreationArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeCreationArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 	if *capabilities {
 		writeCreationCatalog(profile, fs, *jsonOutput)
@@ -233,7 +221,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	validatedAdditionalPaths, pathValidationErr := validateCreationPaths(additionalPaths)
 	if pathValidationErr != nil {
 		NewCLIOutput(*jsonOutput, false).Error(pathValidationErr.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	ensureTmuxInPathOrExit()
@@ -241,37 +229,48 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(*jsonOutput, quietMode)
 
+	// -g means what it means for add: a unique group name resolves to its
+	// stored path and an ambiguous one is an error, before anything is created.
+	sessionGroup := mergeFlags(*group, *groupShort)
+	explicitGroupProvided := strings.TrimSpace(sessionGroup) != ""
+	if explicitGroupProvided {
+		resolvedGroup, groupErr := resolveLaunchGroup(profile, sessionGroup)
+		if groupErr != nil {
+			out.Error(groupErr.Error(), ErrCodeInvalidOperation)
+			exitCLI(1)
+		}
+		sessionGroup = resolvedGroup
+	}
+
 	// Resolve path
-	path, err := resolveLaunchPath(strings.Trim(fs.Arg(0), "'\""), mergeFlags(*group, *groupShort), profile)
+	path, err := resolveLaunchPath(strings.Trim(fs.Arg(0), "'\""), sessionGroup, profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to resolve path: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Merge flags
 	sessionTitle := mergeFlags(*title, *titleShort)
-	sessionGroup := mergeFlags(*group, *groupShort)
-	explicitGroupProvided := strings.TrimSpace(sessionGroup) != ""
 	sessionCommandInput := mergeFlags(*command, *commandShort)
 	sessionCommandTool, sessionCommandResolved, sessionWrapperResolved, sessionCommandNote, sessionCommandIsPassthrough, cmdErr := resolveSessionCommand(sessionCommandInput, *wrapper)
 	if cmdErr != nil {
 		out.Error(cmdErr.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	selectedAccount, accountErr := resolveCLIAccountSlot(*account, sessionCommandTool, sessionCommandResolved, sessionCommandIsPassthrough)
 	if accountErr != nil {
 		out.Error(accountErr.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	sessionParent := mergeFlags(*parent, *parentShort)
 	if sessionParent != "" && *noParent {
 		out.Error("--parent and --no-parent cannot be used together", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	initialMessage, err := resolveMessageInput(mergeFlags(*message, *messageShort), *messageFile, os.Stdin)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// --assert-done: append the completion-sentinel instruction so the child
@@ -296,7 +295,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 
 	if err := validateCreationOptions(firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput)), selectedAccount, *modelID, *effort, *yoloMode, claudeFlags, mcpFlags, pluginFlags, channelFlags, extraArgFlags); err != nil {
 		NewCLIOutput(*jsonOutput, false).Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	queryMode := "new"
 	if *resumeSession != "" {
@@ -307,7 +306,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	}
 	if err := validateCreationStartupQuery(*startupQuery, firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput)), queryMode, true, extraArgFlags...); err != nil {
 		NewCLIOutput(*jsonOutput, false).Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Validate --resume-session requires Claude
@@ -315,7 +314,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		tool := firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		if !session.IsClaudeCompatible(tool) {
 			out.Error("--resume-session only works with Claude sessions (-c claude)", ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		// #1815 (Codex review on #1830): the value below is passed to
 		// MarkClaudeSessionIDVerified — it becomes a VOUCHED ownership
@@ -327,14 +326,14 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		if !session.IsBareClaudeSessionUUID(*resumeSession) {
 			out.Error("--resume-session must be a bare Claude conversation UUID "+
 				"(8-4-4-4-12 lowercase hex, e.g. 91fd7978-1a2b-3c4d-5e6f-7a8b9c0d1e2f)", ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 
 	launchRegLock, launchRegLockErr := session.AcquireRegistrationLock(profile)
 	if launchRegLockErr != nil {
 		out.Error(fmt.Sprintf("failed to acquire session registration lock: %v", launchRegLockErr), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	releaseLaunchRegistration := func() {
 		if launchRegLock != nil {
@@ -345,12 +344,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	defer releaseLaunchRegistration()
 	if _, err := session.ParseIdleTimeoutFlag(*idleTimeout); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	var queryGroup string
 	if err := validateStartupQueryCapacity(profile, sessionGroup, sessionParent, path, *noParent, *inheritGroup || wtBranch != "", *startupQuery != "", &queryGroup); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if *startupQuery != "" && queryGroup != "" {
 		sessionGroup = queryGroup
@@ -358,27 +357,33 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	}
 	if err := validateMultiRepoCreation(path, validatedAdditionalPaths, wtBranch, createNewBranch, *worktreeLocation); err != nil {
 		NewCLIOutput(*jsonOutput, false).Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if err := validatePrimaryCreationPath(path, validatedAdditionalPaths); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	// Verify path exists and is a directory
 	if *createDir {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			out.Error(err.Error(), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 	info, err := os.Stat(path)
 	if err != nil {
 		out.Error(fmt.Sprintf("path does not exist: %s", path), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if !info.IsDir() {
 		out.Error(fmt.Sprintf("path is not a directory: %s", path), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
+	}
+	if *trustFolder {
+		if err := session.AddTrustedFolder(path); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			exitCLI(1)
+		}
 	}
 
 	// Handle worktree creation
@@ -388,7 +393,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		backend, err := detectAndCreateBackend(path)
 		if err != nil {
 			out.Error(fmt.Sprintf("%v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		worktreeType = string(backend.Type())
 		repoRoot := backend.RepoDir()
@@ -399,19 +404,19 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		wtSettings, err := session.GetWorktreeSettingsForDir(repoRoot)
 		if err != nil {
 			out.Error(fmt.Sprintf("invalid directory-local config: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
 
 		if err := git.ValidateBranchName(wtBranch); err != nil {
 			out.Error(fmt.Sprintf("invalid branch name: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 
 		branchExists := backend.BranchExists(wtBranch)
 		if createNewBranch && branchExists {
 			out.Error(fmt.Sprintf("branch '%s' already exists (remove -b flag to use existing branch)", wtBranch), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 
 		location, template := worktreeLocationAndTemplate(wtSettings, *worktreeLocation)
@@ -430,12 +435,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		} else {
 			if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
 				out.Error(fmt.Sprintf("failed to create parent directory: %v", err), ErrCodeInvalidOperation)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			if _, err := os.Stat(worktreePath); err == nil {
 				out.Error(fmt.Sprintf("worktree already exists at %s", worktreePath), ErrCodeInvalidOperation)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Sparse state is inherited from `path` (the directory the user
@@ -445,7 +450,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			ownedPath := worktreePath
 			cleanupSingleWorktree = func() error { return backend.RemoveWorktree(ownedPath, true) }
@@ -463,7 +468,15 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	storage, instances, _, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
+	}
+	// #2683: see handleAdd. An archived holder would silently win the
+	// duplicate-id guard and the launch would start a fresh conversation.
+	if *resumeSession != "" {
+		if msg, code := checkArchivedClaudeIDConflict(instances, nil, *resumeSession); msg != "" {
+			out.Error(msg, code)
+			exitCLI(1)
+		}
 	}
 
 	// Resolve parent session if specified.
@@ -487,7 +500,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if parentErr != nil {
 		message, code := launchParentErrorParts(parentErr)
 		out.Error(message, code)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if parentNote != "" {
 		fmt.Fprintln(os.Stderr, parentNote)
@@ -514,7 +527,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	freshInstances, freshGroups, reloadErr := reloadForRegistration(storage)
 	if reloadErr != nil {
 		out.Error(reloadErr.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	instances = freshInstances
 	groups := freshGroups
@@ -523,7 +536,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if launchDecision.Duplicate != nil {
 		msg, code := launchDecision.DuplicateError()
 		out.ErrorWithData(msg, code, launchDecision.DuplicateJSONFields())
-		os.Exit(1)
+		exitCLI(1)
 	}
 	sessionTitle = launchDecision.Title
 	if warning := launchDecision.RenameWarning(); warning != "" && !*jsonOutput && !quietMode {
@@ -536,6 +549,13 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		newInstance = session.NewInstanceWithGroup(sessionTitle, path, sessionGroup)
 	} else {
 		newInstance = session.NewInstance(sessionTitle, path)
+	}
+
+	// An initial message is a send: an enforced cost budget refuses the
+	// launch before the session is saved or started (a worktree made for it
+	// is removed again).
+	if initialMessage != "" && !*ignoreBudget {
+		enforceSendBudget(profile, "launch", storage, newInstance, append(instances, newInstance), out, quietMode, func() { _ = cleanupSingleWorktree() })
 	}
 
 	// Socket-isolation CLI override (issue #687 phase 1, v1.7.50).
@@ -585,17 +605,23 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		newInstance.Command = sessionCommandResolved
 		newInstance.SubcommandPassthrough = sessionCommandIsPassthrough
+		newInstance.TrackCommandExit = newInstance.Tool == "shell" && !sessionCommandIsPassthrough
+	}
+	// #2895: no --account or AGENTDECK_ACCOUNT → [claude].default_account,
+	// applied once the tool is known (Claude sessions only).
+	if newInstance.Account == "" {
+		newInstance.Account = defaultCLIAccountSlot(newInstance, parentInstance)
 	}
 	if err := newInstance.ValidateAccount(); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Apply --channel flags (claude only — channels is a Claude Code CLI flag).
 	if len(channelFlags) > 0 {
 		if !session.IsClaudeCompatible(newInstance.Tool) {
 			out.Error("--channel only supported for claude sessions (use -c claude); requires --channels on the claude binary", ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		newInstance.Channels = channelFlags
 	}
@@ -604,11 +630,11 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if len(pluginFlags) > 0 {
 		if !session.IsClaudeCompatible(newInstance.Tool) {
 			out.Error("--plugin only supported for claude sessions (use -c claude); plugins enable Claude Code plugin features per-session via enabledPlugins", ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if err := validatePluginFlags(pluginFlags); err != nil {
 			out.Error(err.Error(), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		newInstance.Plugins = pluginFlags
 		newInstance.PluginChannelLinkDisabled = *noChannelLink
@@ -621,7 +647,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if len(extraArgFlags) > 0 {
 		if !session.IsClaudeCompatible(newInstance.Tool) {
 			out.Error("--extra-arg only supported for claude sessions (use -c claude); claude is the only tool whose builder appends user extra args", ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		newInstance.ExtraArgs = extraArgFlags
 	}
@@ -634,12 +660,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if selectedModelID != "" {
 		if err := applyCLIModelOverride(newInstance, selectedModelID); err != nil {
 			out.Error(err.Error(), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 	if err := applyCLIEffortOverride(newInstance, *effort); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if worktreePath != "" {
@@ -653,7 +679,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// the central watcher on its next tick.
 	if idleSecs, err := session.ParseIdleTimeoutFlag(strings.TrimSpace(*idleTimeout)); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	} else {
 		newInstance.IdleTimeoutSecs = idleSecs
 	}
@@ -681,11 +707,11 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	}
 	if err := applyCLIYoloOverride(newInstance, *yoloMode, cliFlagWasSet(fs, "yolo")); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if err := applyCLIClaudeOptionFlags(newInstance, claudeFlags); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	// The identity block already states the sentinel rule (tool, sandbox and
 	// context level are settled by now); repeat it in the message only when
@@ -700,12 +726,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		}
 		if session.ShouldQueue(instances, newInstance.GroupPath, session.GroupMaxConcurrent(queryTree, newInstance.GroupPath)) {
 			out.Error("startup query cannot be queued; retry when group capacity is available", ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 	if err := applyCreationExtras(newInstance, *startupQuery, validatedAdditionalPaths, wtBranch, createNewBranch, *worktreeLocation); err != nil {
 		NewCLIOutput(*jsonOutput, false).Error(err.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	var creationRollback *startupCreationRollback
@@ -744,7 +770,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// to guarantee persistence. Mirror of RemoveSessionAndVerify (#909).
 	if err := creationRollback.run("save session", func() error { return storage.InsertSessionAndVerify(newInstance, groupTree) }); err != nil {
 		out.Error(fmt.Sprintf("failed to save session: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	// The (title, location) pair is now taken in the state db; the start and
 	// attach below must not hold the lock for other registrations.
@@ -773,7 +799,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		return newInstance.WriteLocalMCPConfig(mcpFlags)
 	}); err != nil {
 		out.Error(fmt.Sprintf("failed to configure MCPs: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// v1.9.1 group concurrency cap: if the target group is at its
@@ -787,17 +813,19 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 				return fmt.Errorf("startup query cannot be queued; retry when group capacity is available")
 			})
 			out.Error(err.Error(), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 
-		newInstance.Status = session.StatusQueued
+		// The queued start delivers -m and seeds folder trust like the
+		// direct start below (session.Storage.StartQueued).
+		newInstance.MarkQueued(initialMessage)
 		// v1.9.x issue #1031: same targeted single-row pattern as the
 		// initial insert above — saveSessionData → SaveWithGroups is
 		// the load-modify-write rewrite that loses sibling launches'
 		// rows under concurrency.
 		if err := storage.InsertSessionAndVerify(newInstance, tree); err != nil {
 			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		queuedJSON := map[string]interface{}{
 			"success":        true,
@@ -832,7 +860,10 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// success. This mirrors the same pre-seed already used for conductor
 	// dirs (#1359) and worktree parents (#1149) — best-effort, never
 	// blocks the launch.
-	preAcceptLaunchTrust(newInstance)
+	// On a new install a folder outside the FX-8 trust rule is not seeded:
+	// the result says so (stderr note, and FOLDER_NOT_TRUSTED in --json)
+	// instead of reading as a clean success.
+	trustWarning := session.PreAcceptLaunchTrust(newInstance)
 
 	// Start the session.
 	// - default: StartWithMessage waits for readiness and delivers initial prompt
@@ -853,7 +884,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if initialMessage != "" {
 		if err := creationRollback.run("validate initial message", newInstance.PromptDeliveryError); err != nil {
 			out.Error(err.Error(), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 
@@ -868,12 +899,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if initialMessage != "" && (!*noWait || promptRidesArgv) {
 		if err := creationRollback.run("start session", func() error { return newInstance.StartWithMessage(initialMessage) }); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	} else {
 		if err := creationRollback.run("start session", newInstance.Start); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 	newInstance.RecordTelemetryCreate(telemetry.ViaCLILaunch)
@@ -896,7 +927,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	}
 	if err := creationRollback.run("save started session", func() error { return storage.InsertSessionAndVerify(newInstance, postStartTree) }); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Send message only for --no-wait mode.
@@ -911,22 +942,10 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	if initialMessage != "" && *noWait && !promptRidesArgv {
 		tmuxSess := newInstance.GetTmuxSession()
 		if tmuxSess != nil {
-			// #1777 provenance probe: a freshly launched session has an
-			// empty composer, so a "[Pasted text …]" marker appearing
-			// during verification is this prompt's own collapse and the
-			// Enter nudge stays attributable. If the probe cannot confirm
-			// that, the gate withholds the nudge. Captured once, before the
-			// send, and shared with the v1.7.64 recovery pass below — a
-			// multi-line prompt collapses behind that marker as its normal
-			// delivered form (#1855), so the recovery retry needs the same
-			// provenance or its attribution gate withholds it forever.
-			pasteFreeBeforeSend := composerPasteFree(tmuxSess)
-			if _, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
-				maxRetries:                  8,
-				checkDelay:                  150 * time.Millisecond,
-				tool:                        newInstance.Tool,
-				composerPasteFreeBeforeSend: pasteFreeBeforeSend,
-			}); err != nil {
+			// One pre-send probe (#1777) shared with the recovery pass
+			// below, whose attribution gate needs the same provenance (#1855).
+			opts := launchPromptSendOptions(tmuxSess, newInstance.Tool)
+			if _, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), opts); err != nil {
 				// Check whether the pane died before delivery was attempted.
 				// When it did, the paste-buffer failure is a symptom of the
 				// dead pane, not a transport fault. The spawn-failure sidecar
@@ -938,10 +957,10 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 					return sendErrOrSpawnDied(err, paneGone, newInstance.SpawnFailure())
 				})
 				out.Error(fmt.Sprintf("failed to send initial message: %v", err), ErrCodeInvalidOperation)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			verifyPromptConsumedAfterLaunchAttributed(
-				tmuxSess, initialMessage, pasteFreeBeforeSend,
+				tmuxSess, newInstance.Tool, initialMessage, opts.composerPasteFreeBeforeSend,
 				10*time.Second, 250*time.Millisecond,
 				os.Stderr,
 			)
@@ -1000,6 +1019,9 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		jsonData["worktree_path"] = worktreePath
 		jsonData["worktree_branch"] = wtBranch
 	}
+	if trustWarning != nil {
+		jsonData["warnings"] = []*session.LaunchWarning{trustWarning}
+	}
 	addModelInfoJSON(jsonData, newInstance.LaunchModelInfo())
 	addEffortJSON(jsonData, newInstance)
 	addClaudeOptionsJSON(jsonData, newInstance)
@@ -1023,6 +1045,24 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	out.Success(msg, jsonData)
 }
 
+// resolveLaunchGroup resolves launch's -g selector the way handleAdd does:
+// against the stored groups plus those declared in config.toml, through
+// resolveGroupPathForAdd. A name matching no group is kept as given, so the
+// group is created, as with add. A registry that cannot be read keeps the
+// selector too; the load further down reports that error.
+func resolveLaunchGroup(profile, groupSelector string) (string, error) {
+	storage, instances, groups, err := loadSessionData(profile)
+	if err != nil {
+		return groupSelector, nil
+	}
+	_ = storage.Close()
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	if cfg, cfgErr := session.LoadUserConfig(); cfgErr == nil && cfg != nil {
+		session.ReconcileDeclarativeGroups(groupTree, cfg)
+	}
+	return resolveGroupPathForAdd(groupTree, groupSelector)
+}
+
 // resolveLaunchPath resolves the project path for `agent-deck launch`.
 //
 // An explicit path argument always wins — including ".", which keeps its
@@ -1042,7 +1082,7 @@ func resolveLaunchPath(rawPathArg, groupSelector, profile string) (string, error
 	if grp := strings.TrimSpace(groupSelector); grp != "" {
 		if storage, instances, groups, err := loadSessionData(profile); err == nil {
 			groupTree := session.NewGroupTreeWithGroups(instances, groups)
-			resolvedGroup := resolveGroupPathForAdd(groupTree, grp)
+			resolvedGroup, _ := resolveGroupPathForAdd(groupTree, grp)
 			explicitPath, hasExplicit := groupTree.ExplicitDefaultPathForGroup(resolvedGroup)
 			recentSessionPath = groupTree.RecentSessionPathForGroup(resolvedGroup)
 			_ = storage.Close()

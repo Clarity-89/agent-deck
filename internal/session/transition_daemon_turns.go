@@ -39,6 +39,12 @@ import (
 // commit; in both cases the caller leaves its bookkeeping untouched so the
 // next poll retries.
 func (d *TransitionDaemon) emitTurn(profile string, inst *Instance, byID map[string]*Instance, from, to string, ts time.Time, observedFlip bool) (TransitionNotificationEvent, bool) {
+	return d.emitTurnWith(profile, inst, byID, from, to, ts, observedFlip, nil)
+}
+
+// emitTurnWith is emitTurn for a pi child whose verdict the caller already
+// derived from one status snapshot (nil: read one here).
+func (d *TransitionDaemon) emitTurnWith(profile string, inst *Instance, byID map[string]*Instance, from, to string, ts time.Time, observedFlip bool, pi *piTurnVerdict) (TransitionNotificationEvent, bool) {
 	event := TransitionNotificationEvent{
 		ChildSessionID: inst.ID,
 		ChildTitle:     inst.Title,
@@ -47,6 +53,7 @@ func (d *TransitionDaemon) emitTurn(profile string, inst *Instance, byID map[str
 		ToStatus:       to,
 		Timestamp:      ts,
 		Substate:       string(inst.CachedSubstate()),
+		ExitCode:       inst.ExitCode(),
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
@@ -56,16 +63,70 @@ func (d *TransitionDaemon) emitTurn(profile string, inst *Instance, byID map[str
 	if classified && facts.Pending {
 		return event, false
 	}
-	if classified && facts.UUID == "" && facts.TextHash == "" {
+	var piv piTurnVerdict
+	if pi != nil {
+		piv = *pi
+	} else if strings.EqualFold(strings.TrimSpace(inst.Tool), "pi") {
+		piv = piVerdict(inst, d.statusSnapshot(inst.ID), to, time.Now())
+	}
+	if piv.Awaiting {
+		return event, false // the run's settle has not landed; the next poll retries
+	}
+	// ASK-92: an idle auto-compaction grows the transcript and may flip the
+	// pane, but no one started a turn and the child said nothing. A flip into
+	// error still reaches the parent the legacy way.
+	compaction := classified && facts.Compaction && attentionClass(to) != "error"
+	if classified && !compaction && facts.UUID == "" && facts.TextHash == "" {
 		// No turn identity (an interrupted turn, a reply with no text): the
 		// noise rule cannot recognise it next poll, so journaling it would add
 		// one line per observation. Treat it as unclassified: legacy signal,
 		// the notifier's dedup is the bound.
 		classified = false
 	}
-	event.LastOutputHash = transitionEventOutputHash(inst)
+	if strings.EqualFold(strings.TrimSpace(inst.Tool), "pi") {
+		event.LastOutputHash = piv.Signal // from the one snapshot; "" is the fallback
+	} else {
+		event.LastOutputHash = transitionEventOutputHash(inst)
+	}
 	statsParent := statsParentFor(inst)
 	selfConductor := isSelfSuppressedConductor(inst)
+
+	// Issue #2792: the old process's exit and the resumed one's arrival at
+	// its prompt are not turns, whichever path sees them.
+	signal := ""
+	if !classified || inst.GetJSONLPath() == "" {
+		signal = event.LastOutputHash
+	}
+	d.dropStaleBannerWatch(inst.ID) // before judgeRestart can spend a newer restart's token
+	tok, verdict, why := d.judgeRestart(inst.ID, inst.GetJSONLPath(), signal, func() string { return restartPaneSubstate(inst) }, to, event.Timestamp)
+	switch verdict {
+	case restartNewError:
+		return d.emitRestartError(inst, event, tok, why), true
+	case restartUnsettled:
+		return event, false // the next poll judges it once the restart recorded its new process
+	case restartOldExit:
+		event.DeliveryResult = transitionDeliveryDropped
+		return event, true
+	case restartBoot:
+		return d.emitRestartBoot(inst, event, tok, selfConductor), true
+	}
+	event.restartJudged = true
+
+	if !classified && d.restartResumeEcho(inst, to, event.Timestamp, observedFlip) {
+		// The unseen-boot info line already told the parent this restart
+		// resumed with no new turn; the same idle prompt, seen again once the
+		// flush-race window lets an unanswered user record go unclassified,
+		// is not a finished turn.
+		_ = BumpInboxStats(statsParent, func(s *InboxStats) { s.NoiseSuppressed++ })
+		event.DeliveryResult = transitionDeliveryDropped
+		return event, true
+	}
+
+	if compaction {
+		_ = BumpInboxStats(statsParent, func(s *InboxStats) { s.NoiseSuppressed++ })
+		event.DeliveryResult = transitionDeliveryDropped
+		return event, true
+	}
 
 	if !classified {
 		if selfConductor {
@@ -120,7 +181,7 @@ func (d *TransitionDaemon) emitTurn(profile string, inst *Instance, byID map[str
 		return dropSelfConductorTurn(event, observedFlip || !repeat), true
 	}
 
-	cfg := ResolveInboxConfig(parentTitleFor(inst, byID))
+	cfg := ResolveInboxConfigForInstance(parentInstanceFor(inst, byID))
 	if !cfg.GetQuestionWakes() {
 		facts.Question = false
 	}
@@ -186,6 +247,7 @@ func (d *TransitionDaemon) emitTurn(profile string, inst *Instance, byID map[str
 	event.Tier = tier
 	event.Trigger = facts.Trigger
 	event.TurnUUID = facts.UUID
+	event.TurnTextInterim = facts.FinalTextPending
 	event.TextHash = facts.TextHash
 	event.Text = text
 	event.Question = facts.Question
@@ -330,14 +392,11 @@ func (d *TransitionDaemon) rememberDone(profile, childID string, sig DoneSignal)
 	d.lastDone[profile][childID] = sig
 }
 
-// parentTitleFor resolves the registered parent's title for config
-// overrides, or "" when the parent is not in this pass's registry.
-func parentTitleFor(inst *Instance, byID map[string]*Instance) string {
+// parentInstanceFor resolves the registered parent for config overrides, or
+// nil when the parent is not in this pass's registry.
+func parentInstanceFor(inst *Instance, byID map[string]*Instance) *Instance {
 	if inst == nil || inst.ParentSessionID == "" || byID == nil {
-		return ""
+		return nil
 	}
-	if p := byID[inst.ParentSessionID]; p != nil {
-		return p.Title
-	}
-	return ""
+	return byID[inst.ParentSessionID]
 }

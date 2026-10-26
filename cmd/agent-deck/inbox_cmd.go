@@ -49,14 +49,14 @@ func handleInbox(profile string, args []string) {
 	}
 	if err := runInboxWithProfile(os.Stdout, args, profile); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(inboxExitCode(err))
+		exitCLI(inboxExitCode(err))
 	}
 }
 
 func printInboxUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage: agent-deck inbox <session-id>")
 	fmt.Fprintln(w, "       agent-deck inbox drain [--json] <session-id>")
-	fmt.Fprintln(w, "       agent-deck inbox export [--json] [--after '<cursor-json>' [--with-writer]]")
+	fmt.Fprintln(w, "       agent-deck inbox export [--json] [--profile <name>] [--after '<cursor-json>' [--with-writer]]")
 	fmt.Fprintln(w, "       agent-deck inbox cursor [--json] [<remote>]")
 	fmt.Fprintln(w, "       agent-deck inbox writer-status [--json]")
 	fmt.Fprintln(w, "       agent-deck inbox peek [--json] [<session-id>|self]")
@@ -78,8 +78,10 @@ func printInboxUsage(w io.Writer) {
 }
 
 func printInboxExportUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: agent-deck inbox export [--json] [--after '<cursor-json>' [--with-writer]]")
+	fmt.Fprintln(w, "Usage: agent-deck inbox export [--json] [--profile <name>] [--after '<cursor-json>' [--with-writer]]")
 	fmt.Fprintln(w, "Print this host's completion/transition records without consuming them.")
+	fmt.Fprintln(w, "Only records of one profile are exported: --profile, else the invoking profile")
+	fmt.Fprintln(w, "(-p). A --profile that differs from -p is an error.")
 	fmt.Fprintln(w, "--after (requires --json) returns only what the cursor does not hold yet:")
 	fmt.Fprintln(w, "turn-journal lines past each child's seq, changed completion-ledger entries")
 	fmt.Fprintln(w, "and _unowned records past its read position, as")
@@ -199,7 +201,7 @@ func runInboxWithProfile(stdout io.Writer, args []string, explicitProfile string
 		return runInboxDrain(stdout, args[1:], explicitProfile)
 	}
 	if len(args) > 0 && args[0] == "export" {
-		return runInboxExport(stdout, args[1:])
+		return runInboxExport(stdout, args[1:], explicitProfile)
 	}
 	if len(args) > 0 && args[0] == "writer-status" {
 		return runInboxWriterStatus(stdout, args[1:])
@@ -334,7 +336,7 @@ func runInboxDrain(stdout io.Writer, args []string, explicitProfile string) erro
 		session.SpoolCommsCall(caller, comms.CallInboxDrain, sessionID)
 	}
 
-	events, err := session.DrainInboxForParent(sessionID)
+	events, withdrawn, err := session.DrainInboxForParentReport(sessionID)
 	if err != nil {
 		return fmt.Errorf("drain inbox: %w", err)
 	}
@@ -349,6 +351,17 @@ func runInboxDrain(stdout io.Writer, args []string, explicitProfile string) erro
 		}
 	} else {
 		printInboxEvents(stdout, events)
+	}
+	reportWithdrawnRecords(os.Stderr, withdrawn, *asJSON)
+	// Issue #2834: only the notify-daemon writes these records. With none
+	// running, an empty drain is not "nothing finished", so say so. Text mode
+	// prints it with the drain; --json keeps stdout the bare array.
+	if note := noNotifyDaemonNote(session.ReadWriterStatus()); note != "" {
+		if *asJSON {
+			fmt.Fprintln(os.Stderr, "WARNING: "+note)
+		} else {
+			fmt.Fprintln(stdout, "WARNING: "+note)
+		}
 	}
 
 	// Messaging audit P1-4 (#2101): a dead letter is parked, not pending
@@ -369,6 +382,44 @@ func runInboxDrain(stdout io.Writer, args []string, explicitProfile string) erro
 		}
 	}
 	return nil
+}
+
+// noNotifyDaemonNote is the one sentence the parent-facing surfaces (inbox
+// drain, the fleet line) print when no notify-daemon is writing completion
+// records on this host (#2834), or "" when one is.
+func noNotifyDaemonNote(ws session.WriterStatus) string {
+	if ws.Running {
+		return ""
+	}
+	return "no notify-daemon running; completions are not being recorded, so an empty drain or 0 done does not mean nothing finished. Start one with `agent-deck notify-daemon` (`agent-deck conductor setup` installs it as a service)."
+}
+
+// reportWithdrawnRecords logs the records a drain retired unshown because
+// the parent already read the result they announce. It goes to stderr so
+// stdout stays the delivered records (a JSON array with --json, unchanged
+// for every consumer): one line "withdrawn N ..." in text mode, one JSON
+// object {"withdrawn": N, "withdrawn_records": [...]} with --json. Nothing
+// is printed when nothing was withdrawn.
+func reportWithdrawnRecords(w io.Writer, withdrawn []session.TransitionNotificationEvent, asJSON bool) {
+	if len(withdrawn) == 0 {
+		return
+	}
+	type withdrawnRecord struct {
+		Child    string `json:"child_session_id"`
+		Title    string `json:"child_title,omitempty"`
+		TurnUUID string `json:"turn_uuid"`
+	}
+	records := make([]withdrawnRecord, 0, len(withdrawn))
+	names := make([]string, 0, len(withdrawn))
+	for _, ev := range withdrawn {
+		records = append(records, withdrawnRecord{Child: ev.ChildSessionID, Title: ev.ChildTitle, TurnUUID: ev.TurnUUID})
+		names = append(names, ev.ChildSessionID+"@"+ev.TurnUUID)
+	}
+	if asJSON {
+		_ = json.NewEncoder(w).Encode(map[string]any{"withdrawn": len(records), "withdrawn_records": records})
+		return
+	}
+	fmt.Fprintf(w, "withdrawn %d record(s) already read with session output: %s\n", len(records), strings.Join(names, ", "))
 }
 
 func resolveInboxDrainSession(identifier string) (string, error) {
@@ -521,11 +572,40 @@ func resolveSelfSessionID() (string, error) {
 			return s, nil
 		}
 	}
-	if s := strings.TrimSpace(GetCurrentSessionID()); s != "" {
-		return s, nil
+	if inst := selfInstanceByTmuxName(currentAgentDeckTmuxName()); inst != nil {
+		return inst.ID, nil
 	}
 	return "", fmt.Errorf("no session id given and could not resolve the current session " +
 		"(set AGENTDECK_INSTANCE_ID, run inside an agent-deck tmux session, or pass an explicit id)")
+}
+
+// selfInstanceByTmuxName finds the session that owns the tmux session name,
+// looking in the effective profile first and then the others. The name ends in
+// a random suffix, not the session ID, so it is matched whole.
+func selfInstanceByTmuxName(name string) *session.Instance {
+	if name == "" {
+		return nil
+	}
+	effective := session.GetEffectiveProfile("")
+	profiles := []string{effective}
+	if all, err := session.ListProfiles(); err == nil {
+		for _, p := range all {
+			if p != effective {
+				profiles = append(profiles, p)
+			}
+		}
+	}
+	for _, profile := range profiles {
+		storage, instances, _, err := loadSessionData(profile)
+		if err != nil {
+			continue
+		}
+		_ = storage.Close()
+		if inst := instanceOwningTmuxName(name, instances); inst != nil {
+			return inst
+		}
+	}
+	return nil
 }
 
 // runInboxExport is the issue #1948 remote-side READ: it prints this host's
@@ -544,9 +624,10 @@ var inboxExportStdin = func() io.Reader { return os.Stdin }
 // remote child active within the talkback horizon, about 80 bytes each).
 const maxInboxExportCursorBytes = 64 << 20
 
-func runInboxExport(stdout io.Writer, args []string) error {
+func runInboxExport(stdout io.Writer, args []string, explicitProfile string) error {
 	fs := flag.NewFlagSet("inbox export", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "emit the records as a JSON array")
+	scope := fs.String("profile", "", "export only this profile's records (default: the invoking profile)")
 	after := fs.String("after", "", "incremental export: only records past this cursor JSON, or - to read it from stdin (wrapped with cursor_next)")
 	withWriter := fs.Bool("with-writer", false, "with --after: include the writer status in the reply")
 	fs.Usage = func() { printInboxExportUsage(stdout) }
@@ -556,6 +637,10 @@ func runInboxExport(stdout io.Writer, args []string) error {
 	if fs.NArg() != 0 {
 		fs.Usage()
 		return fmt.Errorf("inbox export takes no positional arguments")
+	}
+	profile, err := inboxExportProfile(*scope, explicitProfile)
+	if err != nil {
+		return err
 	}
 	afterSet := false
 	fs.Visit(func(f *flag.Flag) { afterSet = afterSet || f.Name == "after" })
@@ -579,7 +664,7 @@ func runInboxExport(stdout io.Writer, args []string) error {
 		if err != nil {
 			return err
 		}
-		exp, err := session.ExportRecordsAfter(cursor)
+		exp, err := session.ExportRecordsAfter(profile, cursor)
 		if err != nil {
 			return fmt.Errorf("export inbox records: %w", err)
 		}
@@ -593,7 +678,7 @@ func runInboxExport(stdout io.Writer, args []string) error {
 		return fmt.Errorf("inbox export --with-writer requires --after")
 	}
 
-	records, err := session.ExportPendingRecords()
+	records, err := session.ExportPendingRecords(profile)
 	if err != nil {
 		return fmt.Errorf("export inbox records: %w", err)
 	}
@@ -612,6 +697,29 @@ func runInboxExport(stdout io.Writer, args []string) error {
 	printInboxEventLines(stdout, records)
 	fmt.Fprintf(stdout, "\nExported %d record(s). Nothing was consumed.\n", len(records))
 	return nil
+}
+
+// inboxExportProfile is the one profile an export is scoped to (#2539): the
+// --profile flag, else the invoking profile. The host-wide inbox, journal and
+// ledger directories hold every profile's records, so there is no unscoped
+// export, and a --profile that disagrees with -p is refused rather than
+// silently preferring one of them.
+func inboxExportProfile(flagProfile, explicitProfile string) (string, error) {
+	flagProfile, explicitProfile = strings.TrimSpace(flagProfile), strings.TrimSpace(explicitProfile)
+	if flagProfile != "" {
+		if explicitProfile != "" && explicitProfile != flagProfile {
+			return "", fmt.Errorf("inbox export: --profile %q disagrees with -p %q", flagProfile, explicitProfile)
+		}
+		return flagProfile, nil
+	}
+	profile, err := session.ResolveProfileForStorage(explicitProfile)
+	if err != nil {
+		return "", fmt.Errorf("inbox export: resolve profile: %w", err)
+	}
+	if strings.TrimSpace(profile) == "" {
+		return "", fmt.Errorf("inbox export: no profile to scope the export to")
+	}
+	return profile, nil
 }
 
 // runInboxWriterStatus answers the question an empty export cannot: is anything

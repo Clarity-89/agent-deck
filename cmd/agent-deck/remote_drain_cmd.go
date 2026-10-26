@@ -92,6 +92,10 @@ func lookupSessionAnyProfile(id string) (*session.Instance, string) {
 	if err != nil {
 		return nil, ""
 	}
+	return lookupSessionInProfiles(id, profiles)
+}
+
+func lookupSessionInProfiles(id string, profiles []string) (*session.Instance, string) {
 	for _, profile := range profiles {
 		_, instances, _, err := loadSessionData(profile)
 		if err != nil {
@@ -108,7 +112,7 @@ func lookupSessionAnyProfile(id string) (*session.Instance, string) {
 
 func handleRemoteDrain(args []string) {
 	if code := runRemoteDrain(os.Stdout, os.Stderr, args, fetchRemoteRecordsOverSSH); code != 0 {
-		os.Exit(code)
+		exitCLI(code)
 	}
 }
 
@@ -145,7 +149,7 @@ func staleRemoteBinaryHint(remoteName, remoteVersion string, found bool) string 
 		return fmt.Sprintf("No agent-deck answered `--version` on that host. Install it with `agent-deck remote update %s`.", remoteName)
 	}
 	if update.CompareVersions(remoteVersion, Version) < 0 {
-		return fmt.Sprintf("The remote runs v%s, older than this build (v%s). `inbox export` — the read this drain performs — exists only in newer builds; update it with `agent-deck remote update %s`.",
+		return fmt.Sprintf("The remote runs v%s, older than this build (v%s). `inbox export --profile`, the profile-scoped read this drain performs, exists only in newer builds; update it with `agent-deck remote update %s`.",
 			remoteVersion, Version, remoteName)
 	}
 	return ""
@@ -175,6 +179,9 @@ type remoteDrainResult struct {
 	// Woke reports that an ingested record of a waking tier nudged the
 	// receiving conductor (once per drain).
 	Woke bool `json:"woke,omitempty"`
+	// ForeignDropped counts fetched records of a profile other than the
+	// remote's configured one, dropped before ingest (#2539).
+	ForeignDropped int `json:"foreign_dropped,omitempty"`
 }
 
 func printRemoteDrainUsage(w io.Writer) {
@@ -187,7 +194,8 @@ func printRemoteDrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Each (remote, conductor) keeps a cursor (`agent-deck inbox cursor`), so a")
 	fmt.Fprintln(w, "drain ships only what is new; it advances only once every record landed.")
 	fmt.Fprintln(w, "An ingested urgent record wakes the conductor like a local one. Set")
-	fmt.Fprintln(w, "[remotes.<name>] talkback_interval_secs to let the notify-daemon drain on its own.")
+	fmt.Fprintln(w, "[remotes.<name>] talkback_interval_secs to let the notify-daemon drain on its own,")
+	fmt.Fprintln(w, "and require_same_profile = true to accept only a conductor of the remote's profile.")
 }
 
 func runRemoteDrain(stdout, stderr io.Writer, args []string, fetch remoteRecordFetcher) (exitCode int) {
@@ -237,7 +245,24 @@ func runRemoteDrain(stdout, stderr io.Writer, args []string, fetch remoteRecordF
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
 	}
-	targetID, err = resolveInboxDrainSession(targetID)
+	parent := func() (*session.Instance, string) { return lookupSessionAnyProfile(targetID) }
+	if rc.RequireSameProfile {
+		// #2831: a full id of another profile must not resolve here.
+		profile, perr := session.ResolveProfileForStorage("")
+		if perr != nil {
+			fmt.Fprintf(stderr, "Error: resolve effective profile: %v\n", perr)
+			return 1
+		}
+		targetID, err = resolveInboxDrainSessionInProfile(targetID, "")
+		if err == nil {
+			if inst, _ := lookupSessionInProfiles(targetID, []string{profile}); inst == nil {
+				err = &inboxTargetNotFoundError{identifier: targetID}
+			}
+		}
+		parent = func() (*session.Instance, string) { return lookupSessionInProfiles(targetID, []string{profile}) }
+	} else {
+		targetID, err = resolveInboxDrainSession(targetID)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return inboxExitCode(err)
@@ -245,6 +270,8 @@ func runRemoteDrain(stdout, stderr io.Writer, args []string, fetch remoteRecordF
 
 	ctx := context.Background()
 	res, err := session.RunRemoteTalkback(ctx, name, targetID, session.RemoteTalkbackDeps{
+		RemoteProfile:      rc.GetProfile(),
+		RequireSameProfile: rc.RequireSameProfile,
 		FetchAfter: func(ctx context.Context, cursor session.RemoteCursor) (session.RemoteExport, error) {
 			return remoteCursorFetch(ctx, name, rc, cursor)
 		},
@@ -254,7 +281,7 @@ func runRemoteDrain(stdout, stderr io.Writer, args []string, fetch remoteRecordF
 		WriterProbe: func(ctx context.Context) (session.WriterStatus, error) {
 			return remoteWriterProbe(ctx, rc, name)
 		},
-		Parent: func() (*session.Instance, string) { return lookupSessionAnyProfile(targetID) },
+		Parent: parent,
 		Wake:   remoteDrainWake,
 	})
 	if err != nil {
@@ -273,6 +300,10 @@ func runRemoteDrain(stdout, stderr io.Writer, args []string, fetch remoteRecordF
 			fmt.Fprintf(stderr, "%s\n", te.Writer.Detail)
 			fmt.Fprintln(stderr, "No fetched record was classified as finished or written locally.")
 			return drainExitUnreachable
+		case session.RemoteTalkbackStageProfile:
+			fmt.Fprintf(stderr, "Error: %v\n", te.Err)
+			fmt.Fprintln(stderr, "Nothing was pulled. Drain into a conductor of the remote's profile, or unset require_same_profile.")
+			return 1
 		case session.RemoteTalkbackStageIngest:
 			fmt.Fprintf(stderr, "Error: writing to local inbox %s: %v\n", targetID, te.Err)
 			if !res.Legacy {
@@ -291,6 +322,11 @@ func runRemoteDrain(stdout, stderr io.Writer, args []string, fetch remoteRecordF
 	records, fresh, written, duplicates, unknown, writer := res.Stored, res.Fresh, res.Written, res.Duplicates, res.Unknown, res.Writer
 	if res.RestoreDetected {
 		fmt.Fprintf(stderr, "Warning: detected consumed-ledger restore for inbox %s; forgotten window-inside records are unknown, never new.\n", targetID)
+	}
+	if res.ForeignDropped > 0 {
+		// #2539: the count only; a record of another profile is never shown.
+		fmt.Fprintf(stderr, "Warning: dropped %d record(s) of a profile other than %q; the remote's export is not scoped to it.\n",
+			res.ForeignDropped, rc.GetProfile())
 	}
 	if !res.Legacy && unknown > 0 {
 		fmt.Fprintf(stderr, "Cursor not advanced: %d record(s) could not be confirmed as landed; the next drain refetches them.\n", unknown)
@@ -314,6 +350,7 @@ func runRemoteDrain(stdout, stderr io.Writer, args []string, fetch remoteRecordF
 			CursorAfter:     res.CursorAfter,
 			LegacyExport:    res.Legacy,
 			Woke:            res.Woke,
+			ForeignDropped:  res.ForeignDropped,
 		}
 		if err := json.NewEncoder(stdout).Encode(result); err != nil {
 			fmt.Fprintf(stderr, "Error: %v\n", err)

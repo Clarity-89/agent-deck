@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/optiming"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 )
 
 type apiError struct {
@@ -32,6 +35,7 @@ func (s *Server) handleMenu(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized")
 		return
 	}
+	defer optiming.Start("web.menu")()
 
 	snapshot, err := s.menuData.LoadMenuSnapshot()
 	if err != nil {
@@ -100,7 +104,14 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+// writeAPIError answers with an API error. A 500 or 502 is an agent-deck
+// failure and is recorded as error area=web (no-op without consent); the
+// code and message are never recorded. A 4xx is the caller's mistake and a
+// 503 means a feature is not configured.
 func writeAPIError(w http.ResponseWriter, status int, code, message string) {
+	if status == http.StatusInternalServerError || status == http.StatusBadGateway {
+		telemetry.ErrorOccurred(telemetry.AreaWeb, telemetry.KindOther, "")
+	}
 	writeJSON(w, status, apiErrorResponse{
 		Error: apiError{
 			Code:    code,

@@ -18,6 +18,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
 // The Command Center is the embedded, live, two-way fleet god-view (see
@@ -302,6 +303,7 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 	// Collect sessions, split conductors from children, group children by group.
 	type sess struct {
 		id, title, status, substate, group, prompt string
+		conductorName                              string // managed group; "" for non-conductors
 		isConductor                                bool
 		hints                                      map[string]string
 	}
@@ -312,15 +314,26 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 			continue
 		}
 		ms := item.Session
+		// The resolved conductor name (stored, else a possibly decorated
+		// conductor-<name> title) is the conductor identity, not the title.
+		conductorName := ms.ConductorName
+		if conductorName == "" {
+			conductorName = session.ConductorNameFromTitle(ms.Title)
+		}
+		isConductor := ms.IsConductor || conductorName != ""
+		if isConductor && conductorName == "" {
+			conductorName = ms.Title
+		}
 		e := sess{
-			id:          ms.ID,
-			title:       ms.Title,
-			status:      string(ms.Status),
-			substate:    ms.Substate,
-			group:       ms.GroupPath,
-			prompt:      firstLine(ms.LatestPrompt),
-			isConductor: ms.IsConductor || strings.HasPrefix(ms.Title, "conductor-"),
-			hints:       ms.Hints,
+			id:            ms.ID,
+			title:         ms.Title,
+			status:        string(ms.Status),
+			substate:      ms.Substate,
+			group:         ms.GroupPath,
+			prompt:        firstLine(ms.LatestPrompt),
+			conductorName: conductorName,
+			isConductor:   isConductor,
+			hints:         ms.Hints,
 		}
 		all = append(all, e)
 		// A `summary` hint on any session, or a `note` on a conductor (a
@@ -338,10 +351,9 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 			})
 		}
 		if e.isConductor {
-			// Map a conductor to the group it manages. Conductors named
-			// "conductor-<name>" manage the "<name>" group by convention.
-			managed := strings.TrimPrefix(e.title, "conductor-")
-			conductorByGroup[managed] = e
+			// Map a conductor to the group it manages. Conductor "<name>"
+			// manages the "<name>" group by convention.
+			conductorByGroup[e.conductorName] = e
 		}
 	}
 
@@ -376,7 +388,7 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 	groupNames := map[string]bool{}
 	for _, e := range all {
 		if e.isConductor {
-			groupNames[strings.TrimPrefix(e.title, "conductor-")] = true
+			groupNames[e.conductorName] = true
 		} else if e.group != "" {
 			groupNames[e.group] = true
 		}
@@ -399,6 +411,9 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 		if c, ok := conductorByGroup[name]; ok {
 			cd.Status = c.status
 			cd.Substate = c.substate
+			// Route by the live title so a decorated or renamed conductor
+			// stays askable (the target must be in AskTargets).
+			cd.Target = c.title
 			snap.AskTargets = append(snap.AskTargets, c.title)
 		}
 		// plain-language "currently working on": disk status feed wins, then
@@ -643,7 +658,7 @@ func (s *Server) handleCommandCenterAsk(w http.ResponseWriter, r *http.Request) 
 	// a wedged tmux) can't pile up orphaned processes if many asks fire.
 	// --no-tag: an operator's command-center message is not a send from
 	// whatever session the web server happened to be started in.
-	args := []string{"-p", s.cfg.Profile, "session", "send", resolved, msg, "--no-wait", "--no-tag"}
+	args := commandCenterSendArgs(s.cfg.Profile, resolved, msg)
 	cmdCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, exe, args...)
@@ -681,6 +696,8 @@ func (s *Server) handleCommandCenterAsk(w http.ResponseWriter, r *http.Request) 
 // resolveAskTarget maps a requested target to the concrete allowlisted session
 // title, returning "" if it is not allowed. "maestro" resolves to the live
 // "conductor-maestro" session when present (else bare "maestro").
+// commandCenterAskArgs is the `session send` argv of one ask. --source
+// command-center names the sender in `agent-deck triggers` (issue #2702).
 func resolveAskTarget(target string, allow []string) string {
 	if target == "maestro" {
 		if targetAllowed(allow, "conductor-maestro") {
@@ -742,4 +759,14 @@ func firstNonEmptyString(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// commandCenterSendArgs is the `session send` argv of a Command Center ask.
+// --no-tag: an operator's message is not a send from whatever session the
+// web server happened to be started in. --ignore-budget: an operator's
+// message is never blocked by an enforced cost budget, which gates
+// agent-initiated sends only.
+func commandCenterSendArgs(profile, target, msg string) []string {
+	// --source names the ask in `agent-deck triggers` (issue #2702).
+	return []string{"-p", profile, "session", "send", target, msg, "--no-wait", "--no-tag", "--ignore-budget", "--source", "command-center"}
 }

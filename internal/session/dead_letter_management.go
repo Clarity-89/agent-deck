@@ -166,12 +166,6 @@ func findDeadLetterEntry(id string) (deadLetterEntry, error) {
 	return matches[0], nil
 }
 
-// GetDeadLetter returns one operator-safe record by full ID or unique prefix.
-func GetDeadLetter(id string) (DeadLetterRecord, error) {
-	entry, err := findDeadLetterEntry(id)
-	return entry.record, err
-}
-
 func removeDeadLetterEntry(entry deadLetterEntry) error {
 	lock, err := AcquireConfigFileLock(entry.path)
 	if err != nil {
@@ -218,7 +212,7 @@ func removeDeadLetterEntry(entry deadLetterEntry) error {
 		return nil
 	}
 	data := []byte(strings.Join(kept, "\n") + "\n")
-	if err := writeFileDurable(entry.path, data, 0o644); err != nil {
+	if err := writeFileDurable(entry.path, data, 0o600); err != nil {
 		return err
 	}
 	if managesInboxCache {

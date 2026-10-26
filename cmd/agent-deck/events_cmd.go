@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -26,7 +27,7 @@ const eventsUsage = "Usage: agent-deck events <follow|stats|publish>"
 func handleEvents(profile string, args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, eventsUsage)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	switch args[0] {
 	case "--help", "-h", "help":
@@ -41,7 +42,7 @@ func handleEvents(profile string, args []string) {
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown events subcommand: %s\n", args[0])
 		fmt.Fprintln(os.Stderr, eventsUsage)
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -62,6 +63,52 @@ func openBusForRead(name string) (*events.Bus, error) {
 	}
 }
 
+// Read-only followers use the already resolved profile and never take a writer handle.
+func openFollowerBus(name string, readOnly bool) (*events.Bus, error) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if readOnly && (name == "" || name == "events") {
+		return events.OpenReader(events.CurrentProfile())
+	}
+	return openBusForRead(name)
+}
+
+// openProfileFollowerBus is openFollowerBus for an explicit --profile. The
+// caller owns (and closes) the returned bus.
+func openProfileFollowerBus(name, profile string, readOnly bool) (*events.Bus, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "events":
+		if readOnly {
+			return events.OpenReader(profile)
+		}
+		return events.OpenProfile(profile), nil
+	case "comms":
+		return comms.OpenReader(profile)
+	default:
+		return nil, fmt.Errorf("unknown --bus %q (events or comms)", name)
+	}
+}
+
+// resolveEventsProfile checks an explicit `events follow|publish --profile`.
+// The global -p of a forwarded `remote <name> events ...` is fixed by the
+// remote's config, so this flag is how a caller reaches another profile's log
+// on that host. It must name an existing profile: a typo never creates a bus.
+// It must also be a plain profile name: the bus directory is keyed by the
+// name itself, so "a/b" (which ProfileExists would resolve by its base name)
+// is refused here instead of silently opening a disabled bus.
+func resolveEventsProfile(name string) (string, error) {
+	if name == "" || !filepath.IsLocal(name) || filepath.Base(name) != name {
+		return "", fmt.Errorf("invalid profile %q: a profile name, not a path", name)
+	}
+	exists, err := session.ProfileExists(name)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("profile %q does not exist", name)
+	}
+	return name, nil
+}
+
 // handleEventsFollow implements `agent-deck events follow --json [--after <cursor>]
 // [--kind <prefix>[,<prefix>]] [--session <id>] [--bus events|comms]`. It streams one canonical-JSON
 // frame per line to stdout, oldest first, and keeps streaming newly published
@@ -71,18 +118,22 @@ func openBusForRead(name string) (*events.Bus, error) {
 // only output shape this command has, so the flag doesn't change anything.
 // --kind and --session only filter what is printed; cursors stay the bus's.
 func handleEventsFollow(profile string, args []string) {
-	fs := flag.NewFlagSet("agent-deck events follow", flag.ExitOnError)
+	fs := flag.NewFlagSet("agent-deck events follow", flag.ContinueOnError)
 	afterFlag := fs.Uint64("after", 0, "resume after this cursor (0 = from the beginning of the retained log)")
+	fs.Uint64Var(afterFlag, "since", 0, "alias for --after")
+	_ = fs.Bool("jsonl", true, "stream NDJSON frames (alias for --json)")
 	_ = fs.Bool("json", true, "stream NDJSON frames (always on; kept for CLI symmetry)")
 	kindFlag := fs.String("kind", "", "only frames whose kind equals or starts with one of these comma-separated prefixes (e.g. session.status,session.turn,macapp.)")
 	sessionFlag := fs.String("session", "", "only frames for this session id")
 	busFlag := fs.String("bus", "events", busFlagHelp)
+	readOnlyFlag := fs.Bool("read-only", false, "observe only: no send-worker recovery, no writer handle, no demand lease (tmux.output frames appear only while another follower asks for them); fails if no writer has created the bus yet")
+	profileFlag := fs.String("profile", "", "read this existing profile's log instead of the process profile")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: agent-deck events follow --json [--after <cursor>] [--kind <prefix,...>] [--session <id>] [--bus events|comms]")
+		fmt.Fprintln(fs.Output(), "Usage: agent-deck events follow --jsonl [--since <cursor>] [--kind <prefix,...>] [--session <id>] [--bus events|comms] [--read-only] [--profile <name>]")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 	var kinds []string
 	for _, k := range strings.Split(*kindFlag, ",") {
@@ -91,31 +142,42 @@ func handleEventsFollow(profile string, args []string) {
 		}
 	}
 
+	if *profileFlag != "" {
+		p, err := resolveEventsProfile(*profileFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: events follow: %v\n", err)
+			exitCLI(1)
+		}
+		profile = p
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// A client that only follows the bus still gets queued sends that a
 	// reboot left unfinished delivered: their workers restart here.
 	// Read-only: the queue directory is only looked at, never created.
-	if p, err := session.ResolveProfileForStorage(profile); err == nil {
-		if dir, err := session.GetProfileDir(p); err == nil {
-			kickPendingSendWorkers(profile, sendqueue.Dir(dir), "")
-		}
-	}
+	recoverFollowerWorkers(profile, *readOnlyFlag, sendqueue.KickWorkers)
 
-	bus, err := openBusForRead(*busFlag)
+	var bus *events.Bus
+	var err error
+	if *profileFlag != "" {
+		bus, err = openProfileFollowerBus(*busFlag, profile, *readOnlyFlag)
+	} else {
+		bus, err = openFollowerBus(*busFlag, *readOnlyFlag)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: events follow: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
-	if bus.ReadOnly() {
+	if bus.ReadOnly() || *profileFlag != "" {
 		defer bus.Close()
 	}
 	defer bus.Want(followDemandKinds(kinds)...)()
 	sub, err := bus.Subscribe(ctx, events.Cursor(*afterFlag))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: events follow: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	for frame := range sub.Frames() {
@@ -128,12 +190,23 @@ func handleEventsFollow(profile string, args []string) {
 		}
 		line = append(line, '\n')
 		if _, err := os.Stdout.Write(line); err != nil {
-			os.Exit(1)
+			exitCLI(1)
 		}
 	}
 	if err := sub.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: events follow: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
+	}
+}
+
+func recoverFollowerWorkers(profile string, readOnly bool, kick func(string, string, string)) {
+	if readOnly {
+		return
+	}
+	if p, err := session.ResolveProfileForStorage(profile); err == nil {
+		if dir, err := session.GetProfileDir(p); err == nil {
+			kick(profile, sendqueue.Dir(dir), "")
+		}
 	}
 }
 
@@ -167,7 +240,9 @@ func eventMatches(f events.Frame, kinds []string, sessionID string) bool {
 
 // macappKindPrefix is the only namespace a client may publish from the CLI.
 // macapp.* frames drive Mac app plugins (docs/macapp-core.md) and need
-// [macapp] plugins = true.
+// [macapp] plugins = true, except the Mac app's own frames
+// (events.IsMacappUngatedKind). macapp.browser.request stays gated: it drives
+// the owner's browser.
 const macappKindPrefix = "macapp."
 
 // handleEventsPublish implements `agent-deck events publish --kind <kind>
@@ -179,82 +254,138 @@ func handleEventsPublish(profile string, args []string) {
 	data := fs.String("data", "", "JSON object payload")
 	dataFile := fs.String("data-file", "", "read the JSON payload from this file, or - for stdin")
 	jsonOut := fs.Bool("json", false, "print {ok, kind, session_id, cursor} as JSON")
+	profileFlag := fs.String("profile", "", "publish on this existing profile's log instead of the process profile")
+	fromRemote := fs.Bool("from-remote", false, "set by a forwarded remote <name> events publish: only the Mac app's reply kinds, data on stdin, and --session must be a session of this host")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: agent-deck events publish --kind macapp.<name> [--session <id>] [--data <json> | --data-file <path|->] [--json]")
-		fmt.Fprintln(os.Stderr, "Needs [macapp] plugins = true in config.toml.")
+		fmt.Fprintln(fs.Output(), "Usage: agent-deck events publish --kind macapp.<name> [--session <id>] [--data <json> | --data-file <path|->] [--profile <name>] [--json]")
+		fmt.Fprintln(fs.Output(), "Needs [macapp] plugins = true, except the Mac app's own frames: macapp.open,")
+		fmt.Fprintln(fs.Output(), "macapp.open.ack, macapp.browser.response, macapp.app.focus and macapp.ask.seen;")
+		fmt.Fprintln(fs.Output(), "macapp.ask and macapp.ask.ack are published only by agent-deck ask on the host;")
+		fmt.Fprintln(fs.Output(), "to enable it, run: agent-deck config set macapp.plugins true --yes (docs/macapp-core.md).")
 		fs.PrintDefaults()
 	}
+	routeFlagHelp(fs, args)
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		os.Exit(2)
+		exitCLI(2)
 	}
 	out := NewCLIOutput(*jsonOut, false)
+	// Kind names are lowercase; a mixed-case spelling of a gated kind must
+	// not pass the exact-match gates below as some other kind.
+	if *kind != strings.ToLower(*kind) {
+		out.Error(fmt.Sprintf("events publish: --kind %q must be lowercase", *kind), ErrCodeInvalidOperation)
+		exitCLI(2)
+	}
 	if !strings.HasPrefix(*kind, macappKindPrefix) || len(*kind) == len(macappKindPrefix) {
 		out.Error("events publish: --kind must be in the macapp.* namespace", ErrCodeInvalidOperation)
-		os.Exit(2)
+		exitCLI(2)
 	}
-	if cfg, _ := session.LoadUserConfig(); cfg == nil || !cfg.Macapp.Plugins {
-		out.Error("events publish is off: set [macapp] plugins = true in config.toml (docs/macapp-core.md)", ErrCodeInvalidOperation)
-		os.Exit(2)
+	if *profileFlag != "" {
+		p, err := resolveEventsProfile(*profileFlag)
+		if err != nil {
+			out.Error(fmt.Sprintf("events publish: %v", err), ErrCodeInvalidOperation)
+			exitCLI(2)
+		}
+		profile = p
+	}
+	if events.IsMacappHostOnlyKind(*kind) {
+		// A forged ack would close the owner's ask dialog, a forged request
+		// would show one: only `agent-deck ask` publishes these, in process.
+		out.Error(fmt.Sprintf("events publish: %s is published only by agent-deck ask on this host", *kind), ErrCodeInvalidOperation)
+		exitCLI(2)
+	}
+	if *kind == events.KindMacappBrowserRequest {
+		// The browser opt-in gates the request kind on every publish path
+		// (a forwarded remote publish never carries it: reply kinds only).
+		resolved, err := session.ResolveProfileForStorage(profile)
+		if err != nil {
+			out.Error(fmt.Sprintf("events publish: %v", err), ErrCodeInvalidOperation)
+			exitCLI(2)
+		}
+		if err := requireBrowserEnabled(resolved); err != nil {
+			out.Error("events publish: "+err.Error(), ErrCodeBrowserDisabled)
+			exitCLI(2)
+		}
+	}
+	if cfg, _ := session.LoadUserConfig(); !events.IsMacappUngatedKind(*kind) && (cfg == nil || !cfg.Macapp.Plugins) {
+		exitMacappPluginsOff(out, "events publish")
+	}
+	if *fromRemote {
+		if err := checkRemoteReplyPublish(profile, *kind, *sessionID, *data, *dataFile); err != nil {
+			out.Error(fmt.Sprintf("events publish --from-remote: %v", err), ErrCodeInvalidOperation)
+			exitCLI(2)
+		}
 	}
 	raw := []byte(*data)
 	if *dataFile != "" {
 		var err error
-		if *dataFile == "-" {
-			raw, err = io.ReadAll(os.Stdin)
-		} else {
-			raw, err = os.ReadFile(*dataFile)
-		}
+		raw, err = readPublishData(*dataFile)
 		if err != nil {
 			out.Error(fmt.Sprintf("events publish: read data: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
+	}
+	if *kind == events.KindMacappBrowserResponse {
+		// Page text and screenshots go to a 0600 side file, not the log.
+		spilled, err := spillBrowserResponse(profile, raw, time.Now())
+		if err != nil {
+			out.Error(fmt.Sprintf("events publish: keep the browser result out of the log: %v", err), ErrCodeInvalidOperation)
+			exitCLI(1)
+		}
+		raw = spilled
 	}
 	var payload any
 	if len(strings.TrimSpace(string(raw))) > 0 {
 		if err := json.Unmarshal(raw, &payload); err != nil {
 			out.Error(fmt.Sprintf("events publish: data is not JSON: %v", err), ErrCodeInvalidOperation)
-			os.Exit(2)
+			exitCLI(2)
 		}
 	}
 	sid := *sessionID
 	if sid == "" {
 		sid = os.Getenv("AGENTDECK_INSTANCE_ID")
 	}
-	bus := events.Default()
+	var bus *events.Bus
+	if *profileFlag != "" {
+		bus = events.OpenProfile(profile)
+		defer bus.Close()
+	} else {
+		bus = events.Default()
+	}
 	before := bus.Cursor()
 	bus.Publish(*kind, sid, payload)
 	if !bus.Flush(2 * time.Second) {
 		out.Error("events publish: bus did not commit the frame within 2s", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	cursor := bus.Cursor()
 	if cursor <= before {
 		out.Error("events publish: bus is disabled or dropped the frame (see events stats)", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	out.Success(fmt.Sprintf("published %s at cursor %d", *kind, cursor), map[string]any{"ok": true, "kind": *kind, "session_id": sid, "cursor": uint64(cursor), "profile": profile})
 }
 
 // handleEventsStats implements `agent-deck events stats [--json] [--bus events|comms]`.
 func handleEventsStats(args []string) {
-	fs := flag.NewFlagSet("agent-deck events stats", flag.ExitOnError)
+	fs := flag.NewFlagSet("agent-deck events stats", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "print stats as JSON")
 	busFlag := fs.String("bus", "events", busFlagHelp)
+	readOnlyFlag := fs.Bool("read-only", false, "read the existing event log without opening a writer; fails if no writer has created the bus yet")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: agent-deck events stats [--json] [--bus events|comms]")
+		fmt.Fprintln(fs.Output(), "Usage: agent-deck events stats [--json] [--bus events|comms] [--read-only]")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, args); err != nil {
+		exitCLI(1)
 	}
 
-	bus, err := openBusForRead(*busFlag)
+	bus, err := openFollowerBus(*busFlag, *readOnlyFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: events stats: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if bus.ReadOnly() {
 		defer bus.Close()
@@ -270,7 +401,7 @@ func handleEventsStats(args []string) {
 		}{stats, kinds}
 		if err := enc.Encode(payload); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: encode stats: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		return
 	}
@@ -293,4 +424,62 @@ func handleEventsStats(args []string) {
 			fmt.Printf("kind:      %-24s %d\n", k, kinds[k])
 		}
 	}
+}
+
+// readPublishData reads a publish payload from a file, or stdin for "-",
+// refusing anything over remotePublishDataCap so a box never buffers an
+// unbounded payload whichever way it arrives.
+func readPublishData(name string) ([]byte, error) {
+	var r io.Reader = os.Stdin
+	if name != "-" {
+		f, err := os.Open(name)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		r = f
+	}
+	raw, err := io.ReadAll(io.LimitReader(r, remotePublishDataCap+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > remotePublishDataCap {
+		return nil, fmt.Errorf("payload over %d bytes", remotePublishDataCap)
+	}
+	return raw, nil
+}
+
+// checkRemoteReplyPublish is the box-side check of a publish forwarded by
+// `remote <name> events publish` (which adds --from-remote): only the Mac
+// app's reply kinds, the payload on stdin, and a frame may only reference a
+// session of this host, in the profile it is published on. The controller
+// checks the same before SSH; this is defence in depth, not authentication:
+// --from-remote is set by the caller, and a caller with a shell on this host
+// can publish without it.
+func checkRemoteReplyPublish(profile, kind, sessionID, data, dataFile string) error {
+	if !events.IsMacappRemoteReplyKind(kind) {
+		return fmt.Errorf("kind %q is not a Mac app reply (%s, %s, %s or %s)", kind, events.KindMacappOpenAck, events.KindMacappBrowserResponse, events.KindMacappAppFocus, events.KindMacappAskSeen)
+	}
+	if data != "" || dataFile != "-" {
+		return errors.New("the payload must come on stdin (--data-file -)")
+	}
+	if sessionID == "" {
+		if kind == events.KindMacappAppFocus {
+			return nil // a focus claim is about the app, not a session
+		}
+		return errors.New("--session is required")
+	}
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		return fmt.Errorf("open profile %q: %w", profile, err)
+	}
+	defer storage.Close()
+	exists, err := storage.InstanceExists(sessionID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("session %q is not a session of this host (profile %q)", sessionID, profile)
+	}
+	return nil
 }

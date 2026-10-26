@@ -172,14 +172,7 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 		return false
 	}
 	// Get last 15 lines for analysis (increased from 10 for better context)
-	lines := strings.Split(content, "\n")
-	var lastLines []string
-	for i := len(lines) - 1; i >= 0 && len(lastLines) < 15; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line != "" {
-			lastLines = append([]string{lines[i]}, lastLines...)
-		}
-	}
+	lastLines := recentTailLines(content, 15)
 	recentContent := strings.Join(lastLines, "\n")
 	recentLower := strings.ToLower(recentContent)
 
@@ -332,26 +325,23 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 	// line, mode line, update notice, compaction hint, /rc), as captured on
 	// live sessions in the status-light audit.
 	// ═══════════════════════════════════════════════════════════════════════
+	// A typed draft may wrap across several two-space-indented rows before
+	// the lower box rule. Keep that whole box in view while still requiring
+	// its closing rule near the live footer.
+	if hasClaudeDraftBox(lastLines) {
+		return true
+	}
 	checkLines := lastLines
 	if len(checkLines) > 8 {
 		checkLines = checkLines[len(checkLines)-8:]
 	}
-	for idx, line := range checkLines {
+	for _, line := range checkLines {
 		cleanLine := strings.TrimSpace(StripANSI(line))
 		// Normalize non-breaking spaces (U+00A0) to regular spaces
 		// Claude Code uses NBSP after the prompt character
 		cleanLine = strings.ReplaceAll(cleanLine, "\u00A0", " ")
 		// Check for standalone prompt character (user hasn't typed yet)
 		if cleanLine == ">" || cleanLine == "❯" || cleanLine == "> " || cleanLine == "❯ " {
-			return true
-		}
-		// Prompt with an unsent draft: "❯ migrate all" drawn between the two
-		// horizontal rules of the input box. The rules tell it apart from an
-		// echoed earlier prompt ("❯ text" followed by a ⏺ reply) and from a
-		// menu option ("❯ 1. Leave it"). 11 of 46 audited idle Claude panes
-		// carried a draft; without this they had no prompt verdict at all.
-		if strings.HasPrefix(cleanLine, "❯ ") && idx > 0 && idx+1 < len(checkLines) &&
-			isHorizontalRuleLine(checkLines[idx-1]) && isHorizontalRuleLine(checkLines[idx+1]) {
 			return true
 		}
 		// Check for prompt with suggestion (Claude shows "❯ Try..." when waiting)
@@ -419,6 +409,38 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 	}
 
 	return false
+}
+
+// hasClaudeDraftBox accepts a live input box even when its typed text wraps.
+// The composer glyph must follow an upper rule, continuation rows must keep
+// Claude's two-space indent, and the lower rule must be in the recent footer.
+func hasClaudeDraftBox(lines []string) bool {
+	_, _, ok := claudeDraftBoxBounds(lines)
+	return ok
+}
+
+func claudeDraftBoxBounds(lines []string) (int, int, bool) {
+	for i := 0; i+2 < len(lines); i++ {
+		if !isHorizontalRuleLine(lines[i]) {
+			continue
+		}
+		prompt := strings.ReplaceAll(strings.TrimSpace(StripANSI(lines[i+1])), "\u00a0", " ")
+		if !strings.HasPrefix(prompt, "❯ ") {
+			continue
+		}
+		for j := i + 2; j < len(lines); j++ {
+			if isHorizontalRuleLine(lines[j]) {
+				if j >= len(lines)-8 {
+					return i, j, true
+				}
+				break
+			}
+			if !strings.HasPrefix(StripANSI(lines[j]), "  ") {
+				break
+			}
+		}
+	}
+	return 0, 0, false
 }
 
 // =============================================================================
@@ -898,18 +920,24 @@ func StripANSI(content string) string {
 				i = j
 				continue
 			}
-			// OSC sequence: ESC ] ... BEL
+			// OSC sequence: ESC ] ... BEL or ST (ESC \), whichever comes first.
+			// Preferring a later BEL over an earlier ST would swallow the
+			// visible text between them.
 			if i+1 < len(content) && content[i+1] == ']' {
-				// Find BEL terminator
-				bellPos := strings.Index(content[i:], "\x07")
+				rest := content[i:]
+				bellPos := strings.IndexByte(rest, '\x07')
+				// Look for ST only before the BEL so a BEL-terminated
+				// sequence never rescans the rest of the content.
+				stScope := rest
 				if bellPos != -1 {
-					i += bellPos + 1
+					stScope = rest[:bellPos]
+				}
+				if stPos := strings.Index(stScope, "\x1b\\"); stPos != -1 {
+					i += stPos + 2
 					continue
 				}
-				// No BEL found - find ST (ESC \) as alternative terminator
-				stPos := strings.Index(content[i:], "\x1b\\")
-				if stPos != -1 {
-					i += stPos + 2
+				if bellPos != -1 {
+					i += bellPos + 1
 					continue
 				}
 			}
@@ -948,4 +976,43 @@ func StripANSI(content string) string {
 	}
 
 	return b.String()
+}
+
+// AgentComposerVisible reports whether the pane shows the input composer of
+// an agent that reads a pasted @path (Claude Code, Gemini): the remote attach
+// turns Ctrl+V with a clipboard image into an upload only then, never in an
+// editor, a shell or a dialog that happens to run in the pane. For Claude the
+// composer is its prompt line (❯, or > on older builds; empty or with a draft)
+// between two horizontal rules, the lower one in the pane's last 8 lines;
+// a busy turn keeps the composer, so a paste then queues as typed text does.
+func AgentComposerVisible(tool, content string) bool {
+	content = StripANSI(content)
+	switch tool {
+	case "claude":
+		lines := strings.Split(strings.TrimRight(content, "\n "), "\n")
+		for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+			lines = lines[:len(lines)-1]
+		}
+		for i := 0; i+2 < len(lines); i++ {
+			if !isHorizontalRuleLine(lines[i]) {
+				continue
+			}
+			prompt := strings.TrimSpace(strings.ReplaceAll(lines[i+1], " ", " "))
+			if prompt != "❯" && prompt != ">" && !strings.HasPrefix(prompt, "❯ ") && !strings.HasPrefix(prompt, "> ") {
+				continue
+			}
+			for j := i + 2; j < len(lines); j++ {
+				if isHorizontalRuleLine(lines[j]) {
+					if j >= len(lines)-8 {
+						return true
+					}
+					break
+				}
+			}
+		}
+		return false
+	case "gemini":
+		return NewPromptDetector("gemini").HasPrompt(content)
+	}
+	return false
 }

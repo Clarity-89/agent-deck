@@ -9,19 +9,21 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"al.essio.dev/pkg/shellescape"
 )
 
 // getCopilotHomeDir returns the Copilot CLI config/state directory.
 // Respects COPILOT_CONFIG_DIR env var, falling back to ~/.copilot.
 func getCopilotHomeDir() string {
 	if dir := strings.TrimSpace(os.Getenv("COPILOT_CONFIG_DIR")); dir != "" {
-		return dir
+		return sandboxedToolDir("Copilot home", dir)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return filepath.Join(os.TempDir(), ".copilot")
 	}
-	return filepath.Join(home, ".copilot")
+	return sandboxedToolDir("Copilot home", filepath.Join(home, ".copilot"))
 }
 
 // getCopilotSessionStateDir returns the session state directory.
@@ -186,12 +188,12 @@ func buildCopilotCommand(i *Instance) string {
 	// Determine model flag
 	modelFlag := ""
 	if i.CopilotModel != "" {
-		modelFlag = " --model " + i.CopilotModel
+		modelFlag = " --model " + shellescape.Quote(i.CopilotModel)
 	} else if i.CopilotSessionID == "" {
 		// Only apply default model for NEW sessions (not resumes)
 		userConfig, _ := LoadUserConfig()
 		if userConfig != nil && userConfig.Copilot.DefaultModel != "" {
-			modelFlag = " --model " + userConfig.Copilot.DefaultModel
+			modelFlag = " --model " + shellescape.Quote(userConfig.Copilot.DefaultModel)
 		}
 	}
 
@@ -221,7 +223,7 @@ func buildCopilotCommand(i *Instance) string {
 		return envPrefix + fmt.Sprintf(
 			"%s --resume %s%s%s",
 			baseCmd,
-			i.CopilotSessionID,
+			shellescape.Quote(i.CopilotSessionID),
 			modelFlag,
 			allowAllFlag,
 		)

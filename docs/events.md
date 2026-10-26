@@ -13,7 +13,7 @@ trailing spaces).
 | Field | Type | Meaning |
 |---|---|---|
 | `cursor` | uint64 | Durable, monotonic, per-profile. Never reused. 0 means "no frame". |
-| `event_id` | string | Random, informational only. Not the ordering/identity key. |
+| `event_id` | string | Random request/ack correlation and deduplication ID. Not the ordering key. |
 | `ts` | int64 | Unix milliseconds. |
 | `kind` | string | Producer-defined, dotted (`session.status`, `tmux.output`, ...). |
 | `session_id` | string | The instance/session this event is about, when applicable. |
@@ -27,13 +27,23 @@ trailing spaces).
 | `internal/statedb` `WriteStatus` via `internal/session/status_bus.go` (only with `[macapp] status_events = true`) | every status row transition, from whichever process owns the status (TUI poller, notify daemon); one frame per edge, even when two owners write the same transition | `session.status` |
 | same | entering `running` / leaving `running` | `session.turn` |
 | `internal/session/transition_daemon.go` (only with `[macapp] transcript_events = true`) | a live session's native transcript grew | `session.transcript` |
-| `agent-deck events publish` (only with `[macapp] plugins = true`) | a client/plugin frame | `macapp.*` |
+| `agent-deck open` | Browser request | `macapp.open` |
+| `agent-deck events publish --kind macapp.open.ack` | Built-in Browser acknowledgment | `macapp.open.ack` |
+| `agent-deck events publish --kind macapp.browser.response\|macapp.app.focus` | the Mac app's browser reply and focus claim (no plugin opt-in) | same kind |
+| `agent-deck ask secret\|choice\|text` (in process only; `events publish` refuses the kind) | a request for the owner's dialog (docs/ask.md) | `macapp.ask` |
+| `agent-deck events publish --kind macapp.ask.seen`, or the TUI in process | a dialog shows an ask request, with its nonce (no plugin opt-in) | `macapp.ask.seen` |
+| `agent-deck ask deliver\|cancel` and the asker on expiry or interrupt (host only; `events publish` refuses the kind) | an ask request ended: `{request_id, ask_event_id, status, answered_by, replaced}` | `macapp.ask.ack` |
+| `agent-deck events publish --kind macapp.browser.request` (requires `[browser] enabled = true` for the profile, else exit 2 with code `BROWSER_DISABLED`, and `[macapp] plugins = true`; both opt-ins, not security boundaries) | a browser request | `macapp.browser.request` |
+| `internal/session.CleanupRemovedSession`, run by every path that deletes a session row (`remove`, `session remove` incl. `--all-errored` and `cleanup`, `worktree finish`, `conductor teardown`, TUI delete and worktree finish, web delete and worktree finish), once per deleted row; and a profile migration (`session move`, `group move`, conductor migrate) on the source profile | a session left this profile's bus, best effort, so a following Mac app forgets its Browser state: `{reason:"removed"}` or `{reason:"moved"}` | `macapp.session.closed` |
+| `agent-deck events publish` (other kinds require `[macapp] plugins = true`) | a client/plugin frame | `macapp.*` |
 | `internal/session/transition_notifier.go` | `NotifyTransition` | `session.transition` |
 | `internal/session/transition_daemon_turns.go` | a top-level conductor's own turn, dropped (`self_conductor`) before the notifier; one frame per turn or observed flip | `session.transition` |
 | `internal/session/transition_notifier.go` | `NotifyFinished` | `session.finished` |
 | `internal/tmux/pipemanager.go` | tmux `%output`, only while a follower demands it (see below) | `tmux.output` |
 | `internal/watcher/engine.go` | `writerLoop` (new persisted event) | `watcher.event` |
 | `internal/watcher/engine.go` | `healthLoop` (health snapshot) | `watcher.health` |
+| `cmd/agent-deck/session_queue_cmd.go` | the queue worker answered `session queue release` or `cancel` | `queue.released`, `queue.cancelled` |
+| `internal/triggers/store.go` (from `session send`, `triggers scan\|mute\|unmute` and the daily rescan in `triggers list`) | a trigger fired, was muted or unmuted, or the unit scan stored a result (docs/triggers.md) | `session.trigger` |
 
 Frame data for the session kinds (`session_id` is the agent-deck session id):
 
@@ -42,6 +52,9 @@ Frame data for the session kinds (`session_id` is the agent-deck session id):
 | `session.status` | `{from, to, tool, tmux_session, substate, changed_at}` (`changed_at` RFC 3339, the frame `ts` is the same instant in ms) |
 | `session.turn` | `{phase: "started"}` or `{phase: "ended", to, duration_ms}` (duration measured by the publishing process; omitted when it did not see the start) |
 | `session.transcript` | `{path, bytes_appended, size}` |
+| `queue.released` | `{id, state, outcome, reason}` (`outcome` as `session queue release --json` reports it) |
+| `queue.cancelled` | `{id, state: "cancelled"}` |
+| `session.trigger` | a fire: `{trigger_id, source, kind, outcome, health}` (`session_id` is the receiving session, `""` for a dead target); a mute change: `{trigger_id, mute: "muted"\|"unmuted"}`; a scan: `{scan: "<units found>"}`. Clients refetch `triggers --json` on any of them. |
 | `tmux.output` | none: `session_id` is the tmux session name; the frame has no `data` key (never `"data": null`) |
 
 A producer that passes nil data publishes a frame without `data`; a stored
@@ -85,6 +98,10 @@ name. Typically:
 | `cursor.state` | Last sealed cursor, retained even when all sealed segments are compacted. |
 | `drops.count` | Cumulative drops from all producers for this profile. |
 
+The log is private to its user: the directory (and `want/`) is mode 0700 and
+every file 0600. A log an older core wrote with 0755/0644 is tightened when
+it is next opened.
+
 Rotation: the active segment seals (renamed to `seg-*`) on the next sync pass
 after it passes 8 MiB or 50,000 frames, and a fresh `active.ndjson` starts.
 This keeps file data durable before the sealed cursor range is published. Compaction:
@@ -114,6 +131,7 @@ PublishDefault(kind, sessionID string, data any)  // bounded, no disk on produce
 PublishProfile(profile, kind, sessionID string, data any) // per-profile transition tap
 OpenProfile(profile string) *Bus                  // component owned
 (*Bus) Publish(kind, sessionID string, data any)  // never blocks
+(*Bus) PublishWithID(kind, sessionID string, data any) string // accepted frame ID; Flush confirms durability
 (*Bus) Subscribe(ctx, after Cursor) (*Subscription, error)
 (*Bus) Cursor() Cursor
 (*Bus) Stats() Stats
@@ -150,9 +168,44 @@ a drop; the directory must already exist (`ErrNoBus` otherwise).
 
 | Command | Output |
 |---|---|
-| `agent-deck events follow --json [--after <cursor>] [--kind <prefix,...>] [--session <id>] [--bus events\|comms]` | NDJSON frames, oldest first, streams live until killed. `--kind session` matches `session.*`; `--kind macapp.` matches the namespace; filters never change cursors. `--bus comms` follows the comms ledger (read-only; docs/comms.md). |
-| `agent-deck events stats --json [--bus events\|comms]` | `{enabled, dir, cursor, published, written, synced, dropped, queue_len, queue_cap, kinds: {kind: retained count}}`. |
-| `agent-deck events publish --kind macapp.<name> [--session <id>] [--data <json> \| --data-file <path\|->] [--json]` | Publishes one frame and waits (≤ 2 s) until it is committed; prints `{ok, kind, session_id, cursor, profile}`. Only the `macapp.*` namespace, only with `[macapp] plugins = true` (exit 2 otherwise). `--session` defaults to `$AGENTDECK_INSTANCE_ID`. |
+| `agent-deck events follow --json [--after <cursor>] [--kind <prefix,...>] [--session <id>] [--bus events\|comms] [--read-only] [--profile <name>]` | NDJSON frames, oldest first, streams live until killed. `--jsonl` and `--since` are aliases of `--json` and `--after`; `agent-deck remote <name> events follow --jsonl --since <cursor>` forwards the same stream from a registered remote (docs/remote-recall.md); that forwarded stream ends with exit 0 as soon as the controller's stdin closes, so stdin from `/dev/null` ends it within seconds with no output, while the local command ignores stdin. `--kind session` matches `session.*`; `--kind macapp.` matches the namespace; filters never change cursors. `--bus comms` follows the comms ledger (read-only; docs/comms.md). `--read-only` observes the events bus of the resolved profile without restarting queued send workers, without a writer handle and without a demand lease, so `tmux.output` frames appear only while another follower asks for them; it exits with an error when no writer has created the bus yet. `--profile` reads another existing profile's log (a missing profile, or a path such as `a/b`, is refused); a forwarded remote command runs with the `-p` fixed by the remote config, so this is how a client reaches another profile on that host. |
+| `agent-deck events stats --json [--bus events\|comms] [--read-only]` | `{enabled, dir, cursor, published, written, synced, dropped, queue_len, queue_cap, kinds: {kind: retained count}}`. `--read-only` counts the existing log without opening a writer. |
+| `agent-deck events publish --kind macapp.<name> [--session <id>] [--data <json> \| --data-file <path\|->] [--profile <name>] [--json]` | Publishes one frame and waits (≤ 2 s) until it is committed; prints `{ok, kind, session_id, cursor, profile}`. `--kind` must be lowercase: a kind with any uppercase letter (`macapp.myPlugin`, `macapp.Browser.Request`) is refused with exit 2 before the namespace and opt-in checks, so a mixed-case spelling never passes as another kind. Only the `macapp.*` namespace, with `[macapp] plugins = true` required except for the Mac app's own frames `macapp.open`, `macapp.open.ack`, `macapp.browser.response`, `macapp.app.focus` and `macapp.ask.seen` (exit 2 otherwise; `macapp.ask` and `macapp.ask.ack` are always refused: only `agent-deck ask` publishes them; `macapp.browser.request` also needs `[browser] enabled = true`, see docs/macapp-browser.md). `--data-file` payloads are capped at 2 MiB. `--session` defaults to `$AGENTDECK_INSTANCE_ID`; `--profile` publishes on another existing profile's log (a profile name, never a path). See "Remote reply publish" below for `agent-deck remote <name> events publish`. |
+
+### Remote reply publish
+
+`agent-deck remote <name> events publish --kind <reply kind> [--session <id>] --data-file - [--profile <name>] [--json]`
+sends the Mac app's reply to a session on a remote host. Checks:
+
+- On the controller, before SSH: only `macapp.open.ack`, `macapp.browser.response`,
+  `macapp.app.focus` and `macapp.ask.seen`; the payload on stdin (`--data-file -`), read whole and
+  capped at 2 MiB; a closed option set whose values never start with `-` (so no
+  help flag can hide in a value and skip the cap). Inline `--data`, file paths
+  and every other kind are refused with exit 2.
+- Negotiation: the command goes through the same one-round-trip capability
+  probe as `remote <name> events follow`, with `--from-remote` added. A host
+  whose core predates this answers `unsupported remote command "events publish"`
+  (JSON with `--json`) instead of its own flag or gate error, and never runs it.
+- On the remote host (`events publish --from-remote`): the same kind and stdin
+  rules, and the frame may only reference a session of that host: `--session`
+  must name a session in the profile it is published on (exit 2 otherwise).
+  Only `macapp.app.focus`, which is about the app, may omit `--session`.
+  These box checks are defence in depth on top of the controller's: the
+  controller sets `--from-remote`, so they do not authenticate it.
+
+### Mac app checks
+
+The app is the other half of the contract. It must:
+
+- act only on frames read from the host and profile it follows, and treat a
+  frame's `session_id` as a session of that host: one the host's own session
+  list reported (sessions on other hosts are never addressed through it);
+- act on `macapp.browser.request` and `macapp.open` only for those sessions,
+  deduplicate by `event_id` (the key; `macapp.open` may also carry
+  `request_id`, which is optional, since older CLIs do not send it, and only
+  a hint), and answer on the same host and profile;
+- publish its replies only with the reply kinds above, and forget a
+  session's Browser state on `macapp.session.closed`.
 
 `cursor` and `dropped` reflect the profile across processes. `published`,
 `written`, `synced` and queue occupancy describe the process running the
@@ -163,3 +216,64 @@ The slice-1 registry bundle and this branch now share `origin/main` at
 `3b41e36d`, and both bundles verify. Slice 1 remains a separate branch; its
 registry is absent from this branch. Integration belongs to the later branch
 that combines the two slices.
+
+### App-side checks (Mac app)
+
+These checks live in the Mac app, not in the CLI, and land in it in steps:
+each one applies from the Mac app build that includes it, and older builds do
+not have it. Details are in docs/macapp-open.md, "App-side checks (Mac app)".
+
+- Per-session consent for `macapp.browser.request`, keyed by host and
+  session: allow once, allow for this session, or deny. No answer is a deny.
+  Grants are listed and revocable in Settings and dropped with the session.
+- Pages from Boxes is off by default. An upgrade that had it on reads it as
+  off until the owner confirms once.
+- Box and local sessions both go through the address policy and the
+  filtering proxy, with the same allowlist. Loopback, private (`10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local
+  (`169.254.0.0/16`, `fe80::/10`), this Mac's own addresses and networks,
+  numeric IPv4 and IPv4-mapped IPv6 forms are refused. Loopback, link-local
+  and this Mac's own addresses stay refused whatever the allowlist says.
+  On the Chrome panel engine only the first address of an open is checked
+  for now.
+- One scratch profile per session (host and session), removed with the
+  session; "Use My Logins" is a per-session choice in the app.
+- The app reads `browser_profile`, and the old `profile` for one release
+  (`browser_profile` wins). A remote host naming either is refused.
+- The CLI opt-ins (`[browser] enabled`, `[macapp] plugins`) are not a
+  security boundary.
+
+Browser requests, acknowledgments, local launch fallback, and remote tar export are documented in [macapp-open.md](macapp-open.md).
+
+## Claude statusline metadata
+
+`usage ingest claude` and the installed `usage statusline-wrap` publish
+`usage.statusline` without the Mac app plugins gate. The frame's `session_id`
+is the owning agent-deck session ID when the native Claude ID resolves uniquely,
+or an empty string when it cannot be resolved. The data object contains only
+`claude_session_id`, `captured_at` (UTC RFC3339 with milliseconds), `model`
+(`id`, `display_name`), `cwd`, `context_window` (`used_percentage`,
+`context_window_size`, `total_input_tokens`, `total_output_tokens`) and
+`rate_limits` (`five_hour`, `seven_day`, each with `used_percentage` and epoch
+seconds `resets_at`). Unreported objects and numeric fields are null. Two
+string fields appear only when known: `account`, the configured Claude account
+slot whose config dir the status line ran under (`$CLAUDE_CONFIG_DIR`, else
+`~/.claude`), and `permission_mode`, the payload's `permission_mode` or else the
+newest `permissionMode` in the last 256 KiB of the transcript. Prompt text,
+transcript paths, cost data and additional payload keys are not retained.
+
+Use `usage statusline --session <id|title> --json` to read the current native
+conversation's last record. Missing or ambiguous records return
+`{"error":"no statusline record"}` with exit 1. Records are replaced per native
+ID; a known session retains only its latest native conversation. Registry
+removal prunes linked records. At most 128 unlinked records remain per
+profile. An unlinked record is kept in the feed profile when that profile
+already has a store, otherwise in the configured default profile when it has
+one; if neither exists, only the quota cache is written and no event is
+published, so a statusline update never creates a profile. The event log keeps
+its existing bounded retention.
+
+`events follow --json --kind usage.statusline` streams these records from the
+host that ran the ingest. Account-named hook feeds keep their original quota
+cache while statusline events go to the owning session's profile bus. The
+wrapper is not installed when `[claude] statusline_feed = false`.

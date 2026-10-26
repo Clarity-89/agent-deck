@@ -3,11 +3,16 @@ package core
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
+
+// ifIdleSendLockWait bounds how long restart --if-idle waits for a send in
+// progress before it skips.
+var ifIdleSendLockWait = 10 * time.Second
 
 // SessionRestartIn is the input of session.restart.
 type SessionRestartIn struct {
@@ -16,6 +21,7 @@ type SessionRestartIn struct {
 	All     bool              `json:"all,omitempty" doc:"Restart every active session"`
 	Force   bool              `json:"force,omitempty" doc:"Restart even if the session is healthy and fresh"`
 	Env     map[string]string `json:"env,omitempty" doc:"Environment variables for the restarted process"`
+	IfIdle  bool              `json:"if_idle,omitempty" doc:"Restart only if the session is still idle at an empty prompt, checked under the send lock"`
 }
 
 // SessionRestartOut is the output of session.restart. A single restart fills
@@ -87,6 +93,24 @@ func (deps Deps) sessionRestart(ctx context.Context, in SessionRestartIn) (Sessi
 		return out, nil
 	}
 
+	// IfIdle (the idle build refresh): hold the send lock from the last idle
+	// check through the restart and save, so a send or wake in between is
+	// either seen by the check or delivered to the new process, never lost.
+	if in.IfIdle {
+		lock, err := session.AcquireSendLock(inst.ID, ifIdleSendLockWait)
+		if err != nil {
+			out.Skipped, out.Reason = true, "a send is in progress"
+			return out, nil
+		}
+		defer lock.Release()
+		if blocker := inst.IdleRefreshRecheck(); blocker != "" {
+			out.Skipped, out.Reason = true, "not idle: "+blocker
+			return out, nil
+		}
+		inst.SkipConductorRecoveryTurn()
+		inst.SetRestartReason(session.RestartReasonIdleBuildRefresh)
+	}
+
 	if err := inst.RestartWithEnv(in.Env); err != nil {
 		return SessionRestartOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to restart session: %v", err), Cause: err}
 	}
@@ -97,7 +121,7 @@ func (deps Deps) sessionRestart(ctx context.Context, in SessionRestartIn) (Sessi
 	// A warning is both part of the typed result and an envelope warning;
 	// the duplication is intentional (typed field for the CLI shape, generic
 	// list for any client).
-	if warning := inst.ConsumeCodexRestartWarning(); warning != "" {
+	if warning := strings.TrimSpace(inst.ConsumeCodexRestartWarning() + "\n" + inst.ConductorRecoveryWarning()); warning != "" {
 		out.Warning = warning
 		Warn(ctx, warning)
 		Emit(ctx, Event{Kind: EventRestartWarning, ID: inst.ID, Title: inst.Title, Message: warning})
@@ -151,7 +175,7 @@ func (d *sessionData) restartAll(ctx context.Context, in SessionRestartIn) (*Res
 		inst.LastStartedAt = time.Now()
 		restarted = append(restarted, inst.ID)
 
-		warning := inst.ConsumeCodexRestartWarning()
+		warning := strings.TrimSpace(inst.ConsumeCodexRestartWarning() + "\n" + inst.ConductorRecoveryWarning())
 		if warning != "" {
 			Warn(ctx, warning)
 			Emit(ctx, Event{Kind: EventRestartWarning, ID: inst.ID, Title: inst.Title, Message: warning})

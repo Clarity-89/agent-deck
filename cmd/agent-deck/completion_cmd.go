@@ -109,10 +109,11 @@ var completionTree = []completionNode{
 	{name: "accounts"},
 	{name: "web"},
 	{name: "debug-dump"},
+	{name: "perf"},
 	{name: "migrate-paths"},
 	{name: "uninstall"},
 	{name: "run-task"},
-	{name: "feedback"},
+	{name: "feedback", subs: []string{"bug", "idea"}},
 	{name: "telegram-doctor"},
 	{name: "version"},
 	{name: "help"},
@@ -133,8 +134,8 @@ var completionTree = []completionNode{
 			"start", "stop", "remove", "cleanup", "prune", "archive", "unarchive",
 			"restart", "revive", "fork", "handoff", "attach", "focus", "show",
 			"viewers", "current", "primer", "set-parent", "unset-parent", "update", "set-transition-notify",
-			"set-title-lock", "set", "switch-account", "move", "send", "approve",
-			"send-keys", "output", "children", "search",
+			"set-title-lock", "set", "switch-account", "switch-settle", "move", "send", "ref", "approve",
+			"send-keys", "command", "commands", "output", "children", "search",
 		},
 		args: map[string][]argKind{
 			"start":                 {argSession},
@@ -157,10 +158,14 @@ var completionTree = []completionNode{
 			"set-title-lock":        {argSession},
 			"set":                   {argSession},
 			"switch-account":        {argSession, argProfile},
+			"switch-settle":         {argSession},
 			"move":                  {argSession},
 			"send":                  {argSession},
+			"ref":                   {argSession, argSession},
 			"approve":               {argSession},
 			"send-keys":             {argSession},
+			"command":               {argSession},
+			"commands":              {argSession},
 			"output":                {argSession},
 			"children":              {argSession},
 		},
@@ -227,9 +232,10 @@ var completionTree = []completionNode{
 	{name: "oc", subs: []string{"sync", "bridge", "status", "list", "send"}},
 	{
 		name: "remote",
-		subs: []string{"add", "remove", "list", "sessions", "drain", "attach", "rename", "update"},
+		subs: []string{"add", "remove", "destroy", "list", "sessions", "drain", "attach", "rename", "update"},
 		args: map[string][]argKind{
 			"remove":   {argRemote},
+			"destroy":  {argRemote},
 			"sessions": {argRemote},
 			"attach":   {argRemote, argRemoteSession},
 			"rename":   {argRemote, argRemoteSession},
@@ -252,7 +258,10 @@ var completionTree = []completionNode{
 			"finish": {argSession},
 		},
 	},
-	{name: "costs", subs: []string{"sync", "summary", "recompute"}},
+	{name: "provider", subs: []string{"list", "test"}},
+	{name: "open"},
+	{name: "file", subs: []string{"bundle", "read", "roots"}},
+	{name: "costs", subs: []string{"sync", "summary", "recompute", "daily", "sessions", "models", "groups", "budgets"}},
 	{name: "hooks", subs: []string{"install", "uninstall", "status"}},
 	{name: "codex-hooks", subs: []string{"install", "uninstall", "status"}},
 	{name: "gemini-hooks", subs: []string{"install", "uninstall", "status"}},
@@ -314,7 +323,7 @@ func completionRules() []completionRule {
 func handleCompletion(args []string) {
 	if len(args) == 0 {
 		printCompletionHelp(os.Stderr)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	switch args[0] {
 	case "help", "--help", "-h":
@@ -328,7 +337,7 @@ func handleCompletion(args []string) {
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unknown shell %q (want bash, zsh, or fish)\n\n", args[0])
 		printCompletionHelp(os.Stderr)
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 

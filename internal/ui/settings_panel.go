@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -21,6 +22,7 @@ const (
 	SettingDefaultTool
 	SettingDangerousMode
 	SettingClaudeConfigDir
+	SettingClaudeDefaultAccount
 	SettingGeminiYoloMode
 	SettingCodexYoloMode
 	SettingHermesYoloMode
@@ -59,7 +61,7 @@ const (
 )
 
 // Total number of navigable settings.
-const settingsCount = 39
+const settingsCount = 40
 
 // SettingsPanel displays and edits user configuration
 type SettingsPanel struct {
@@ -109,6 +111,12 @@ type SettingsPanel struct {
 	statsShowGPU        bool
 	statsShowLoad       bool
 
+	// [claude].default_account (#2895) and the slots its radio row offers
+	// (ConfiguredAccountNames). The value is kept verbatim, so a slot removed
+	// from config survives an unrelated save until the row is moved.
+	claudeDefaultAccount string
+	claudeAccountSlots   []string
+
 	showSessionTimestamps  bool
 	showPaneTitles         bool
 	showOnlyInstalledTools bool
@@ -133,8 +141,8 @@ type SettingsPanel struct {
 // builtinToolNames and builtinToolValues are the built-in tools. Custom tools
 // from config are appended dynamically in LoadConfig.
 var (
-	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi"}
-	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp"}
+	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "OpenCode 2", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi"}
+	builtinToolValues = []string{"claude", "gemini", "opencode", "opencode2", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp"}
 )
 
 // Search tier names for radio selection
@@ -298,6 +306,8 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 			s.claudeConfigIsScope = true
 		}
 	}
+	s.claudeDefaultAccount = config.Claude.DefaultAccount
+	s.claudeAccountSlots = session.ConfiguredAccountNames(config)
 
 	// Gemini settings
 	s.geminiYoloMode = config.Gemini.YoloMode
@@ -400,7 +410,7 @@ func (s *SettingsPanel) buildToolLists(config *session.UserConfig) {
 
 	if len(config.Tools) > 0 {
 		builtins := map[string]bool{
-			"claude": true, "gemini": true, "opencode": true,
+			"claude": true, "gemini": true, "opencode": true, "opencode2": true,
 			"codex": true, "pi": true, "crush": true, "copilot": true,
 			"shell": true, "cursor": true, "aider": true, "hermes": true,
 			"deepseek": true, "muse": true, "omp": true,
@@ -450,6 +460,7 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	if !s.claudeConfigIsScope {
 		config.Claude.ConfigDir = s.claudeConfigDir
 	}
+	config.Claude.DefaultAccount = s.claudeDefaultAccount
 
 	// Gemini settings
 	config.Gemini.YoloMode = s.geminiYoloMode
@@ -682,6 +693,16 @@ func (s *SettingsPanel) adjustValue(delta int) bool {
 			changed = true
 		}
 
+	case SettingClaudeDefaultAccount:
+		idx := s.defaultAccountIndex() + delta
+		if idx >= 0 && idx <= len(s.claudeAccountSlots) {
+			s.claudeDefaultAccount = ""
+			if idx > 0 {
+				s.claudeDefaultAccount = s.claudeAccountSlots[idx-1]
+			}
+			changed = true
+		}
+
 	case SettingSearchTier:
 		newVal := s.searchTier + delta
 		if newVal >= 0 && newVal < len(tierNames) {
@@ -746,6 +767,17 @@ func (s *SettingsPanel) adjustValue(delta int) bool {
 	}
 
 	return changed
+}
+
+// defaultAccountIndex is the Default account radio index: 0 = None, i+1 =
+// claudeAccountSlots[i]. A slot no longer configured reads as None.
+func (s *SettingsPanel) defaultAccountIndex() int {
+	for i, name := range s.claudeAccountSlots {
+		if name == s.claudeDefaultAccount {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 // toggleValue toggles a checkbox value
@@ -902,13 +934,20 @@ func (s *SettingsPanel) handleTextEdit(msg tea.KeyMsg) (*SettingsPanel, tea.Cmd,
 
 	case "backspace":
 		if len(s.textBuffer) > 0 {
-			s.textBuffer = s.textBuffer[:len(s.textBuffer)-1]
+			// Drop the whole last rune, not one byte, so non-ASCII paths stay valid UTF-8.
+			_, size := utf8.DecodeLastRuneInString(s.textBuffer)
+			s.textBuffer = s.textBuffer[:len(s.textBuffer)-size]
 		}
 
 	default:
-		// Add character
-		if len(key) == 1 {
-			s.textBuffer += key
+		// Add typed characters. msg.String() is longer than one byte for
+		// non-ASCII runes, so append the runes themselves. Alt-chords and
+		// bracketed pastes stay ignored, as before.
+		switch {
+		case msg.Type == tea.KeyRunes && !msg.Alt && !msg.Paste:
+			s.textBuffer += string(msg.Runes)
+		case msg.Type == tea.KeySpace && !msg.Alt:
+			s.textBuffer += " "
 		}
 	}
 
@@ -1008,6 +1047,17 @@ func (s *SettingsPanel) View() string {
 		line += s.claudeConfigDir
 	}
 	if s.cursor == int(SettingClaudeConfigDir) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	// Default account (#2895): the slot new sessions start on.
+	accountNames := append([]string{"None"}, s.claudeAccountSlots...)
+	line = "Default account: " + s.renderRadioGroup(accountNames, s.defaultAccountIndex(), s.cursor == int(SettingClaudeDefaultAccount))
+	if s.claudeDefaultAccount != "" && s.defaultAccountIndex() == 0 {
+		line += dimStyle.Render(" (" + s.claudeDefaultAccount + " not configured)")
+	}
+	if s.cursor == int(SettingClaudeDefaultAccount) {
 		line = highlightStyle.Render(line)
 	}
 	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
@@ -1360,41 +1410,42 @@ func (s *SettingsPanel) View() string {
 			7,  // SettingDefaultTool
 			11, // SettingDangerousMode
 			12, // SettingClaudeConfigDir
-			15, // SettingGeminiYoloMode
-			18, // SettingCodexYoloMode
-			21, // SettingHermesYoloMode
-			24, // SettingCheckForUpdates
-			25, // SettingAutoUpdate
-			26, // SettingAutoInstall
-			27, // SettingAutoRestart
-			30, // SettingLogMaxSize
-			30, // SettingLogMaxLines (shares line with LogMaxSize)
-			31, // SettingRemoveOrphans
-			34, // SettingGlobalSearchEnabled
-			35, // SettingSearchTier
-			36, // SettingRecentDays
-			39, // SettingShowOutput
-			40, // SettingShowAnalytics
-			41, // SettingShowNotes
-			42, // SettingNotesOutputSplit
-			45, // SettingMaintenanceEnabled
-			48, // SettingStatsEnabled
-			49, // SettingStatsRefresh
-			50, // SettingStatsFormat
-			52, // SettingStatsShowCPU (row with RAM, Disk)
-			52, // SettingStatsShowRAM
-			52, // SettingStatsShowDisk
-			53, // SettingStatsShowNetwork (row with GPU, Load)
-			53, // SettingStatsShowGPU
-			53, // SettingStatsShowLoad
-			56, // SettingSyncTitle (SESSIONS section, after stats)
-			59, // SettingShowSessionTimestamps (DISPLAY section, after SESSIONS)
-			60, // SettingShowPaneTitles (DISPLAY section, after timestamps)
-			63, // SettingShowOnlyInstalledTools (TOOL PICKER section)
-			64, // SettingVisibleTools
-			67, // SettingEmbeddedTerminal (INTERFACE section)
-			68, // SettingSidebarDensity
-			73, // SettingPrivacy (PRIVACY section)
+			13, // SettingClaudeDefaultAccount
+			16, // SettingGeminiYoloMode
+			19, // SettingCodexYoloMode
+			22, // SettingHermesYoloMode
+			25, // SettingCheckForUpdates
+			26, // SettingAutoUpdate
+			27, // SettingAutoInstall
+			28, // SettingAutoRestart
+			31, // SettingLogMaxSize
+			31, // SettingLogMaxLines (shares line with LogMaxSize)
+			32, // SettingRemoveOrphans
+			35, // SettingGlobalSearchEnabled
+			36, // SettingSearchTier
+			37, // SettingRecentDays
+			40, // SettingShowOutput
+			41, // SettingShowAnalytics
+			42, // SettingShowNotes
+			43, // SettingNotesOutputSplit
+			46, // SettingMaintenanceEnabled
+			49, // SettingStatsEnabled
+			50, // SettingStatsRefresh
+			51, // SettingStatsFormat
+			53, // SettingStatsShowCPU (row with RAM, Disk)
+			53, // SettingStatsShowRAM
+			53, // SettingStatsShowDisk
+			54, // SettingStatsShowNetwork (row with GPU, Load)
+			54, // SettingStatsShowGPU
+			54, // SettingStatsShowLoad
+			57, // SettingSyncTitle (SESSIONS section, after stats)
+			60, // SettingShowSessionTimestamps (DISPLAY section, after SESSIONS)
+			61, // SettingShowPaneTitles (DISPLAY section, after timestamps)
+			64, // SettingShowOnlyInstalledTools (TOOL PICKER section)
+			65, // SettingVisibleTools
+			68, // SettingEmbeddedTerminal (INTERFACE section)
+			69, // SettingSidebarDensity
+			74, // SettingPrivacy (PRIVACY section)
 		}
 		cursorLine := rowOf[cursorToLine[s.cursor]]
 

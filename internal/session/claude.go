@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/sandboxguard"
 )
 
 // claudeDirNameRegex matches any character that's not alphanumeric or hyphen
@@ -386,6 +388,11 @@ type resolveOpts struct {
 // group config_dir also beats env (#1508) so both chains agree that a
 // config.toml-scoped group override wins over a shell-wide CLAUDE_CONFIG_DIR.
 func resolveClaudeConfigDir(opts resolveOpts) (path, source string) {
+	path, source = resolveClaudeConfigDirUnguarded(opts)
+	return sandboxedToolDir("Claude config dir (source "+source+")", path), source
+}
+
+func resolveClaudeConfigDirUnguarded(opts resolveOpts) (path, source string) {
 	userConfig, _ := LoadUserConfig()
 
 	groupPath := opts.groupPath
@@ -484,6 +491,12 @@ func envClaudeConfigDirIgnoringScratchLeak() string {
 	return expanded
 }
 
+// AmbientClaudeConfigDir returns the CLAUDE_CONFIG_DIR of this process's
+// environment as the resolver reads it (a worker-scratch leak ignored), or "".
+func AmbientClaudeConfigDir() string {
+	return envClaudeConfigDirIgnoringScratchLeak()
+}
+
 // GetClaudeConfigDir returns the Claude config directory for the active profile.
 func GetClaudeConfigDir() string {
 	path, _ := resolveClaudeConfigDir(resolveOpts{})
@@ -516,19 +529,12 @@ func GetClaudeConfigDirSourceForGroup(groupPath string) (path, source string) {
 	return resolveClaudeConfigDir(resolveOpts{groupPath: groupPath})
 }
 
-// conductorNameFromInstance extracts the conductor name from an Instance's
-// Title. Returns "" for non-conductor sessions. Mirrors the canonical pattern
-// used in env.go getConductorEnv (line 267) — single source of truth for
-// conductor name derivation from a session.
+// conductorNameFromInstance returns the conductor name of inst, or "" for
+// non-conductor sessions. Delegates to Instance.ResolveConductorName
+// (conductor_identity.go), the single source of truth: stable stored name
+// first, decorated-title fallback for old records.
 func conductorNameFromInstance(inst *Instance) string {
-	if inst == nil {
-		return ""
-	}
-	name := strings.TrimPrefix(inst.Title, "conductor-")
-	if name == "" || name == inst.Title {
-		return ""
-	}
-	return name
+	return inst.ResolveConductorName()
 }
 
 // GetClaudeConfigDirForInstance returns the Claude config directory for
@@ -539,8 +545,8 @@ func conductorNameFromInstance(inst *Instance) string {
 // Priority (most-specific → least-specific):
 //
 //  1. Instance.Account (#924) → [profiles.<account>.claude].config_dir
-//  2. [conductors.<name>.claude].config_dir — consulted only when
-//     Instance.Title starts with "conductor-"
+//  2. [conductors.<name>.claude].config_dir — consulted only when the
+//     instance resolves to a conductor (ResolveConductorName)
 //  3. [groups."<group>".claude].config_dir
 //  4. CLAUDE_CONFIG_DIR env var
 //  5. [profiles.<profile>.claude].config_dir
@@ -969,8 +975,8 @@ func claudeConfigDirRootsForInstance(inst *Instance) []string {
 		}
 	}
 
-	if home, err := os.UserHomeDir(); err == nil {
-		add(filepath.Join(home, ".claude"))
+	if dir, err := sandboxguard.HomeJoin("Claude config dir (~/.claude)", ".claude"); err == nil {
+		add(dir)
 	}
 
 	return roots

@@ -113,6 +113,27 @@ type toolDataBlob struct {
 	// struct do — MergeToolDataExtras would otherwise treat the omission as
 	// "a binary that doesn't know this key" and resurrect the old value.
 	ContextLevel string `json:"context_level,omitempty"`
+	// PromptSuggestions is the per-session prompt-suggestions override
+	// (internal/session/prompt_suggestions.go), listed for the same reason as
+	// ContextLevel: clearing it must not be undone by MergeToolDataExtras.
+	PromptSuggestions string `json:"prompt_suggestions,omitempty"`
+	// WaitTimeout is the per-session wait timer (internal/session/
+	// wait_timer.go), listed for the same reason as ContextLevel: clearing it
+	// must not be undone by MergeToolDataExtras.
+	WaitTimeout string `json:"wait_timeout,omitempty"`
+	// IntendedSwitch is the per-session intended account/model switch record
+	// (internal/session/intended_switch.go), listed for the same reason as
+	// ContextLevel: clearing it must not be undone by MergeToolDataExtras.
+	IntendedSwitch json.RawMessage `json:"intended_switch,omitempty"`
+	// LimitVerdictResetAt is when the session's account or model last changed
+	// (internal/session/limit_verdict_reset.go), listed for the same reason as
+	// ContextLevel: clearing it must not be undone by MergeToolDataExtras.
+	LimitVerdictResetAt json.RawMessage `json:"limit_verdict_reset_at,omitempty"`
+	// QueuedMessage is a queued session's pending -m prompt
+	// (internal/session/queued_start.go), listed for the same reason as
+	// ContextLevel: clearing it once delivered must not be undone by
+	// MergeToolDataExtras, or a later save would resurrect it.
+	QueuedMessage string `json:"queued_message,omitempty"`
 }
 
 // multiRepoWorktreeBlob is the JSON representation of a multi-repo worktree in tool_data.

@@ -68,8 +68,8 @@ Four adapters are wired into the CLI today. All four embody the doorbell model �
 
 | Type | What it listens for | Required flag | Transport |
 |------|---------------------|---------------|-----------|
-| `webhook` | Any service that can fire an HTTP POST | `--port <int>` | Local HTTP listener |
-| `github` | GitHub repo events (issues, PRs, pushes) | `--secret <hmac-secret>` | HTTPS webhook + HMAC-SHA256 verify |
+| `webhook` | Any service that can fire an HTTP POST | `--port <int>` | Local HTTP listener, signed with a shared secret |
+| `github` | GitHub repo events (issues, PRs, pushes) | `$GITHUB_WEBHOOK_SECRET` or `--secret-file <path>` (chmod 600) | HTTPS webhook + HMAC-SHA256 verify |
 | `ntfy` | [ntfy.sh](https://ntfy.sh) topics (phone → conductor) | `--topic <name>` | Persistent SSE subscription |
 | `slack` | Slack messages via a Cloudflare Worker bridge into an ntfy topic | `--topic <name>` | Slack → CF Worker → ntfy → watcher |
 
@@ -83,6 +83,7 @@ Verified against `agent-deck watcher --help`:
 agent-deck watcher create <type> --name <name> [options]
 agent-deck watcher start <name>
 agent-deck watcher stop <name>
+agent-deck watcher reload [--json] [--timeout 15s]
 agent-deck watcher list [--json]
 agent-deck watcher status <name> [--json]
 agent-deck watcher test <name>
@@ -95,9 +96,9 @@ The usual loop:
 
 ```bash
 # Create the watcher (writes ~/.agent-deck/watcher/<name>/ with watcher.toml + state.json).
-agent-deck watcher create github --name gh-alerts --secret "$GITHUB_WEBHOOK_SECRET"
+GITHUB_WEBHOOK_SECRET=... agent-deck watcher create github --name gh-alerts
 
-# Activate it (picked up by the engine on the next tick).
+# Activate it (the profile's watcher engine runs it within seconds).
 agent-deck watcher start gh-alerts
 
 # Confirm: list shows status + events/hour; status shows recent events.
@@ -109,6 +110,10 @@ agent-deck watcher test gh-alerts
 ```
 
 `agent-deck watcher routes` prints the currently-loaded routing rules across every watcher, so you can double-check which conductor or group owns which event types.
+
+Which process runs the watchers: every long-lived agent-deck process of a profile (the TUI, `agent-deck web`, or a headless `agent-deck web --no-tui`) can run the profile's watcher engine, and exactly one does. The first to start with a watcher marked running takes the engine owner lock, `watcher-engine.lock` in the profile's runtime dir next to the daemon's `daemon.lock`, and runs every watcher marked running. The others wait and retry every few seconds, so when the owner exits one of them takes over, and a process with no running watcher holds no lock: the first watcher started on the profile runs within seconds. The debug log records the outcome as `watcher_engine_owner`, `watcher_engine_standby` (with the owner's pid), `watcher_engine_idle` or `watcher_engine_took_over`. The owner keeps its engine in step with the profile while it runs: every few seconds it starts the adapter of a watcher started since, stops the adapter of a watcher stopped or deleted, restarts the adapter of a watcher whose `[source]` table in `watcher.toml` changed, and swaps the routes when `clients.json` changed. That covers `watcher start` and `watcher stop` from the CLI and the TUI. Only the `[source]` table and `clients.json` are applied this way; other settings, such as the `[watcher]` table in config.toml, are read when the engine starts (an adapter started later uses the `max_silence_minutes` current at that time). The adapters of unchanged watchers are not touched, so their webhook ports stay bound and their ntfy or Slack streams stay connected. An adapter that is stopped or restarted hands on the events it had already accepted before it goes, and a routed event already in the send queue is delivered as before. A `watcher.toml` that does not parse, or is empty because it is being written, leaves that watcher's adapter as it is. A `clients.json` that does not parse leaves the routes as they were and is logged as `watcher_routes_reload_failed`; an empty one is taken for a file being written and changes nothing, while a deleted one means no routes. Each pass that changes something logs `watcher_engine_reloaded`, and a failure that repeats is logged once.
+
+`agent-deck watcher reload` asks the engine for that pass now and prints what it did: the watchers started, stopped and restarted, the ones whose adapter failed to start (a webhook whose port is busy, say) or whose `watcher.toml` does not parse, and whether the routes changed (`--json` for the same as JSON). It also retries a watcher whose adapter is not running, for example after its port was busy; the passes the engine runs by itself do not, so a watcher whose port stays busy is not retried every few seconds. A change the engine already applied by itself before the reload shows as unchanged. The request and the answer are the files `watcher-reload.request` and `watcher-reload.ack` next to `watcher-engine.lock`; no signal is sent to any process. With no engine running, `reload` says so and exits 0. It exits 1 when an adapter failed to start, a `watcher.toml` or `clients.json` did not parse, or the engine did not answer within `--timeout`, which is what an engine of an agent-deck older than `reload` does: such an engine applies watcher changes only when its process restarts.
 
 Conversational setup is also supported: `agent-deck watcher install-skill watcher-creator` drops a Claude Code skill into `~/.agent-deck/skills/pool/`, and inside an agent-deck Claude session you can then ask *"Use the watcher-creator skill to set up a GitHub watcher"*. The skill walks through adapter choice, required settings, and emits the exact `watcher create` command.
 
@@ -126,13 +131,46 @@ Each watcher gets its own directory at `~/.agent-deck/watcher/<name>/` with (REQ
 
 `clients.json` is where you decide *which* conductor wakes up for *which* event. Edit it by hand, or let `watcher create` prompt you for defaults. `agent-deck watcher routes` is the authoritative read-out.
 
+Delivery: a routed event reaches its conductor through the same durable outbox as `agent-deck session send --queue`. When the engine routes an event to a conductor it writes a record to the profile's send queue (`sendqueue/` in the profile directory), before it stores the event, and starts that conductor's detached `session send-worker`. The worker types the events into the conductor in the order they were routed, once the conductor is idle, and retries while the pane is busy or its composer holds a draft. It types each at most once: an attempt whose outcome it cannot prove settles as typed and is never typed again. The record outlives the process that routed the event, so a quit, a signal exit or a crash of the TUI or `web` process loses nothing, and an event for a stopped conductor waits until the conductor runs again. The same event routed twice (a replay after a restart, say) is queued once. Set `delivery_deadline` under `[watcher]` in config.toml (a duration such as `"72h"`) to fail an event that has waited that long instead; unset, it waits until the conductor takes it. `agent-deck watcher status <name>` shows, per conductor, how many routed events still wait and since when (`undelivered` in `--json`), and so does each health state the engine reports.
+
+Queue cap: the outbox keeps at most 1000 undelivered routed events, and at most 64 MiB of their message text, per watcher and conductor. A webhook watcher bound to loopback with no `secret` accepts unsigned requests from any local process, and each request is a new event, so without a cap one local process could fill the disk while the conductor is stopped or busy. The cap is per watcher, so a flood stays inside the watcher it comes through: a signed GitHub watcher routed to the same conductor keeps its own 1000 slots and is still queued. There is no shared per-conductor ceiling on top, because any ceiling one watcher can fill alone would let it refuse the others again; the total stays bounded by the number of watchers you configure. Past a watcher's cap its new events for that conductor are refused, not queued, and are never delivered later: they are stored in the watcher's event history (`watcher_events` in the profile's state.db) like delivered ones, so the history alone does not tell them apart. The refusal is counted instead: state.db keeps, per watcher and conductor, how many events were refused and when the first and the last were. `agent-deck watcher status <name>` shows it (`refused` in `--json`, with `count`, `first_refused_at` and `last_refused_at`), so does each health state the engine reports, and a watcher with a refusal in the last hour is in warning, so the health alert below goes to its conductor. The events already queued are delivered in order and none is dropped. The engine logs `watcher_delivery_queue_full` at most once a minute per watcher and conductor, with the running total (`refused_total`) and the refusals since the previous warning, and the outbox logs `watcher_delivery_queue_has_room`, naming the watcher, once it queues that watcher's events for that conductor again.
+
+Health alerts follow the same routing. While the engine runs, a watcher that moves into warning or error sends one `[WATCHER HEALTH ALERT]` line to its conductor, and one `[WATCHER HEALTH RECOVERED]` line when it is healthy again. A watcher that stays in the same state sends nothing more. The conductor is the one set on the watcher row if any, else the one its newest routed event went to, else the only conductor `clients.json` names. If `clients.json` names several and the watcher has no routed events yet, the alert waits and the engine's process logs `watcher_health_alert_no_conductor`. Alerts are typed by the engine's process, not queued: one that is still waiting when that process exits is dropped, and the next engine owner restates each watcher's state. An alert takes the conductor's send lock like any `session send`, so it never lands in the pane together with a routed event.
+
 Dedupe is SQL-level: `INSERT OR IGNORE INTO watcher_events (watcher_name, event_id, ...)`. Retries from the sender (GitHub re-fires when its delivery times out, ntfy replays when the subscriber reconnects) cannot double-fire a conductor. Turning this off requires an RFC.
+
+Restart catch-up (ntfy and slack): `state.json` keeps `dedup_cursor`, the ntfy message ID of the last event the engine stored. On start the adapter subscribes with `since=<that ID>`, so messages published to the topic while agent-deck was down are fetched and handled once. Replay is bounded: a fresh watcher only streams new messages, and a cursor older than 24 hours resumes from 24 hours ago instead (the ntfy server's own message cache, 12 hours by default on ntfy.sh, limits it further). Set `resume_max_age` in the watcher's `[source]` table to change the bound (a duration such as `"6h"`; `"0"` turns catch-up off).
 
 ## Security guarantees
 
 - **GitHub adapter verifies HMAC-SHA256** on every webhook. Missing or invalid signature → event dropped, counter incremented, nothing forwarded. Removing this check requires an RFC (`CLAUDE.md` "Watcher structural changes requiring RFC").
 - **ntfy adapter** relies on topic secrecy. Use a long random topic name; anyone who knows it can publish to it.
-- **webhook adapter** binds to localhost by default; exposing it to the public internet is on you (use a reverse proxy + auth header).
+- **webhook adapter** binds to localhost by default and checks every request against the `secret` in its `[source]` table: it needs `X-Webhook-Timestamp: <unix seconds>` within 5 minutes of the watcher's clock and `X-Webhook-Signature-256: sha256=<hex HMAC-SHA256 of timestamp + "\n" + X-Webhook-Sender + "\n" + raw body>` (the sender is `""` when the header is absent), else 401. The signature covers the timestamp, the sender and the body, so a changed sender or a stale request is refused, and each signature is accepted once: a replay within the window gets 409 (the adapter remembers up to 10000 recent signatures in memory and answers 503 when that many are live; a restart forgets them, but the timestamp window still bounds a replay to 5 minutes). On a loopback bind `X-Webhook-Token: <secret>` is accepted instead; it is the secret itself, unsigned, so any local process that sees such a request can replay it or change its sender, and on a non-loopback bind it is refused (401). The secret is trimmed and must be at least 16 bytes of printable ASCII with no space, `"` or `\`, or the watcher fails to start. `X-Webhook-Subject` is not covered by the signature: treat it as a display hint only. `watcher create webhook` generates that secret (or takes `$WEBHOOK_SECRET` / `--secret-file <path>`, chmod 600) and prints where it is stored. Any request with an `Origin` header is refused (403), since only browser pages send one, and on a loopback bind with no secret a `Host` other than `localhost`, `127.0.0.1` or `[::1]` is refused too (403; a signed request may come through a tunnel or proxy). Every refusal is logged as `webhook_refused` with its reason. `X-Webhook-Sender`, which picks the routed conductor, is only trusted when the signature covers it, from a loopback token request, or from a local process when no secret is set. A `watcher.toml` that exists but does not parse fails that watcher's start with an error naming the file, instead of starting it with default (unsigned) settings. Without a secret the adapter refuses to start on a non-loopback bind and logs a WARNING on loopback; `--no-secret` creates such a watcher on purpose.
+
+  Example sender; it reads the secret from the file, so the secret never appears in a process's arguments (`/proc/<pid>/cmdline`):
+
+  ```bash
+  python3 - <<'EOF'
+  import hashlib, hmac, re, time, urllib.request
+  toml = open("<watcher dir>/watcher.toml").read()
+  secret = re.search(r'^secret = "(.*)"$', toml, re.M).group(1).encode()
+  body, sender, ts = b'{"text":"hello"}', 'my-service', str(int(time.time()))
+  sig = hmac.new(secret, (ts + '\n' + sender + '\n').encode() + body, hashlib.sha256).hexdigest()
+  req = urllib.request.Request('http://127.0.0.1:9000/webhook', data=body, headers={
+      'X-Webhook-Timestamp': ts, 'X-Webhook-Sender': sender, 'X-Webhook-Signature-256': 'sha256=' + sig})
+  print(urllib.request.urlopen(req).status)
+  EOF
+  ```
+
+  Token form, loopback bind only, with the header in a chmod-600 file:
+
+  ```bash
+  (umask 077; printf 'X-Webhook-Token: %s\n' "$(sed -n 's/^secret = "\(.*\)"$/\1/p' '<watcher dir>/watcher.toml')" > '<watcher dir>/token-header')
+  curl -sS http://127.0.0.1:9000/webhook -H @'<watcher dir>/token-header' \
+    -H 'X-Webhook-Sender: my-service' --data-binary 'hello'
+  ```
+
+  **Upgrading:** a webhook watcher created before this change has no `secret` and keeps working on `127.0.0.1`, with a startup WARNING. Its senders may not send an `Origin` header, and must address it as `localhost`, `127.0.0.1` or `[::1]`. A watcher with `bind = "0.0.0.0"` (or any non-loopback address) and no secret no longer starts: add `secret = "<output of: openssl rand -hex 32>"` under `[source]` in its `watcher.toml` (chmod 600) and have its senders sign with it, or set `bind = "127.0.0.1"`.
 - **slack adapter** rides on top of the ntfy adapter, so it inherits ntfy's topic-secrecy threat model plus whatever you put in front of your Cloudflare Worker.
 
 ## Custom external watchers
@@ -193,7 +231,7 @@ The watcher does not know which of these happens. That is the separation of conc
 
 ## Related docs
 
-- [CONDUCTOR.md](CONDUCTOR.md) — what the watcher is ringing the doorbell *for*.
+- [Conductor guide](../docs/conductor/README.md) — what the watcher is ringing the doorbell *for*.
 - [WATCHDOG.md](WATCHDOG.md) — keeps the conductor alive so the doorbell gets answered.
 - [SKILLS.md](SKILLS.md) — `watcher-creator` is a pool skill; this doc explains the two tiers and how to install skills.
 - `internal/watcher/` — the code. Start at `adapter.go` and `engine.go` to understand the data flow.

@@ -18,7 +18,13 @@ import (
 func handlePlugin(profile string, args []string) {
 	if len(args) == 0 {
 		printPluginHelp()
-		os.Exit(1)
+		exitCLI(1)
+	}
+	// Help after a subcommand must not run it: `plugin attached --help`
+	// opened (and created) the profile state DB before this guard.
+	if len(args) > 1 && helpRequested(args[1:]) {
+		printPluginHelp()
+		return
 	}
 	switch args[0] {
 	case "list", "ls":
@@ -34,7 +40,7 @@ func handlePlugin(profile string, args []string) {
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unknown plugin command %q\n", args[0])
 		printPluginHelp()
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -120,13 +126,14 @@ func handlePluginAttached(profile string, args []string) {
 	storage, instances, _, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	_ = storage
 
 	inst := resolvePluginSession(out, instances, identifier)
 	if inst == nil {
-		os.Exit(1)
+		exitCLI(2)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	if jsonOutput {
@@ -174,19 +181,20 @@ func pluginAttachOrDetach(profile string, args []string, op string) {
 
 	if len(pos) < 2 {
 		out.Error(fmt.Sprintf("Usage: agent-deck plugin %s <session-id|title> <plugin-name>", op), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	identifier, name := pos[0], pos[1]
 
 	storage, instances, groupsData, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	inst := resolvePluginSession(out, instances, identifier)
 	if inst == nil {
-		os.Exit(1)
+		exitCLI(2)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	current := append([]string(nil), inst.Plugins...)
@@ -199,7 +207,7 @@ func pluginAttachOrDetach(profile string, args []string, op string) {
 			out.Print("", map[string]interface{}{
 				"id": inst.ID, "plugins": inst.Plugins, "noop": true,
 			})
-		} else {
+		} else if !quiet {
 			fmt.Printf("(%s noop) %s already %s\n", op, name, opPastTense(op))
 		}
 		return
@@ -214,51 +222,60 @@ func pluginAttachOrDetach(profile string, args []string, op string) {
 	old, _, mutErr := session.SetField(inst, session.FieldPlugins, strings.Join(updated, ","), nil)
 	if mutErr != nil {
 		out.Error(mutErr.Error(), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if err := saveSessionData(storage, instances, groupsData); err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
+	}
+
+	// Restart before reporting, so --json prints exactly one document: the
+	// success payload (with the restart outcome) or the restart error.
+	outcome := restartOutcomeFor(nil, false)
+	if restart {
+		if !inst.CanRestart() {
+			fmt.Fprintln(os.Stderr, "(skipping --restart: session is not in a restartable state)")
+		} else {
+			if !jsonOutput && !quiet {
+				fmt.Println("Restarting session to apply enabledPlugins...")
+			}
+			// See adoptStateDB: the restart records its new tmux name through the
+			// process-wide StateDB, which a CLI process does not have until now.
+			adoptStateDB(storage)
+			if err := inst.Restart(); err != nil {
+				out.Error(fmt.Sprintf("plugins saved, but restart failed: %s", err.Error()), ErrCodeNotFound)
+				exitCLI(1)
+			}
+			// The save above ran BEFORE the restart, so it recorded the tmux name
+			// the restart then killed. The replacement name is recorded at the
+			// chokepoint in Instance.restart (#1870) rather than by repeating that
+			// whole-snapshot save, which would push rows loaded before a
+			// seconds-long restart back over another process's concurrent edits.
+			//
+			// An unrecorded name is reported, not fatal: the plugin change and the
+			// restart both succeeded, and exiting non-zero here would invite a
+			// retry that leaks another tmux session.
+			outcome = restartOutcomeFor(inst, true)
+			outcome.warn(os.Stderr)
+		}
 	}
 
 	if jsonOutput {
-		out.Print("", map[string]interface{}{
+		payload := map[string]interface{}{
 			"id":       inst.ID,
 			"old":      old,
 			"new":      strings.Join(inst.Plugins, ","),
 			"plugins":  inst.Plugins,
 			"channels": inst.Channels,
-		})
-	} else {
-		fmt.Printf("✓ %s plugin %q on %s: %q -> %q\n", capitalize(opPastTense(op)), name, inst.Title, old, strings.Join(inst.Plugins, ","))
-	}
-
-	if restart {
-		if !inst.CanRestart() {
-			fmt.Println("(skipping --restart: session is not in a restartable state)")
-			return
 		}
-		fmt.Println("Restarting session to apply enabledPlugins...")
-		// See adoptStateDB: the restart records its new tmux name through the
-		// process-wide StateDB, which a CLI process does not have until now.
-		adoptStateDB(storage)
-		if err := inst.Restart(); err != nil {
-			out.Error(fmt.Sprintf("restart failed: %s", err.Error()), ErrCodeNotFound)
-			os.Exit(1)
+		if restart {
+			outcome.addTo(payload)
 		}
-		// The save above ran BEFORE the restart, so it recorded the tmux name
-		// the restart then killed. The replacement name is recorded at the
-		// chokepoint in Instance.restart (#1870) rather than by repeating that
-		// whole-snapshot save, which would push rows loaded before a
-		// seconds-long restart back over another process's concurrent edits.
-		//
-		// An unrecorded name is reported, not fatal: the plugin change and the
-		// restart both succeeded, and exiting non-zero here would invite a
-		// retry that leaks another tmux session.
-		outcome := restartOutcomeFor(inst, true)
-		outcome.warn(os.Stderr)
+		out.Print("", payload)
+		return
 	}
+	out.Success(fmt.Sprintf("%s plugin %q on %s: %q -> %q", capitalize(opPastTense(op)), name, inst.Title, old, strings.Join(inst.Plugins, ",")), nil)
 }
 
 func pluginListMutation(current []string, name, op string) []string {
@@ -305,13 +322,13 @@ func resolvePluginSession(out *CLIOutput, instances []*session.Instance, identif
 		out.Error("no session identifier given and not running inside an agent-deck tmux session", ErrCodeInvalidOperation)
 		return nil
 	}
-	for _, inst := range instances {
-		if inst.ID == identifier || inst.Title == identifier {
-			return inst
-		}
+	// Same resolution as every other session command: ID prefix, title
+	// (AMBIGUOUS when shared), path or location.
+	inst, errMsg, errCode := ResolveSession(identifier, instances)
+	if inst == nil {
+		out.Error(errMsg, errCode)
 	}
-	out.Error(fmt.Sprintf("session %q not found", identifier), ErrCodeNotFound)
-	return nil
+	return inst
 }
 
 func parsePluginListFlags(args []string) (jsonOutput, quiet bool) {

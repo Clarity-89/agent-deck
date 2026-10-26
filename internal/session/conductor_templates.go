@@ -6,6 +6,9 @@ import "strings"
 // generated template. Installers compare its fully rendered form byte-for-byte
 // before migrating, so any user customization is preserved.
 func previousConductorInstructionsTemplate(template string) string {
+	template = preHarnessControlConductorInstructionsTemplate(template)
+	template = prePlainReadConductorInstructionsTemplate(template)
+	template = preNoOpNoticeRuleConductorInstructionsTemplate(template)
 	template = preBackgroundWorkConductorInstructionsTemplate(template)
 	// Issue #2469 (comms redesign): the heartbeat section gained the
 	// prompt-time drain wording and the record tiers paragraph. Revert them so
@@ -55,6 +58,39 @@ fallback — together they guarantee no completion is missed whether you are bus
 // shared template's substate paragraph.
 const conductorBackgroundWorkGuidance = " `background-work` (shown as coarse status `running`) means the child's turn ended but a Workflow, background agents, shells or a Monitor it started are still in flight (`background_work` in `session show --json` names the task and its n/m progress); leave it alone, it reports back and settles to `waiting` by itself."
 
+// The conductor reads a child with a plain `session output` (no -q): only a
+// plain read is remembered as the conductor having seen the result, so the
+// inbox notice for that turn withdraws itself. Earlier templates used -q,
+// which never counts (inbox_result_read.go).
+const (
+	conductorPlainReadRow  = "agent-deck -p <PROFILE> session output <id_or_title>"
+	conductorPlainCheckCmd = "agent-deck -p <PROFILE> session output <name>"
+	conductorPlainReadDoc  = " | Get the last response (plain read: the inbox notice for that turn withdraws itself; `-q` only for scripts that grep it) |"
+	conductorQuietReadDoc  = " | Get the last response (raw text, perfect for reading) |"
+)
+
+// prePlainReadConductorInstructionsTemplate reconstructs the template as it
+// was before the reads dropped -q, so a conductor file written then is
+// recognised as generated and migrated. Per-name templates carry neither
+// row: a no-op there.
+func prePlainReadConductorInstructionsTemplate(template string) string {
+	template = strings.Replace(template, "`"+conductorPlainReadRow+"`"+conductorPlainReadDoc, "`"+conductorPlainReadRow+" -q`"+conductorQuietReadDoc, 1)
+	return strings.Replace(template, "`"+conductorPlainCheckCmd+"` and summarize", "`"+conductorPlainCheckCmd+" -q` and summarize", 1)
+}
+
+// conductorNoOpNoticeRule is the paragraph added to the shared template
+// after v1.16.29: no reply to a notice that needs no action (prime-agent's
+// "no reply to no-op notices" rule).
+const conductorNoOpNoticeRule = "\n\n**No-op notices get no reply.** A record or message that needs nothing from you (a pure acknowledgement such as \"ok\", \"thanks\" or \"noted\", or a status ping that changes nothing) is a no-op notice: do not answer it, do not send anything back to the child, just end the turn. Replying only starts another round trip. A `[HEARTBEAT]` is not a no-op notice; answer it in the format below."
+
+// preNoOpNoticeRuleConductorInstructionsTemplate reconstructs the template
+// as v1.16.25-v1.16.29 shipped it, before conductorNoOpNoticeRule, so a
+// conductor written by those releases is recognised as generated and
+// migrated. Per-name templates never carried the rule: a no-op there.
+func preNoOpNoticeRuleConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorNoOpNoticeRule, "", 1)
+}
+
 // preBackgroundWorkConductorInstructionsTemplate reconstructs the template as
 // v1.16.24 shipped it, before #2473 added the background-work sentence, so a
 // conductor written by v1.16.24 is recognised as generated and migrated.
@@ -93,6 +129,20 @@ func preHumanTierConductorInstructionsTemplate(template string) string {
 	return strings.Replace(template, conductorHeartbeatReplyDoc, conductorHeartbeatReplyDocV0, 1)
 }
 
+// conductorHarnessControlQuickCommandRow is the `/cmd` quick-command row the
+// session command change added to the shared template's Quick Commands table.
+// v1.16.25 through v1.16.29 shipped the template without it.
+const conductorHarnessControlQuickCommandRow = "| `/cmd <session> <slash command>` (also `cmd ...` without the leading slash) | Run a Claude Code client command (`/model <id>`, `/compact`, `/clear`, `/exit`, any slash command or skill) on that session: run `agent-deck -p <PROFILE> session command --json --wait-idle 60s <session> '<slash command>'` (single quotes, so `$(...)` and backticks in the text are never expanded; write a `'` inside it as `'\\''`; add `--background` when `<session>` is you). Reply with one short line from the JSON: `after` or the first `evidence` entry when `ok`, otherwise `code` and `error`. `/cmd <session> what can I run` runs `agent-deck -p <PROFILE> session commands --json <session>` instead. Never type a slash command with `session send` or tmux. |\n"
+
+// preHarnessControlConductorInstructionsTemplate reconstructs the template as
+// v1.16.25 through v1.16.29 shipped it, before the `/cmd` quick command, so a
+// conductor written by those releases is recognised as generated and
+// migrated. Per-name templates carry no Quick Commands table, so this is a
+// no-op there.
+func preHarnessControlConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorHarnessControlQuickCommandRow, "", 1)
+}
+
 // conductorHeartbeatReplyDoc is the tail of the heartbeat reply-format
 // example as of #2469 (urgent/info markers, conductor notify);
 // conductorHeartbeatReplyDocV0 is the wording v1.11.0-v1.16.24 shipped.
@@ -110,6 +160,8 @@ const (
 //
 // Verified against fixtures rendered from the actual shipped source
 // (testdata/conductor_templates_shipped.tsv): this reconstructs the
+// v1.16.25-v1.16.29 generation (before the /cmd quick command and the no-op notice rule; pinned by
+// TestShippedV11628SharedTemplateMigratesToHarnessControl), the
 // v1.16.24 generation (only the heartbeat reply format differs), the
 // v1.11.0-v1.16.10 generation and the v1.10.9-v1.10.11 generation. It does
 // NOT reconstruct v1.9.73 or v1.9.70, which shipped further template
@@ -118,10 +170,27 @@ const (
 // those releases is treated as user-edited and left alone.
 func conductorInstructionsGenerations(template string) []string {
 	var gens []string
-	// Chain: current -> minus the #2473 background-work sentence (unreleased
-	// main builds) -> minus the strict urgent rule (unreleased main builds)
-	// -> exactly what v1.16.24 shipped. The intermediate "new sentence with the
-	// old reply format" was never released, so it is not a generation.
+	// Newest first: main before the /cmd quick command, then the release
+	// with the no-op notice rule whose conductor reads still used -q, then
+	// what v1.16.25-v1.16.29 shipped (current minus all three). Every older
+	// generation is reconstructed from the latter.
+	if noCmd := preHarnessControlConductorInstructionsTemplate(template); noCmd != template {
+		gens = append(gens, noCmd)
+		template = noCmd
+	}
+	if quiet := prePlainReadConductorInstructionsTemplate(template); quiet != template {
+		gens = append(gens, quiet)
+		template = quiet
+	}
+	if shipped := preNoOpNoticeRuleConductorInstructionsTemplate(template); shipped != template {
+		gens = append(gens, shipped)
+		template = shipped
+	}
+	// Chain from that template: minus the #2473 background-work sentence
+	// (main builds between v1.16.24 and v1.16.25) -> minus the strict urgent
+	// rule (same builds) -> exactly what v1.16.24 shipped. The intermediate
+	// "new sentence with the old reply format" was never released, so it is
+	// not a generation.
 	base := template
 	if noBG := preBackgroundWorkConductorInstructionsTemplate(template); noBG != template {
 		gens = append(gens, noBG)
@@ -165,7 +234,7 @@ Each conductor has its own identity in its subdirectory and its own policy in PO
 ### Reading Session Output
 | Command | Description |
 |---------|-------------|
-| ` + "`" + `agent-deck -p <PROFILE> session output <id_or_title> -q` + "`" + ` | Get the last response (raw text, perfect for reading) |
+| ` + "`" + conductorPlainReadRow + "`" + ` | Get the last response (plain read: the inbox notice for that turn withdraws itself; ` + "`" + `-q` + "`" + ` only for scripts that grep it) |
 
 ### Sending Messages to Sessions
 | Command | Description |
@@ -227,7 +296,7 @@ Records are tiered and carry the child's own text (issue #2469): ` + "`" + `urge
 sentinel, an error, or an explicit question to you) wakes you;
 ` + "`" + `info` + "`" + ` (progress in a turn a background task started) waits for your next turn or a
 digest. Act on the text in the record. Do NOT run ` + "`" + `session output` + "`" + ` on a child whose
-record you already have unless the text is clipped and you need the rest.
+record you already have unless the text is clipped and you need the rest.` + conductorNoOpNoticeRule + `
 
 For child work still in flight, wait with one blocking ` + "`" + `agent-deck -p <PROFILE> session children --follow --until-done` + "`" + ` call. Do not spend turns repeatedly calling ` + "`" + `list --json` + "`" + ` or ` + "`" + `session children --json` + "`" + `.
 
@@ -321,9 +390,9 @@ You may receive these special commands (from remote channels or the CLI):
 |---------|------------|
 | ` + "`" + `/status` + "`" + ` | Run ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` and format a brief summary |
 | ` + "`" + `/sessions` + "`" + ` | Run ` + "`" + `agent-deck -p <PROFILE> list --json` + "`" + ` and list active sessions with status |
-| ` + "`" + `/check <name>` + "`" + ` | Run ` + "`" + `agent-deck -p <PROFILE> session output <name> -q` + "`" + ` and summarize what it's doing |
+| ` + "`" + `/check <name>` + "`" + ` | Run ` + "`" + conductorPlainCheckCmd + "`" + ` and summarize what it's doing |
 | ` + "`" + `/send <name> <msg>` + "`" + ` | Forward the message to that session via ` + "`" + `agent-deck -p <PROFILE> session send` + "`" + ` |
-| ` + "`" + `/help` + "`" + ` | List available commands |
+` + conductorHarnessControlQuickCommandRow + `| ` + "`" + `/help` + "`" + ` | List available commands |
 
 For any other text, treat it as a conversational message from the user. They might ask about session progress, give instructions for specific sessions, or ask you to create/manage sessions.
 

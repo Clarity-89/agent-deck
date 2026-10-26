@@ -24,7 +24,7 @@ const versionCheckInterval = 60 * time.Second
 
 // handleNotifyDaemon runs the always-on transition notifier daemon.
 func handleNotifyDaemon(args []string) {
-	fs := flag.NewFlagSet("notify-daemon", flag.ExitOnError)
+	fs := flag.NewFlagSet("notify-daemon", flag.ContinueOnError)
 	once := fs.Bool("once", false, "Run one sync pass and exit")
 
 	fs.Usage = func() {
@@ -40,8 +40,8 @@ func handleNotifyDaemon(args []string) {
 		return
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	// handleNotifyDaemon is dispatched from main()'s early command switch and
@@ -88,7 +88,7 @@ func handleNotifyDaemon(args []string) {
 	if err := daemon.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "notify-daemon error: %v\n", err)
 		_ = events.CloseDefault()
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -152,14 +152,29 @@ func initDaemonLogging() func() {
 // fresh. Recycling only on a definite mismatch (ShouldRecycleForVersion ignores
 // empty/unknown versions) means a transient read failure never flaps the daemon.
 func watchBinaryVersion(ctx context.Context, cancel context.CancelFunc) {
-	ticker := time.NewTicker(versionCheckInterval)
+	watchBinaryVersionAt(ctx, cancel, os.Executable, versionCheckInterval)
+}
+
+// watchBinaryVersionAt is watchBinaryVersion with the executable lookup and
+// interval as seams. The install path is resolved once, before the first
+// tick: after an upgrade swaps the binary (rename to <path>.old, new file into
+// <path>, remove .old), os.Executable on Linux reports the running inode as
+// "<path>.old (deleted)", which cannot be run, so probing it would read
+// "unknown" forever and the daemon would never recycle.
+func watchBinaryVersionAt(ctx context.Context, cancel context.CancelFunc, executable func() (string, error), interval time.Duration) {
+	exe, err := executable()
+	if err != nil || exe == "" {
+		return
+	}
+	exe = installedExePath(exe)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			onDisk := readOnDiskVersion()
+			onDisk := readOnDiskVersion(exe)
 			if session.ShouldRecycleForVersion(Version, onDisk) {
 				fmt.Fprintf(os.Stderr, "notify-daemon: binary upgraded (running %s, on-disk %s); recycling\n", Version, onDisk)
 				cancel()
@@ -169,16 +184,31 @@ func watchBinaryVersion(ctx context.Context, cancel context.CancelFunc) {
 	}
 }
 
-// readOnDiskVersion runs the current executable path with `version` and parses
-// the semver token. After an in-place upgrade the path holds the new bytes while
-// this process still runs the old inode, so this reads the NEW version. Returns
-// "" on any failure (treated as "unknown" -> no recycle).
-func readOnDiskVersion() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
+// installedExePath maps the path os.Executable reports for this process to
+// the install path an upgrade writes: Linux appends " (deleted)" once the
+// running file is unlinked, and the updater moves the running file to
+// <path>.old before the new one takes its place. The ".old" suffix is only
+// dropped when the install path exists, so an install that really ends in
+// ".old" keeps its name.
+func installedExePath(exe string) string {
+	p := strings.TrimSuffix(exe, " (deleted)")
+	if base, ok := strings.CutSuffix(p, ".old"); ok {
+		if _, err := os.Stat(base); err == nil {
+			return base
+		}
 	}
-	out, err := exec.Command(exe, "version").Output()
+	return p
+}
+
+// readOnDiskVersion runs the binary at the install path with `version` and
+// parses the semver token. After an in-place upgrade the path holds the new
+// bytes while this process still runs the old inode, so this reads the NEW
+// version. Returns "" on any failure (treated as "unknown" -> no recycle).
+func readOnDiskVersion(exe string) string {
+	// Bounded so a hung binary cannot stall the version watcher.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, installedExePath(exe), "version").Output() //nolint:gosec // G204: the path is this process's own install path (os.Executable), the argument is the fixed "version", no shell
 	if err != nil {
 		return ""
 	}
@@ -213,6 +243,9 @@ type notifyDaemonStart struct {
 	watchVersion        func(ctx context.Context, cancel context.CancelFunc)
 	headlessAutoInstall func(ctx context.Context)
 	healUpdateTimer     func()
+	// settlePending drops this service's own deferred launchd
+	// re-registration once launchd has started it again (nil: skipped).
+	settlePending func()
 }
 
 func realNotifyDaemonStart() notifyDaemonStart {
@@ -222,6 +255,34 @@ func realNotifyDaemonStart() notifyDaemonStart {
 		healUpdateTimer: func() {
 			healUpdateTimerAtDaemonStart(logging.ForComponent(logging.CompNotif))
 		},
+		settlePending: func() {
+			settleOwnPendingAtDaemonStart(os.Getppid(), daemonStartedAt, logging.ForComponent(logging.CompNotif))
+		},
+	}
+}
+
+// daemonStartedAt is when this process came up: a launchd deferral
+// recorded before it is one launchd has since answered by starting the
+// service again on the replaced binary.
+var daemonStartedAt = time.Now()
+
+// daemonSettlePending is update.SettleRespawnedService; a seam so tests
+// never read the host's pending marker.
+var daemonSettlePending = update.SettleRespawnedService
+
+// settleOwnPendingAtDaemonStart clears the daemon's own deferred launchd
+// re-registration once launchd has respawned it (2026-10-10: the notifier
+// stayed "pending" after it was already running the new build, because
+// every run inside it keeps the entry and the only run outside it, a TUI
+// tick, was parked in an attach all night). Only the service's main
+// process (parent launchd, pid 1) may settle: a child inheriting
+// XPC_SERVICE_NAME proves nothing about the service's own start.
+func settleOwnPendingAtDaemonStart(ppid int, startedAt time.Time, log *slog.Logger) {
+	if ppid != 1 {
+		return
+	}
+	if _, err := daemonSettlePending(update.RebootstrapOptions{Logger: log}, startedAt); err != nil {
+		log.Warn("launchagent_pending_settle_failed", "error", err.Error())
 	}
 }
 
@@ -244,6 +305,10 @@ func (s notifyDaemonStart) begin(ctx context.Context, cancel context.CancelFunc)
 	// The update timer heals the way the hooks do (#2472): once per daemon
 	// start, off the start path, gated by [updates] manage_timer.
 	go s.healUpdateTimer()
+
+	if s.settlePending != nil {
+		go s.settlePending()
+	}
 }
 
 // daemonEnsureUpdateTimer is the daemon's timer heal; a seam so tests never

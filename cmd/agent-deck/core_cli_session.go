@@ -16,7 +16,7 @@ import (
 // TestCoreRegistryMatchesLegacyHandlers); the work itself runs in internal/core.
 
 func cliSessionStart(profile string, args []string) {
-	fs := flag.NewFlagSet("session start", flag.ExitOnError)
+	fs := flag.NewFlagSet("session start", flag.ContinueOnError)
 	var jsonOutput jsonModeFlag
 	fs.Var(&jsonOutput, "json", "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
@@ -24,6 +24,7 @@ func cliSessionStart(profile string, args []string) {
 	message := fs.String("message", "", "Initial message to send once agent is ready")
 	messageShort := fs.String("m", "", "Initial message to send once agent is ready (short)")
 	messageFile := fs.String("message-file", "", "Read the initial message from a file ('-' for stdin); avoids shell quoting of long prompts")
+	ignoreBudget := fs.Bool("ignore-budget", false, ignoreBudgetFlagHelp)
 	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode when starting Gemini or Codex sessions")
 	attach := fs.Bool("attach", false, "Attach to the session after starting (requires an interactive terminal)")
 	noWait := fs.Bool("no-wait", false, "Return as soon as the process is spawned instead of waiting up to 3s for the tool's session id (a caller that attaches right away; the id is still captured by hooks)")
@@ -44,8 +45,8 @@ func cliSessionStart(profile string, args []string) {
 		fmt.Println("  git diff | agent-deck session start my-project --message-file -   # initial message from stdin")
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(jsonOutput.enabled(), *quiet || *quietShort)
@@ -53,6 +54,12 @@ func cliSessionStart(profile string, args []string) {
 	initialMessage, err := resolveMessageInput(mergeFlags(*message, *messageShort), *messageFile, os.Stdin)
 	if err != nil {
 		exitCLIError(out, &jsonOutput, core.IDSessionStart, core.CodeInvalidInput, err.Error(), 1)
+	}
+
+	// An initial message is a send: an enforced cost budget refuses it
+	// before the start.
+	if initialMessage != "" && !*ignoreBudget {
+		gateStartMessageBudget(profile, fs.Arg(0), out)
 	}
 
 	res := runCore(profile, &jsonOutput, core.IDSessionStart, core.SessionStartIn{
@@ -86,6 +93,10 @@ func cliSessionStart(profile string, args []string) {
 		return
 	}
 
+	if started.Warning != "" && !jsonOutput.enabled() {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", started.Warning)
+	}
+
 	// --attach suspends the CLI into tmux until the user detaches, so the
 	// success output is skipped. Refused loudly without a terminal or under
 	// --json; the session stays started in both cases.
@@ -96,10 +107,10 @@ func cliSessionStart(profile string, args []string) {
 		if err := attachInstanceInteractive(started.Instance); err != nil {
 			if errors.Is(err, errAttachNoTTY) {
 				fmt.Fprintf(os.Stderr, "Error: %v; session was started\n", err)
-				os.Exit(3)
+				exitCLI(3)
 			}
 			fmt.Fprintf(os.Stderr, "Error: failed to attach: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		return
 	}
@@ -112,6 +123,9 @@ func cliSessionStart(profile string, args []string) {
 		"success": true,
 		"id":      started.ID,
 		"title":   started.Title,
+	}
+	if started.Warning != "" {
+		jsonData["warning"] = started.Warning
 	}
 	if started.Tmux != "" {
 		jsonData["tmux"] = started.Tmux
@@ -129,7 +143,7 @@ func cliSessionStart(profile string, args []string) {
 }
 
 func cliSessionStop(profile string, args []string) {
-	fs := flag.NewFlagSet("session stop", flag.ExitOnError)
+	fs := flag.NewFlagSet("session stop", flag.ContinueOnError)
 	var jsonOutput jsonModeFlag
 	fs.Var(&jsonOutput, "json", "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
@@ -144,8 +158,8 @@ func cliSessionStop(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(jsonOutput.enabled(), *quiet || *quietShort)
@@ -179,15 +193,16 @@ func cliSessionStop(profile string, args []string) {
 }
 
 func cliSessionRestart(profile string, args []string) {
-	fs := flag.NewFlagSet("session restart", flag.ExitOnError)
+	fs := flag.NewFlagSet("session restart", flag.ContinueOnError)
 	var jsonOutput jsonModeFlag
 	fs.Var(&jsonOutput, "json", "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	force := fs.Bool("force", false, "Restart even if the session is already healthy and fresh (bypasses issue #30 guard)")
 	all := fs.Bool("all", false, "Restart all active sessions")
-	envFlags := make(envVarFlags)
-	fs.Var(&envFlags, "env", "Environment variable in KEY=VALUE format for the restarted process (can be repeated)")
+	ifIdle := fs.Bool("if-idle", false, "Restart only if the session is idle at an empty prompt, checked under the send lock (skipped otherwise); a conductor gets no recovery turn")
+	envFlags := newEnvVarFlags()
+	fs.Var(envFlags, "env", "Environment variable in KEY=VALUE format for the restarted process (can be repeated)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session restart [id|title] [options]")
@@ -208,6 +223,9 @@ func cliSessionRestart(profile string, args []string) {
 		fmt.Println("boots run at once, skips auth-held sessions, and STOPS early if several")
 		fmt.Println("restarts in a row die on authentication (reported as auth_tripped).")
 		fmt.Println()
+		fmt.Println("Run from inside the session it restarts, the restart is handed to a detached")
+		fmt.Println("agent-deck (it ends the calling pane); the receipt names its pid and log file.")
+		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
 		fmt.Println()
@@ -218,20 +236,28 @@ func cliSessionRestart(profile string, args []string) {
 		fmt.Println("  agent-deck session restart --all")
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
+	exitOnEnvFlagError(fs, envFlags)
 
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(jsonOutput.enabled(), quietMode)
 	human := !jsonOutput.enabled()
+
+	// #2897: from inside the target, the restart ends this process; hand it
+	// to a detached child.
+	if !*all && handOffSelfRestart(out, profile, args, fs.Arg(0)) {
+		return
+	}
 
 	res := runCore(profile, &jsonOutput, core.IDSessionRestart, core.SessionRestartIn{
 		Profile: profile,
 		Session: fs.Arg(0),
 		All:     *all,
 		Force:   *force,
-		Env:     envFlags,
+		Env:     envFlags.Map(),
+		IfIdle:  *ifIdle,
 	}, func(ev core.Event) {
 		if !human {
 			return
@@ -259,6 +285,9 @@ func cliSessionRestart(profile string, args []string) {
 	if restarted.All != nil {
 		renderRestartAll(out, &jsonOutput, res, restarted.All)
 		return
+	}
+	if restarted.Skipped {
+		markCLINoop() // the freshness or auth guard skipped it: not a restart
 	}
 
 	switch {
@@ -323,7 +352,7 @@ func renderRestartAll(out *CLIOutput, mode *jsonModeFlag, res *core.Result, all 
 
 	res.Finish()
 	if !all.OK() {
-		os.Exit(1)
+		exitCLI(1)
 	}
 }
 
@@ -354,4 +383,18 @@ func restartRowsJSON(rows []core.RestartRow) []map[string]interface{} {
 		out = append(out, m)
 	}
 	return out
+}
+
+// gateStartMessageBudget refuses `session start -m` on an enforced, spent
+// cost budget (enforceSendBudget). A session it cannot resolve is left to the
+// start itself, which reports it.
+func gateStartMessageBudget(profile, identifier string, out *CLIOutput) {
+	storage, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		return
+	}
+	defer func() { _ = storage.Close() }()
+	if inst, _, _ := ResolveSession(identifier, instances); inst != nil {
+		enforceSendBudget(profile, "start", storage, inst, instances, out, false, nil)
+	}
 }

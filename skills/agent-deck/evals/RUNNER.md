@@ -1,18 +1,57 @@
 # Running these evals
 
-Written per Anthropic's skill-creator method (`~/.claude/plugins/marketplaces/anthropic-agent-skills/skills/skill-creator/SKILL.md`).
+One skill, one eval set. Never use `claude -p` (or the skill-creator's `run_loop.py`, which shells out to it).
 
-## Trigger evals (`trigger_evals` in evals.json)
+| File | What it is |
+|---|---|
+| `promises.json` | What the skill teaches: one entry per teaching unit, with the file, heading and a verbatim `anchor` that must stay in the text, plus `checked_by` for promises a deterministic checker covers |
+| `evals.json` | Task evals (`evals`, `agent_friendliness_evals`) and trigger evals (`trigger_evals`) |
+| `check.py` | Deterministic checks and grading. No model calls |
+| `run.sh` | Runs every deterministic eval: `check.py static` and `mutate`, plus the script tests |
+| `drift-allow.json` | Invocations the CLI drift check skips on purpose, each with a reason |
 
-The skill-creator's own optimizer (`scripts/run_loop.py`) shells out to `claude -p`, which is banned for this task (see PROMPT.md SAFETY/DELIVERABLE). Two offline alternatives, in order of preference:
+## One command
 
-1. **`claude plugin eval`** (if this checkout is loaded as a plugin): point it at this skill and `evals/evals.json`'s `trigger_evals` block; it does not require `claude -p`.
-2. **Manual inline judgment** (what this refresh actually did): for each `should_trigger`/`should_not_trigger` query, compare it against the skill's frontmatter `description` and judge whether a reasonable triggering policy would consult this skill. This is weaker evidence than a real subagent run (no held-out test, no repeated sampling) but catches an obviously miscalibrated description without spawning processes.
+```bash
+skills/agent-deck/evals/run.sh                 # builds this checkout for the CLI check; ~30 s
+skills/agent-deck/evals/run.sh --answers a.json # also grade model answers (below)
+```
 
-## Task evals (`evals` in evals.json)
+`go test ./cmd/agent-deck/` runs `check.py static` and `mutate` too (`TestAgentDeckSkillEvalsDeterministic`), without the CLI check, which needs a built binary.
 
-Each has a `prompt` and a checkable `expected_output`. To score them for real: spawn a with-skill subagent per eval (Task/Agent tool, not `claude -p`) pointed at this skill directory, save its transcript, and grade the transcript against `expected_output` — same procedure as skill-creator's "Running and evaluating test cases" section, minus the `claude -p`-based description optimizer. This refresh authored the prompts and assertions and reasoned through expected behavior against the verified CLI truth table, but did not spawn the full with-skill/baseline subagent matrix (out of scope for a docs-and-evals-authoring pass at this budget) — see RESULTS.md for exactly what ran.
+## What the deterministic checks prove
 
-## Agent-friendliness evals (`agent_friendliness_evals` in evals.json, agent-deck skill only)
+- `static`:
+  - every promise's anchor is still under its heading;
+  - every task eval lists the promises it checks, cites its sources (`file#Exact heading`) and has `checks.must` regexes, and every `must` regex matches the text of its sources;
+  - trigger terms match the description (should trigger) or its "Not for" clause (near misses), and unrelated topics stay out of it;
+  - every promise is covered by a task eval or a script/Go test, except reference tables (`kind: reference`), which may be covered by the drift checks alone; `static` and `coverage` report those as drift-only;
+  - checks pin facts: no `must` is satisfied by the eval's own prompt, each eval has a `must` that matches at most 12 times across the skill, and cited headings are unique and narrower than a whole file;
+  - every key in config-reference.md's toml blocks is a toml tag in the Go source;
+  - with `--binary`, every `agent-deck ...` command and flag in the skill exists in that binary's `--help` (or, for a subcommand whose help is its parent's, in the CLI's flag definitions).
+- `mutate`: in a temp copy, deletes each eval's cited sections and garbles each trigger eval's terms; every eval must then fail. It also injects an invented flag, command and config key, which the drift checks must catch.
 
-Added per maintainer request. These check structured-output discipline (reads `confirmation`, not text), non-TTY safety (`--verify` needs `--yes` off a TTY), and the performance-budget claims in `agent-deck health`. Score the same way as task evals: run the prompt with the skill loaded, check the transcript against `expected_output`.
+### What they do not prove
+
+- `mutate` deletes whole sections. A fact changed in place survives `static` when another cited source, or a sibling clause, still satisfies the `must`. Examples: a default flipped from 2s to 30s, or `confirmation:"unknown"` rewritten while cli-reference still says it. The model runs catch some of these; the drift checks catch none.
+- Config defaults and values are not compared with the Go source: only the key names are checked.
+- A flag listed in the root help is accepted on every subcommand.
+
+## Task evals with a model
+
+Answer-only runs by fresh sub-agents (Workflow or Agent), never headless `claude -p`:
+
+1. **With skill:** the agent reads only a copy of the skill (SKILL.md first, then the references it needs), never `evals/`, and writes the commands and facts it would give the user.
+2. **Without skill:** the agent may run only `agent-deck <cmd> --help`.
+3. Save the answers as `{"answers": [{"id": 1, "answer": "..."}]}` and grade them with `check.py grade` (or `run.sh --answers`). An answer passes when every `must` regex matches and no `must_not` matches.
+
+Repeat the with-skill run 3 times. An eval is **flaky** when it passes 1 or 2 times out of 3. It is **weak** when it passes without the skill: tighten its checks to a fact only the skill gives, or mark it `help_answerable` when the skill adds nothing to `--help`. Record each run's numbers, with the date and the change that ran them.
+
+## Trigger evals
+
+A judge agent sees only the frontmatter `description` and decides for each query whether to load the skill. Compare its decisions with `should_trigger`. This is weaker than sampling a real triggering policy, but it catches a description that misses an area. `claude plugin eval` is the stronger option when this checkout is loaded as a plugin.
+
+## Adding or changing something
+
+- **New section in a reference:** add a promise for it, with an anchor copied verbatim from the text. Then add an eval that lists the promise, cites the section, and uses 2-4 `must` regexes that each name one fact from that section.
+- **Changed text under an eval:** run `run.sh`. A `must pattern not in its sources` failure means the fact moved or changed. Update the eval or the text, never just the regex.

@@ -22,9 +22,10 @@ import (
 type SlackAdapter struct {
 	server string       // ntfy server URL (e.g., "https://ntfy.sh")
 	topic  string       // topic name
+	token  string       // optional ntfy access token, sent as a Bearer header
 	client *http.Client // HTTP client for streaming requests
 
-	lastID string     // last received message ID for reconnect resumption
+	lastID string     // `since` for the next subscription: last handed-on message ID or the persisted resume position
 	mu     sync.Mutex // protects lastID
 
 	// initialBackoff and maxBackoff are configurable for testing.
@@ -54,6 +55,7 @@ type slackV2Payload struct {
 // Settings:
 //   - "topic": required ntfy topic name for Slack bridge
 //   - "server": ntfy server URL (default "https://ntfy.sh")
+//   - "token": optional ntfy access token for a protected topic
 func (a *SlackAdapter) Setup(_ context.Context, config AdapterConfig) error {
 	a.topic = config.Settings["topic"]
 	if a.topic == "" {
@@ -65,9 +67,17 @@ func (a *SlackAdapter) Setup(_ context.Context, config AdapterConfig) error {
 		a.server = "https://ntfy.sh"
 	}
 	a.server = strings.TrimRight(a.server, "/")
+	a.token = config.Settings["token"]
+	warnPublicNtfyTopic("slack", a.server, a.topic, a.token)
 
 	// Streaming client: no timeout on body reads (context handles cancellation).
 	a.client = &http.Client{Timeout: 0}
+
+	// Resume from the position the engine persisted, so messages published
+	// while agent-deck was down are fetched on the first subscription (#2538).
+	a.mu.Lock()
+	a.lastID = config.ResumeSince
+	a.mu.Unlock()
 
 	// Set defaults for backoff if not already set (tests may override before Listen).
 	if a.initialBackoff == 0 {
@@ -87,9 +97,15 @@ func (a *SlackAdapter) Listen(ctx context.Context, events chan<- Event) error {
 	backoff := a.initialBackoff
 
 	for {
-		err := a.streamOnce(ctx, events)
+		uptime, err := a.streamOnce(ctx, events)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		// A stream that stayed up at least the cap was healthy: the drop
+		// starts a fresh backoff instead of staying at the cap from earlier
+		// failures. One that drops at once keeps backing off.
+		if uptime >= a.maxBackoff {
+			backoff = a.initialBackoff
 		}
 		_ = err // logged by engine's runAdapter
 		select {
@@ -105,8 +121,9 @@ func (a *SlackAdapter) Listen(ctx context.Context, events chan<- Event) error {
 }
 
 // streamOnce opens a single NDJSON streaming connection and reads events until
-// the connection closes or the context is cancelled.
-func (a *SlackAdapter) streamOnce(ctx context.Context, events chan<- Event) error {
+// the connection closes or the context is cancelled. It returns how long the
+// stream stayed up after the server accepted it (0 if it never did).
+func (a *SlackAdapter) streamOnce(ctx context.Context, events chan<- Event) (time.Duration, error) {
 	a.mu.Lock()
 	lastID := a.lastID
 	a.mu.Unlock()
@@ -118,19 +135,23 @@ func (a *SlackAdapter) streamOnce(ctx context.Context, events chan<- Event) erro
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	if a.token != "" {
+		req.Header.Set("Authorization", "Bearer "+a.token)
 	}
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("ntfy server returned status %d", resp.StatusCode)
+		return 0, fmt.Errorf("ntfy server returned status %d", resp.StatusCode)
 	}
 
+	connected := time.Now()
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		var msg ntfyMessage
@@ -141,21 +162,25 @@ func (a *SlackAdapter) streamOnce(ctx context.Context, events chan<- Event) erro
 			continue // skip "open" and "keepalive" events
 		}
 
-		// Track last ID for reconnect resumption
+		// Copy the line: the scanner reuses its buffer, and the event can
+		// sit in a channel while the next line is read.
+		evt := a.normalizeSlackEvent(msg, append([]byte(nil), scanner.Bytes()...))
+		evt.Cursor = msg.ID
+
+		// Blocking send: the stream applies backpressure instead of dropping
+		// (a restart can replay a large backlog). The resume position only
+		// moves past a message once it was handed on (#2538).
+		select {
+		case events <- evt:
+		case <-ctx.Done():
+			return time.Since(connected), ctx.Err()
+		}
 		a.mu.Lock()
 		a.lastID = msg.ID
 		a.mu.Unlock()
-
-		evt := a.normalizeSlackEvent(msg, scanner.Bytes())
-
-		// Non-blocking send (drop event if channel full)
-		select {
-		case events <- evt:
-		default:
-		}
 	}
 
-	return scanner.Err()
+	return time.Since(connected), scanner.Err()
 }
 
 // normalizeSlackEvent converts an ntfy message into a normalized Event.
