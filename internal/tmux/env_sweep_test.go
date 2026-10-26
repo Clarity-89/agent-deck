@@ -332,37 +332,13 @@ func TestContainsToken_Boundaries(t *testing.T) {
 	}
 }
 
-func TestVersionSupportsNewSessionEnvFlag(t *testing.T) {
-	cases := []struct {
-		ver  string
-		want bool
-	}{
-		{"2.9", false},
-		{"3.0", false},
-		{"3.1c", false},
-		{"3.2", true},
-		{"3.2a", true},
-		{"3.7b", true},
-		{"4.0", true},
-		{"master", true},
-		{"next", true},
-		{"", false},
-		{"garbage", false},
-	}
-	for _, c := range cases {
-		if got := versionSupportsNewSessionEnvFlag(c.ver); got != c.want {
-			t.Errorf("versionSupportsNewSessionEnvFlag(%q) = %v, want %v", c.ver, got, c.want)
-		}
-	}
-}
-
 // TestStartCommandSpec_InjectsKillScope pins that session creation
 // carries the -e marker (on tmux >= 3.2) and that each launch gets a
 // unique value — the property that makes late async sweeps unable to
 // touch a restarted session.
 func TestStartCommandSpec_InjectsKillScope(t *testing.T) {
 	skipIfNoTmuxBinary(t)
-	if !supportsNewSessionEnvFlag() {
+	if !SupportsLaunchEnv() {
 		t.Skip("local tmux < 3.2: no -e support, injection intentionally disabled")
 	}
 	extractScope := func(args []string) string {
@@ -392,7 +368,7 @@ func TestStartCommandSpec_InjectsKillScope(t *testing.T) {
 func TestKillScope_EndToEnd_ReapsDaemonizedPaneChild(t *testing.T) {
 	skipUnlessSweepPlatform(t)
 	skipIfNoTmuxBinary(t)
-	if !supportsNewSessionEnvFlag() {
+	if !SupportsLaunchEnv() {
 		t.Skip("local tmux < 3.2: kill-scope pipeline disabled")
 	}
 	exe, err := os.Executable()

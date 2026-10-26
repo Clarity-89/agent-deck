@@ -175,7 +175,7 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	// environment, where killInternal reads it back to sweep daemonized
 	// survivors that left the pane tree. Gated on tmux >= 3.2 (`-e`
 	// support); older tmux gets no marker and no sweep.
-	if supportsNewSessionEnvFlag() {
+	if SupportsLaunchEnv() {
 		if scope := newKillScopeValue(s.InstanceID); scope != "" {
 			tmuxArgs = append(tmuxArgs, "-e", KillScopeEnvKey+"="+scope)
 		}
