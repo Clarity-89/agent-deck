@@ -562,12 +562,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	}
 
 	db := storage.GetDB()
-	tuiAlive := false
-	if db != nil {
-		if count, err := db.AliveInstanceCount(); err == nil && count > 0 {
-			tuiAlive = true
-		}
-	}
+	tuiAlive := db != nil && tuiOwnsStatus(db)
 
 	statuses := map[string]string{}
 	// substates holds the cached substate of instances this pass probed
