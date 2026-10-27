@@ -175,7 +175,7 @@ func findEnvMatchesProcFS(key, value string) ([]int, error) {
 		return nil, fmt.Errorf("env sweep: reading /proc: %w", err)
 	}
 	token := []byte(key + "=" + value)
-	uid := uint32(os.Geteuid())
+	uid := os.Geteuid()
 	var pids []int
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
@@ -189,7 +189,7 @@ func findEnvMatchesProcFS(key, value string) ([]int, error) {
 			continue
 		}
 		st, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || st.Uid != uid {
+		if !ok || int(st.Uid) != uid {
 			continue
 		}
 		environ, err := os.ReadFile("/proc/" + e.Name() + "/environ")
