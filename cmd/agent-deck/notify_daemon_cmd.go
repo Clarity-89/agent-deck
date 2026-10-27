@@ -24,17 +24,23 @@ const versionCheckInterval = 60 * time.Second
 
 // handleNotifyDaemon runs the always-on transition notifier daemon.
 func handleNotifyDaemon(args []string) {
+	if len(args) > 0 && args[0] == "install" {
+		handleNotifyDaemonInstall(args[1:])
+		return
+	}
 	fs := flag.NewFlagSet("notify-daemon", flag.ContinueOnError)
 	once := fs.Bool("once", false, "Run one sync pass and exit")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck notify-daemon [--once]")
+		fmt.Println("       agent-deck notify-daemon install [--json]")
 		fmt.Println()
-		fmt.Println("Run status-driven transition notification daemon.")
+		fmt.Println("Run status-driven transition notification daemon, or install it as a")
+		fmt.Println("launchd agent (macOS) or systemd user unit (Linux).")
 	}
-	// notify-daemon takes no positional operands (only --once), so a bare
-	// "help" can never collide with a legitimate data value; treat it the
-	// same as --help/-h (issue #2025).
+	// Besides the install subcommand, dispatched above, notify-daemon takes no
+	// operands, so a bare "help" can never collide with a legitimate data
+	// value; treat it the same as --help/-h (issue #2025).
 	if hooksHelpRequested(args) {
 		fs.Usage()
 		return
@@ -42,6 +48,11 @@ func handleNotifyDaemon(args []string) {
 
 	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
 		exitCLI(1)
+	}
+	// A mistyped subcommand must not start a foreground daemon instead.
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "Error: notify-daemon: unknown argument %q\n", fs.Arg(0))
+		exitCLI(2)
 	}
 
 	// handleNotifyDaemon is dispatched from main()'s early command switch and
@@ -90,6 +101,36 @@ func handleNotifyDaemon(args []string) {
 		_ = events.CloseDefault()
 		exitCLI(1)
 	}
+}
+
+// handleNotifyDaemonInstall implements `agent-deck notify-daemon install`. It
+// writes the same launchd agent or systemd unit `conductor setup` does, so
+// whichever of the two installed it last, one daemon runs.
+func handleNotifyDaemonInstall(args []string) {
+	fs := flag.NewFlagSet("notify-daemon install", flag.ContinueOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck notify-daemon install [--json]")
+		fmt.Println()
+		fmt.Println("Install and start the notify daemon as a launchd agent (macOS) or")
+		fmt.Println("systemd user unit (Linux), the same service `conductor setup` installs.")
+	}
+	// As for the daemon itself: "install help" asks for help, never installs.
+	if hooksHelpRequested(args) {
+		fs.Usage()
+		return
+	}
+	if err := parseCLIFlags(fs, args); err != nil {
+		exitCLI(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, false)
+	path, err := session.InstallTransitionNotifierDaemon()
+	if err != nil {
+		out.Error(fmt.Sprintf("installing the notify daemon: %v", err), ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
+	out.Success("Notify daemon installed: "+path, map[string]any{"success": true, "path": path})
 }
 
 // initDaemonLogging wires up structured file logging for the always-on daemon

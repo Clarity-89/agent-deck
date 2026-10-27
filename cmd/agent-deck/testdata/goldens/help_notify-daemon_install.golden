@@ -1,0 +1,4 @@
+Usage: agent-deck notify-daemon install [--json]
+
+Install and start the notify daemon as a launchd agent (macOS) or
+systemd user unit (Linux), the same service `conductor setup` installs.

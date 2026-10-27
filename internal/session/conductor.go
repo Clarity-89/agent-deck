@@ -3111,7 +3111,7 @@ func TransitionNotifierDaemonHint() string {
 				return fmt.Sprintf("Start notifier daemon with: launchctl load %s", plistPath)
 			}
 		}
-		return "Run 'agent-deck conductor setup <name>' to install notifier daemon"
+		return "Run 'agent-deck notify-daemon install' to install the notifier daemon"
 	case platform.PlatformLinux, platform.PlatformWSL2:
 		if !systemdUserAvailable() {
 			return "Run notifier manually: agent-deck notify-daemon"
@@ -3122,7 +3122,7 @@ func TransitionNotifierDaemonHint() string {
 				return "Start notifier daemon with: systemctl --user start agent-deck-transition-notifier"
 			}
 		}
-		return "Run 'agent-deck conductor setup <name>' to install notifier daemon"
+		return "Run 'agent-deck notify-daemon install' to install the notifier daemon"
 	default:
 		return "Run notifier manually: agent-deck notify-daemon"
 	}

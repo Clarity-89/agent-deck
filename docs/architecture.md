@@ -71,8 +71,9 @@ that model. `cmd/agent-deck-test-server` is a test-only server entry point.
 polls sessions, turns status changes into parent notifications (writes
 `inboxes/`), wakes conductors, raises desktop notifications, writes the comms
 ledger, drains remote talkback and starts the recall backfill. `conductor
-setup` installs it as a systemd user unit or launchd agent
-(`session.InstallTransitionNotifierDaemon`, `internal/session/conductor.go`).
+setup` and `notify-daemon install` install it as a systemd user unit or
+launchd agent (`session.InstallTransitionNotifierDaemon`,
+`internal/session/conductor.go`).
 
 **Hook handler** (`agent-deck hook-handler`, plus `codex-notify`). Short
 processes the harness itself starts on its hook events. They write

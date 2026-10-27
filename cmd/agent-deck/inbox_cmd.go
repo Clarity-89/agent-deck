@@ -391,7 +391,7 @@ func noNotifyDaemonNote(ws session.WriterStatus) string {
 	if ws.Running {
 		return ""
 	}
-	return "no notify-daemon running; completions are not being recorded, so an empty drain or 0 done does not mean nothing finished. Start one with `agent-deck notify-daemon` (`agent-deck conductor setup` installs it as a service)."
+	return "no notify-daemon running; completions are not being recorded, so an empty drain or 0 done does not mean nothing finished. Start one with `agent-deck notify-daemon` (`agent-deck notify-daemon install` installs it as a service)."
 }
 
 // reportWithdrawnRecords logs the records a drain retired unshown because

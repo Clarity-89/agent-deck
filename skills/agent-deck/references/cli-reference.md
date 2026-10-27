@@ -1115,7 +1115,7 @@ agent-deck conductor list [--profile <name>]
 - Heartbeat timers run per conductor (default every 15 minutes) and can be disabled with `--no-heartbeat`.
 - Heartbeat sends use non-blocking `session send --no-wait -q` to avoid timeout churn when sessions are busy.
 - Bridge daemon is installed only when Telegram and/or Slack is configured in `[conductor]`.
-- Transition notifier daemon (`agent-deck notify-daemon`) is installed by setup and sends event nudges on `running -> waiting|error|idle` transitions (parent first, then conductor fallback).
+- Transition notifier daemon (`agent-deck notify-daemon`) is installed by setup and sends event nudges on `running -> waiting|error|idle` transitions (parent first, then conductor fallback). `agent-deck notify-daemon install [--json]` installs the same daemon without a conductor.
 
 ### notify / outbox / tier-filter - What reaches the human (#2469)
 
