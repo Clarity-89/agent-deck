@@ -392,13 +392,21 @@ func handleEventsStats(args []string) {
 	}
 	stats := bus.Stats()
 	kinds, kindErr := bus.KindCounts()
+	// Only the events bus carries session.status, so only it has an owner.
+	var owner string
+	if !strings.EqualFold(strings.TrimSpace(*busFlag), "comms") {
+		if owner, err = session.StatusOwner(events.CurrentProfile()); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: events stats: status owner: %v\n", err)
+		}
+	}
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		payload := struct {
 			events.Stats
-			Kinds map[string]uint64 `json:"kinds"`
-		}{stats, kinds}
+			StatusOwner string            `json:"status_owner,omitempty"`
+			Kinds       map[string]uint64 `json:"kinds"`
+		}{stats, owner, kinds}
 		if err := enc.Encode(payload); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: encode stats: %v\n", err)
 			exitCLI(1)
@@ -414,6 +422,9 @@ func handleEventsStats(args []string) {
 	fmt.Printf("synced:    %d\n", stats.Synced)
 	fmt.Printf("dropped:   %d\n", stats.Dropped)
 	fmt.Printf("queue:     %d/%d\n", stats.QueueLen, stats.QueueCap)
+	if owner != "" {
+		fmt.Printf("owner:     %s\n", owner)
+	}
 	if kindErr == nil {
 		names := make([]string, 0, len(kinds))
 		for k := range kinds {

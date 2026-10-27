@@ -171,6 +171,9 @@ still reports a successful start, whatever its exit code).
 | notify daemon, no TUI | reloads Instances per pass, probes tmux; carries the previous pass's verdict and pending flip (`livePrior`) so the one-sample hold works | 1–3 s | `status` column on change |
 | `list --json`, `session show`, remote agent probe | one fresh pass, hooks cold-loaded, pane read; a persisted `running` is not treated as an observation | per call | nothing |
 
+`events stats --json` reports which of these owns a profile's statuses as
+`status_owner`: `tui`, `notify-daemon` or `none` (docs/events.md).
+
 ## Remote sessions
 
 `agent-deck remote sessions` runs `agent-deck list --json` over SSH on each

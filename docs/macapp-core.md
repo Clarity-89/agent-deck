@@ -11,7 +11,7 @@ read-only transcript and pane reads named below.
 | --- | --- | --- | --- |
 | Conversation rows for live and busy sessions | `recall timeline <session> --json [--since c] [--limit N] [--tail N]`; older pages with `--before <before_cursor> --limit N` | `[recall] enabled` | docs/recall-timeline.md, "Rows" |
 | Live rows, status strip, send states | `recall follow <session> --after <cursor\|end> --jsonl [--status]` | `[recall] enabled` | same |
-| Status transitions without polling | `events follow --json --kind session.status,session.turn` | `[macapp] status_events` (status owners: TUI, notify daemon) | docs/events.md |
+| Status transitions without polling | `events follow --json --kind session.status,session.turn`; `events stats --json` → `status_owner` (`none`: nothing publishes them), `notify-daemon install --json` installs the daemon that does | `[macapp] status_events` (status owners: TUI, notify daemon) | docs/events.md |
 | Transcript growth frames | `session.transcript` on the bus | `[macapp] transcript_events` (notify daemon) | docs/events.md |
 | Browser reports | `open <file\|url> [--session <id\|title>]`, `file bundle <dir\|file> --session <id>` | built-in | docs/macapp-open.md |
 | Plugin frames | `events publish --kind macapp.<name> --session <id> --data-file -` | `[macapp] plugins` | docs/events.md |

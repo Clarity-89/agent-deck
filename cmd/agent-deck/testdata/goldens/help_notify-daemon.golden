@@ -1,3 +1,5 @@
 Usage: agent-deck notify-daemon [--once]
+       agent-deck notify-daemon install [--json]
 
-Run status-driven transition notification daemon.
+Run status-driven transition notification daemon, or install it as a
+launchd agent (macOS) or systemd user unit (Linux).
