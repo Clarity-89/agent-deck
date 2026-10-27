@@ -473,6 +473,16 @@ func (h *Home) View() string {
 	}
 
 	frame := h.renderFrame()
+	// Every frame handed to Bubble Tea must satisfy the terminal contract
+	// (exactly h.height lines, each exactly h.width cells, SGR-isolated).
+	// renderFrame has many early-return views (splashes, dialogs, pagers)
+	// that hand-roll their own geometry; one over-wide line in any of them
+	// wraps and permanently desyncs the incremental renderer's row model,
+	// which surfaces later as ghost/duplicated rows on the next full-list
+	// repaint. Clamping here covers them all with a single choke point.
+	if h.width > 0 && h.height > 0 {
+		frame = clampViewToViewport(frame, h.width, h.height)
+	}
 	if frame != "" {
 		h.lastRenderedFrame = frame
 	}
@@ -1029,7 +1039,10 @@ func (h *Home) renderFrame() string {
 			content = h.renderSessionSwitcherOverlay(content)
 		}
 	}
-	return clampViewToViewport(content, h.width, h.height)
+	// Viewport clamping (the per-row auto-wrap bracket) happens once, in View,
+	// the single choke point for every frame including this function's many
+	// early returns. Rows must reach it bracket-free.
+	return content
 }
 
 // renderPanelTitle creates a styled section title with underline

@@ -48,7 +48,13 @@ func fitCellWidth(s string, width int) string {
 	}
 	w := cellWidth(s)
 	if w > width {
-		return cellTruncate(s, width, "")
+		// cellTruncate guarantees <= width but can land short of it (its
+		// keycap budget adjustment is conservative), so re-pad: a row that
+		// under-fills the viewport leaves the previous frame's trailing
+		// glyphs on screen — the same ghost artifact the pad below exists
+		// to prevent.
+		s = cellTruncate(s, width, "")
+		w = cellWidth(s)
 	}
 	if w < width {
 		return s + strings.Repeat(" ", width-w)
