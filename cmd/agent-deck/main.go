@@ -3542,9 +3542,14 @@ func handleRemove(profile string, args []string) {
 	// this removal was never allowed to touch.
 	_ = inst.RetireServiceUnit(serviceUnitOwnership)
 
-	// Clean up worktree directory if this is a worktree session
+	// Clean up worktree directory if this is a worktree session. One another
+	// session still works in is kept (#1449), as the TUI's delete keeps it.
 	if inst.IsWorktree() {
-		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
+		if session.OtherSessionsShareWorktree(inst, instances) {
+			if !*jsonOutput {
+				fmt.Printf("Keeping worktree %s: another session still uses it\n", FormatPath(inst.WorktreePath))
+			}
+		} else if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
 			if err := backend.RemoveWorktree(inst.WorktreePath, false); err != nil {
 				if !*jsonOutput {
 					fmt.Printf("Warning: failed to remove worktree: %v\n", err)

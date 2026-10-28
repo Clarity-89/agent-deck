@@ -25,7 +25,7 @@ func handleSessionRemove(profile string, args []string) {
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	force := fs.Bool("force", false, "Remove even when the session is running/waiting/idle; with --all-errored, also include pinned sessions (destructive)")
 	allErrored := fs.Bool("all-errored", false, "Remove every unpinned session currently in the 'error' state (bulk); pinned sessions are skipped unless --force is given")
-	pruneWorktree := fs.Bool("prune-worktree", false, "Also kill the process and remove any git worktree (destructive)")
+	pruneWorktree := fs.Bool("prune-worktree", false, "Also remove the session's git worktree (destructive: discards uncommitted work; a worktree another session uses is kept)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session remove <id|title> [options]")
@@ -101,7 +101,7 @@ func handleSessionRemove(profile string, args []string) {
 	inst.RecordTelemetryEnd(telemetry.EndDelete)
 
 	if *pruneWorktree {
-		pruneSessionWorktree(inst)
+		pruneSessionWorktree(inst, instances)
 	}
 
 	// v1.9.1 (#909): RemoveSessionAndVerify replaces the
@@ -193,6 +193,8 @@ func removeAllErrored(
 //   - Verify + re-DELETE: a concurrent writer (a live TUI) can still resurrect a
 //     row between our DELETE and our save.
 //   - Inbox / notify-state sweep (#910).
+//   - A worktree a surviving session still uses is kept (#1449). Sharing is
+//     judged against the survivors, so sharers removed together still prune.
 //
 // Returns the {id,title} payload rows for the sessions actually removed.
 func bulkRemoveSessions(
@@ -207,6 +209,12 @@ func bulkRemoveSessions(
 	for _, inst := range doomed {
 		doomedIDs[inst.ID] = true
 	}
+	remaining := make([]*session.Instance, 0, len(instances)-len(doomed))
+	for _, inst := range instances {
+		if !doomedIDs[inst.ID] {
+			remaining = append(remaining, inst)
+		}
+	}
 
 	removed := make([]removedSessionRow, 0, len(doomed))
 	removedIDs := make([]string, 0, len(doomed))
@@ -214,7 +222,7 @@ func bulkRemoveSessions(
 		saveStoppedBeforeRemoval(storage, inst)
 		_ = inst.KillAndWait()
 		if pruneWorktree {
-			pruneSessionWorktree(inst)
+			pruneSessionWorktree(inst, remaining)
 		}
 		if err := storage.DeleteInstance(inst.ID); err != nil {
 			out.Error(fmt.Sprintf("failed to remove session %s: %v", inst.ID, err), ErrCodeInvalidOperation)
@@ -227,12 +235,6 @@ func bulkRemoveSessions(
 		removed = append(removed, map[string]interface{}{"id": inst.ID, "title": inst.Title})
 	}
 
-	remaining := make([]*session.Instance, 0, len(instances)-len(removedIDs))
-	for _, inst := range instances {
-		if !doomedIDs[inst.ID] {
-			remaining = append(remaining, inst)
-		}
-	}
 	groupTree := session.NewGroupTreeWithGroups(remaining, groups)
 	if err := storage.SaveGroupsOnly(groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
@@ -292,15 +294,23 @@ func saveStoppedBeforeRemoval(storage *session.Storage, inst *session.Instance) 
 //
 // Uses KillAndWait so the SIGTERM→SIGKILL escalation completes before
 // this short-lived CLI exits (issue #59, v1.7.68).
-func pruneSessionWorktree(inst *session.Instance) {
+//
+// A worktree another session in others still works in is kept (#1449), as the
+// TUI's delete keeps it: removing it would strand that session.
+func pruneSessionWorktree(inst *session.Instance, others []*session.Instance) {
 	_ = inst.KillAndWait()
-	if inst.IsWorktree() {
-		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
-			if err := backend.RemoveWorktree(inst.WorktreePath, true); err != nil {
-				fmt.Fprintf(os.Stderr, "warn: worktree remove failed for %s: %v\n", inst.ID, err)
-			}
-			_ = backend.PruneWorktrees()
+	if !inst.IsWorktree() {
+		return
+	}
+	if session.OtherSessionsShareWorktree(inst, others) {
+		fmt.Fprintf(os.Stderr, "note: worktree %s kept: another session still uses it\n", FormatPath(inst.WorktreePath))
+		return
+	}
+	if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
+		if err := backend.RemoveWorktree(inst.WorktreePath, true); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: worktree remove failed for %s: %v\n", inst.ID, err)
 		}
+		_ = backend.PruneWorktrees()
 	}
 }
 

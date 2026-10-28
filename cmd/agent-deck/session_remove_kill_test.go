@@ -21,6 +21,8 @@
 //  4. `session cleanup` re-probes liveness after the [y/N] prompt, so a
 //     session revived while the prompt is open is neither killed nor
 //     removed.
+//  5. `session remove --prune-worktree` and `remove` keep a worktree another
+//     session still works in (#1449), on the single and the bulk path alike.
 
 package main
 
@@ -329,6 +331,95 @@ func TestSessionCleanup_KeepsWorktreeUnlessPruneRequested(t *testing.T) {
 	}
 	if _, err := os.Stat(wtPrune); !os.IsNotExist(err) {
 		t.Fatalf("cleanup --prune-worktree kept the worktree (stat err %v)", err)
+	}
+}
+
+// `--prune-worktree` on one of two sessions sharing a worktree must keep the
+// directory, as the TUI's delete does (#1449): removing it strands the other
+// session. The last sharer still takes the worktree with it.
+func TestSessionRemove_PruneKeepsWorktreeSharedWithAnotherSession(t *testing.T) {
+	sb := removeSandbox(t)
+	repo, wt := newSandboxWorktree(t, sb, "shared")
+	if err := os.WriteFile(filepath.Join(wt, "uncommitted.txt"), []byte("work in progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedDeadSession(t, sb, "shared-a", wt, repo)
+	seedDeadSession(t, sb, "shared-b", wt, repo)
+
+	if out, err := runRemoveCLI(t, sb, "session", "remove", "--force", "--prune-worktree", "shared-a"); err != nil {
+		t.Fatalf("session remove --prune-worktree shared-a: %v\n%s", err, out)
+	}
+	if row := loadSandboxRow(t, sb, "shared-a"); row != nil {
+		t.Fatalf("row still present after remove: %+v", row)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "uncommitted.txt")); err != nil {
+		t.Fatalf("remove --prune-worktree deleted a worktree another session still uses (#1449): %v", err)
+	}
+
+	if out, err := runRemoveCLI(t, sb, "session", "remove", "--force", "--prune-worktree", "shared-b"); err != nil {
+		t.Fatalf("session remove --prune-worktree shared-b: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("remove --prune-worktree kept the last sharer's worktree (stat err %v)", err)
+	}
+}
+
+// The bulk path judges sharing against the sessions that survive the run:
+// two errored sharers removed together take their worktree with them, while
+// a worktree a surviving session still uses stays.
+func TestSessionRemove_AllErroredPruneKeepsWorktreeOfSurvivor(t *testing.T) {
+	sb := removeSandbox(t)
+	repoDoomed, wtDoomed := newSandboxWorktree(t, sb, "doomed")
+	repoKept, wtKept := newSandboxWorktree(t, sb, "kept")
+	seedDeadSession(t, sb, "doomed-a", wtDoomed, repoDoomed)
+	seedDeadSession(t, sb, "doomed-b", wtDoomed, repoDoomed)
+	seedDeadSession(t, sb, "kept-errored", wtKept, repoKept)
+	seedDeadSession(t, sb, "kept-survivor", wtKept, repoKept)
+	setSandboxRowStatus(t, sb, "kept-survivor", "stopped")
+
+	if out, err := runRemoveCLI(t, sb, "session", "remove", "--all-errored", "--prune-worktree"); err != nil {
+		t.Fatalf("session remove --all-errored --prune-worktree: %v\n%s", err, out)
+	}
+	for _, id := range []string{"doomed-a", "doomed-b", "kept-errored"} {
+		if row := loadSandboxRow(t, sb, id); row != nil {
+			t.Fatalf("errored row %s still present: %+v", id, row)
+		}
+	}
+	if row := loadSandboxRow(t, sb, "kept-survivor"); row == nil {
+		t.Fatal("--all-errored removed a stopped session")
+	}
+	if _, err := os.Stat(wtDoomed); !os.IsNotExist(err) {
+		t.Fatalf("worktree shared only by removed sessions was kept (stat err %v)", err)
+	}
+	if _, err := os.Stat(wtKept); err != nil {
+		t.Fatalf("worktree a surviving session still uses was deleted (#1449): %v", err)
+	}
+}
+
+// `remove` always removes a clean worktree; one another session still works
+// in must survive (#1449). The worktree is clean on purpose: non-force
+// removal already refuses an untracked file, which would mask the guard.
+func TestRemove_KeepsWorktreeSharedWithAnotherSession(t *testing.T) {
+	sb := removeSandbox(t)
+	repo, wt := newSandboxWorktree(t, sb, "legacy")
+	seedDeadSession(t, sb, "legacy-a", wt, repo)
+	seedDeadSession(t, sb, "legacy-b", wt, repo)
+
+	if out, err := runRemoveCLI(t, sb, "remove", "legacy-a"); err != nil {
+		t.Fatalf("remove legacy-a: %v\n%s", err, out)
+	}
+	if row := loadSandboxRow(t, sb, "legacy-a"); row != nil {
+		t.Fatalf("row still present after remove: %+v", row)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("remove deleted a worktree another session still uses (#1449): %v", err)
+	}
+
+	if out, err := runRemoveCLI(t, sb, "remove", "legacy-b"); err != nil {
+		t.Fatalf("remove legacy-b: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("remove kept the last sharer's worktree (stat err %v)", err)
 	}
 }
 

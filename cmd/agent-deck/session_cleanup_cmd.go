@@ -205,7 +205,7 @@ func handleSessionCleanup(profile string, args []string) {
 	dryRun := fs.Bool("dry-run", false, "Preview only; never delete even with --yes")
 	includeArchived := fs.Bool("include-archived", false, "Also consider archived sessions (excluded by default)")
 	force := fs.Bool("force", false, "Also include pinned sessions (pinned are retained by default)")
-	pruneWorktree := fs.Bool("prune-worktree", false, "Also delete each session's git worktree directory (DESTRUCTIVE: discards uncommitted work)")
+	pruneWorktree := fs.Bool("prune-worktree", false, "Also delete each session's git worktree directory (DESTRUCTIVE: discards uncommitted work; a worktree a surviving session uses is kept)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -404,7 +404,8 @@ func printCleanupPreview(
 	if worktrees > 0 {
 		if pruneWorktree {
 			fmt.Printf("WARNING: --prune-worktree will DELETE the git worktree directory of %d session(s)\n", worktrees)
-			fmt.Println("         marked 'wt' above, discarding any uncommitted work in them.")
+			fmt.Println("         marked 'wt' above, discarding any uncommitted work in them. A worktree")
+			fmt.Println("         a surviving session still uses is kept.")
 		} else {
 			fmt.Printf("Note: %d session(s) marked 'wt' own a git worktree. Their directories are\n", worktrees)
 			fmt.Println("      KEPT (registry-only). Pass --prune-worktree to delete them too.")
