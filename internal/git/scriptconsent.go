@@ -99,6 +99,10 @@ type ScriptConsentConfig struct {
 	// PersistOverride (--trust, only meaningful with AllowOverride) also
 	// records the identity that ran as trusted, so later runs need no flag.
 	PersistOverride bool
+	// Skip is this one invocation's --skip-hooks: no worktree lifecycle
+	// script runs, trusted or not, and the skip notice names the flag
+	// rather than the policy.
+	Skip bool
 	// AllowInteractivePrompt gates whether checkScriptConsent may attempt a
 	// synchronous stdin/stdout prompt at all, independent of whether
 	// isInteractiveConsoleStdio reports a TTY. It must be false whenever a
@@ -714,6 +718,9 @@ func TrustHooksCommand(repoRoot, kind string) string {
 func checkScriptConsent(id *WorktreeScriptIdentity, out io.Writer) error {
 	cfg := getScriptConsentConfig()
 
+	if cfg.Skip {
+		return notApproved("worktree %s hook not run: skipped by --skip-hooks: %s", id.Kind, id.ScriptPath)
+	}
 	switch cfg.Policy {
 	case ScriptConsentAlways:
 		return nil

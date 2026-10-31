@@ -475,6 +475,8 @@ agent-deck worktree trust-hooks . --hook setup --yes       # scripts: approve af
 agent-deck worktree trust-hooks . --revoke                 # forget the approvals
 agent-deck launch . -w feat -b --run-hooks                 # run unapproved hooks this once (prints sha256)
 agent-deck launch . -w feat -b --run-hooks --trust         # ...and remember that version
+agent-deck add . -w feat -b --skip-hooks                   # this worktree without the hook, approved or not
+agent-deck worktree setup "My Session"                     # run the hook again in a session's worktree (TUI: b)
 ```
 
 `[worktree] run_repo_scripts` sets the policy: `"prompt"` (default), `"never"` (hooks never run), or `"always"` (every hook runs without asking; only for machines where you own every repository you open, because any repository you create a worktree in can then run code as you). Remote hosts apply their own policy and approvals: run `trust-hooks` on the remote host.

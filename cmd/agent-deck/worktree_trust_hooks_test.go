@@ -144,25 +144,28 @@ func TestPartitionWorktreeTrustScriptsArgs_HookValue(t *testing.T) {
 	}
 }
 
-func TestExtractAllowRepoScriptsFlag(t *testing.T) {
+func TestExtractRepoScriptFlags(t *testing.T) {
 	for _, tc := range []struct {
-		args         []string
-		allow, trust bool
-		rest         string
+		args               []string
+		allow, trust, skip bool
+		rest               string
 	}{
-		{[]string{"launch", ".", "--run-hooks"}, true, false, "launch ."},
-		{[]string{"launch", ".", "--allow-repo-scripts"}, true, false, "launch ."},
-		{[]string{"launch", "--run-hooks", "--trust", "."}, true, true, "launch ."},
-		{[]string{"launch", "--run-hooks=false", "."}, false, false, "launch ."},
+		{[]string{"launch", ".", "--run-hooks"}, true, false, false, "launch ."},
+		{[]string{"launch", ".", "--allow-repo-scripts"}, true, false, false, "launch ."},
+		{[]string{"launch", "--run-hooks", "--trust", "."}, true, true, false, "launch ."},
+		{[]string{"launch", "--run-hooks=false", "."}, false, false, false, "launch ."},
+		{[]string{"add", "--json", "--skip-hooks", "-w", "x", "."}, false, false, true, "add --json -w x ."},
+		{[]string{"add", "--skip-hooks=false", "."}, false, false, false, "add ."},
 		// --trust is left alone without a run-hooks flag.
-		{[]string{"launch", "--trust", "."}, false, false, "launch --trust ."},
+		{[]string{"launch", "--trust", "."}, false, false, false, "launch --trust ."},
 		// Everything after "--" is data (a chat message, say), never a global flag.
-		{[]string{"session", "send", "s1", "--", "--run-hooks"}, false, false, "session send s1 -- --run-hooks"},
-		{[]string{"session", "send", "--run-hooks", "s1", "--", "--trust"}, true, false, "session send s1 -- --trust"},
+		{[]string{"session", "send", "s1", "--", "--run-hooks"}, false, false, false, "session send s1 -- --run-hooks"},
+		{[]string{"session", "send", "--run-hooks", "s1", "--", "--trust"}, true, false, false, "session send s1 -- --trust"},
+		{[]string{"session", "send", "s1", "--", "--skip-hooks"}, false, false, false, "session send s1 -- --skip-hooks"},
 	} {
-		allow, trust, rest := extractAllowRepoScriptsFlag(tc.args)
-		if allow != tc.allow || trust != tc.trust || strings.Join(rest, " ") != tc.rest {
-			t.Errorf("extract(%v) = (%v, %v, %v), want (%v, %v, %s)", tc.args, allow, trust, rest, tc.allow, tc.trust, tc.rest)
+		allow, trust, skip, rest := extractRepoScriptFlags(tc.args)
+		if allow != tc.allow || trust != tc.trust || skip != tc.skip || strings.Join(rest, " ") != tc.rest {
+			t.Errorf("extract(%v) = (%v, %v, %v, %v), want (%v, %v, %v, %s)", tc.args, allow, trust, skip, rest, tc.allow, tc.trust, tc.skip, tc.rest)
 		}
 	}
 }

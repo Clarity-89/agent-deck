@@ -45,28 +45,33 @@ type ProfileSessions struct {
 // cmd/agent-deck/main.go: `list --json` marshals these rows directly, so a
 // reorder here changes its bytes.
 type SessionRow struct {
-	ID                string         `json:"id"`
-	ParentSessionID   string         `json:"parent_session_id,omitempty"`
-	ParentProjectPath string         `json:"parent_project_path,omitempty"`
-	Title             string         `json:"title"`
-	Path              string         `json:"path"`
-	Group             string         `json:"group"`
-	Tool              string         `json:"tool"`
-	Account           string         `json:"account"`
-	Command           string         `json:"command,omitempty"`
-	ModelID           string         `json:"model_id,omitempty" doc:"live"`
-	Model             string         `json:"model,omitempty" doc:"live"`
-	ModelVersion      string         `json:"model_version,omitempty" doc:"live"`
-	Status            string         `json:"status"`
-	StatusSource      string         `json:"status_source,omitempty" doc:"cached for an absent historical row whose stored status was used; live after a status refresh"`
-	Substate          string         `json:"substate,omitempty" doc:"live"`
-	ExitCode          *int           `json:"exit_code,omitempty" doc:"live"`
-	SubstateDetail    string         `json:"substate_detail,omitempty" doc:"live"`
-	TmuxSession       string         `json:"tmux_session,omitempty" doc:"live"`
-	Profile           string         `json:"profile"`
-	CreatedAt         time.Time      `json:"created_at"`
-	SSHHost           string         `json:"ssh_host,omitempty"`
-	SSHRemotePath     string         `json:"ssh_remote_path,omitempty"`
+	ID                string    `json:"id"`
+	ParentSessionID   string    `json:"parent_session_id,omitempty"`
+	ParentProjectPath string    `json:"parent_project_path,omitempty"`
+	Title             string    `json:"title"`
+	Path              string    `json:"path"`
+	Group             string    `json:"group"`
+	Tool              string    `json:"tool"`
+	Account           string    `json:"account"`
+	Command           string    `json:"command,omitempty"`
+	ModelID           string    `json:"model_id,omitempty" doc:"live"`
+	Model             string    `json:"model,omitempty" doc:"live"`
+	ModelVersion      string    `json:"model_version,omitempty" doc:"live"`
+	Status            string    `json:"status"`
+	StatusSource      string    `json:"status_source,omitempty" doc:"cached for an absent historical row whose stored status was used; live after a status refresh"`
+	Substate          string    `json:"substate,omitempty" doc:"live"`
+	ExitCode          *int      `json:"exit_code,omitempty" doc:"live"`
+	SubstateDetail    string    `json:"substate_detail,omitempty" doc:"live"`
+	TmuxSession       string    `json:"tmux_session,omitempty" doc:"live"`
+	Profile           string    `json:"profile"`
+	CreatedAt         time.Time `json:"created_at"`
+	SSHHost           string    `json:"ssh_host,omitempty"`
+	SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
+	// WorktreePath and WorktreeBranch say the session works in a git
+	// worktree agent-deck made, which `worktree setup` can run the
+	// repository's hook in again.
+	WorktreePath      string         `json:"worktree_path,omitempty"`
+	WorktreeBranch    string         `json:"worktree_branch,omitempty"`
 	Channels          []string       `json:"channels,omitempty" doc:"live"`
 	ExtraArgs         []string       `json:"extra_args,omitempty" doc:"live"`
 	Color             string         `json:"color,omitempty" doc:"live"`
@@ -154,6 +159,8 @@ func staticSessionRow(inst *session.Instance, instances []*session.Instance, pro
 		CreatedAt:         inst.CreatedAt,
 		SSHHost:           inst.SSHHost,
 		SSHRemotePath:     inst.SSHRemotePath,
+		WorktreePath:      inst.WorktreePath,
+		WorktreeBranch:    inst.WorktreeBranch,
 		CodexSessionID:    inst.CodexSessionID,
 		ClaudeSessionID:   inst.ClaudeSessionID,
 		TranscriptPath:    transcripts[inst],

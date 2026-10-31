@@ -418,12 +418,14 @@ func main() {
 		exitCLI(1)
 	}
 	defer func() { _ = events.CloseDefault() }()
-	// Extract global --run-hooks (alias --allow-repo-scripts) and --trust
-	// before subcommand dispatch (mirrors -p/--profile above). One-shot run
-	// of unapproved worktree hooks for non-interactive callers (CI) that
-	// can't answer a prompt and would otherwise skip them under the "prompt"
-	// default; --trust additionally records the version that ran.
-	// Remote arguments belong to the server, including its script-consent flag.
+	// Extract the global worktree-hook flags before subcommand dispatch
+	// (mirrors -p/--profile above). --run-hooks (alias --allow-repo-scripts)
+	// is a one-shot run of unapproved worktree hooks for non-interactive
+	// callers (CI) that can't answer a prompt and would otherwise skip them
+	// under the "prompt" default; --trust additionally records the version
+	// that ran. --skip-hooks runs none, approved or not, for a caller that
+	// wants the worktree alone this once.
+	// Remote arguments belong to the server, including its script-consent flags.
 	if len(args) > 0 && args[0] == "remote" {
 		beginCLITelemetry(args[0], args[1:])
 		enableTimingsFromConfig() // remote dispatches before the config block below
@@ -432,15 +434,20 @@ func main() {
 		handleRemote(profile, args[1:])
 		return
 	}
-	allowRepoScripts, trustRepoScripts, args2 := extractAllowRepoScriptsFlag(args)
+	allowRepoScripts, trustRepoScripts, skipRepoScripts, args2 := extractRepoScriptFlags(args)
 	args = args2
 	if envVal := strings.TrimSpace(os.Getenv("AGENT_DECK_ALLOW_REPO_SCRIPTS")); envVal != "" {
 		allowRepoScripts = allowRepoScripts || envVal == "1" || strings.EqualFold(envVal, "true")
+	}
+	if allowRepoScripts && skipRepoScripts {
+		fmt.Fprintln(os.Stderr, "Error: --run-hooks and --skip-hooks cannot be combined")
+		exitCLI(1)
 	}
 	git.SetScriptConsentConfig(git.ScriptConsentConfig{
 		Policy:          session.GetWorktreeSettings().ScriptConsentPolicy(),
 		AllowOverride:   allowRepoScripts,
 		PersistOverride: allowRepoScripts && trustRepoScripts,
+		Skip:            skipRepoScripts,
 		// True here: every switch case below that can reach a worktree
 		// script (add/remove/worktree/session/etc.) `return`s before the
 		// TUI/web startup code further down, so it's still a real CLI
@@ -854,6 +861,7 @@ func main() {
 		Policy:                 session.GetWorktreeSettings().ScriptConsentPolicy(),
 		AllowOverride:          allowRepoScripts,
 		PersistOverride:        allowRepoScripts && trustRepoScripts,
+		Skip:                   skipRepoScripts,
 		AllowInteractivePrompt: false,
 	})
 
@@ -1677,15 +1685,15 @@ func extractProfileFlag(args []string) (string, []string) {
 	return profile, remaining
 }
 
-// extractAllowRepoScriptsFlag extracts --run-hooks (and its pre-1.16.22
-// spelling --allow-repo-scripts) plus --trust from args, returning whether
-// each was present and the args with them removed. Mirrors
+// extractRepoScriptFlags extracts the global worktree-hook flags from args
+// and returns the args with them removed: --run-hooks (and its pre-1.16.22
+// spelling --allow-repo-scripts) plus --trust, and --skip-hooks. Mirrors
 // extractNoTuiFlag's boolean-flag scan (web_cmd.go): supports the bare flag
 // and =true/false/1. --trust is only consumed when a run-hooks flag is
 // present, so it never steals a --trust meant for another subcommand.
-func extractAllowRepoScriptsFlag(args []string) (allow, trust bool, remaining []string) {
-	isRunHooks := func(a string) (bool, bool) {
-		for _, name := range []string{"--run-hooks", "--allow-repo-scripts"} {
+func extractRepoScriptFlags(args []string) (allow, trust, skip bool, remaining []string) {
+	isFlag := func(a string, names ...string) (bool, bool) {
+		for _, name := range names {
 			if a == name {
 				return true, true
 			}
@@ -1695,6 +1703,8 @@ func extractAllowRepoScriptsFlag(args []string) (allow, trust bool, remaining []
 		}
 		return false, false
 	}
+	isRunHooks := func(a string) (bool, bool) { return isFlag(a, "--run-hooks", "--allow-repo-scripts") }
+	isSkipHooks := func(a string) (bool, bool) { return isFlag(a, "--skip-hooks") }
 	// Arguments after "--" are data (a message, say), never global flags.
 	flagArgs, rest := args, []string(nil)
 	if i := slices.Index(args, "--"); i >= 0 {
@@ -1712,13 +1722,17 @@ func extractAllowRepoScriptsFlag(args []string) (allow, trust bool, remaining []
 			allow = v
 			continue
 		}
+		if ok, v := isSkipHooks(a); ok {
+			skip = v
+			continue
+		}
 		if present && a == "--trust" {
 			trust = true
 			continue
 		}
 		remaining = append(remaining, a)
 	}
-	return allow, trust, append(remaining, rest...)
+	return allow, trust, skip, append(remaining, rest...)
 }
 
 // extractGroupFlag extracts -g or --group from args, returning the group path and remaining args.
@@ -3203,6 +3217,8 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		CreatedAt         time.Time `json:"created_at"`
 		SSHHost           string    `json:"ssh_host,omitempty"`
 		SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
+		WorktreePath      string    `json:"worktree_path,omitempty"`
+		WorktreeBranch    string    `json:"worktree_branch,omitempty"`
 		Channels          []string  `json:"channels,omitempty"`
 		ExtraArgs         []string  `json:"extra_args,omitempty"`
 		Color             string    `json:"color,omitempty"` // issue #391
@@ -3276,6 +3292,8 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 			CreatedAt:         inst.CreatedAt,
 			SSHHost:           inst.SSHHost,
 			SSHRemotePath:     inst.SSHRemotePath,
+			WorktreePath:      inst.WorktreePath,
+			WorktreeBranch:    inst.WorktreeBranch,
 			Channels:          inst.Channels,
 			ExtraArgs:         inst.ExtraArgs,
 			Color:             inst.Color,
@@ -3343,6 +3361,8 @@ func handleListAllProfiles(jsonOutput, includeSuperseded bool) {
 			CreatedAt         time.Time `json:"created_at"`
 			SSHHost           string    `json:"ssh_host,omitempty"`
 			SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
+			WorktreePath      string    `json:"worktree_path,omitempty"`
+			WorktreeBranch    string    `json:"worktree_branch,omitempty"`
 			CodexSessionID    string    `json:"codex_session_id,omitempty"`
 			ClaudeSessionID   string    `json:"claude_session_id,omitempty"`
 			TranscriptPath    string    `json:"transcript_path,omitempty"`
@@ -3379,6 +3399,8 @@ func handleListAllProfiles(jsonOutput, includeSuperseded bool) {
 					CreatedAt:         inst.CreatedAt,
 					SSHHost:           inst.SSHHost,
 					SSHRemotePath:     inst.SSHRemotePath,
+					WorktreePath:      inst.WorktreePath,
+					WorktreeBranch:    inst.WorktreeBranch,
 					CodexSessionID:    inst.CodexSessionID,
 					ClaudeSessionID:   inst.ClaudeSessionID,
 					TranscriptPath:    transcripts[inst],

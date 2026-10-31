@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -30,6 +32,8 @@ func handleWorktree(profile string, args []string) {
 		handleWorktreeCleanup(profile, args[1:])
 	case "finish":
 		handleWorktreeFinish(profile, args[1:])
+	case "setup":
+		handleWorktreeSetup(profile, args[1:])
 	case "trust-hooks", "trust-scripts": // trust-scripts: pre-1.16.22 name
 		exitCLI(runWorktreeTrustHooks(args[1:], os.Stdin, os.Stdout, os.Stderr, stdinStdoutIsTerminal()))
 	case "help", "-h", "--help":
@@ -51,6 +55,7 @@ func printWorktreeUsage() {
 	fmt.Println("  list              List all worktrees in current repository")
 	fmt.Println("  info <session>    Show worktree info for a session")
 	fmt.Println("  finish <session>  Merge branch, remove worktree, and delete session")
+	fmt.Println("  setup <session>   Run the repository's worktree setup hook again in the session's worktree")
 	fmt.Println("  cleanup [--force] Find and remove orphaned worktrees/sessions")
 	fmt.Println("  trust-hooks <repo> [--hook setup|destruction] [--yes] [--revoke]")
 	fmt.Println("                    Review and approve .agent-deck/worktree-*.sh hooks for a repo")
@@ -428,6 +433,84 @@ func handleWorktreeInfo(profile string, args []string) {
 	} else {
 		fmt.Printf("Status:         MISSING (worktree directory not found)\n")
 	}
+}
+
+// handleWorktreeSetup runs .agent-deck/worktree-setup.sh again for a
+// session's worktree, as the TUI's b key does, for callers that have no
+// TUI. The same consent gate as creation applies, so an unapproved hook
+// is refused with the notice naming `worktree trust-hooks`.
+func handleWorktreeSetup(profile string, args []string) {
+	fs := flag.NewFlagSet("worktree setup", flag.ContinueOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck worktree setup <session> [options]")
+		fmt.Println()
+		fmt.Println("Run the repository's .agent-deck/worktree-setup.sh again in the session's worktree.")
+		fmt.Println("The hook must be approved (see worktree trust-hooks), as when the worktree was created.")
+		fmt.Println()
+		fmt.Println("Arguments:")
+		fmt.Println("  session    Session title, ID prefix, or path")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+	}
+
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
+	}
+
+	identifier := fs.Arg(0)
+	out := NewCLIOutput(*jsonOutput, false)
+
+	if identifier == "" {
+		out.Error("session identifier is required", ErrCodeNotFound)
+		fmt.Println()
+		fs.Usage()
+		exitCLI(1)
+	}
+
+	_, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		exitCLI(1)
+	}
+
+	inst, errMsg, errCode := ResolveSession(identifier, instances)
+	if inst == nil {
+		out.Error(errMsg, errCode)
+		exitCLI(1)
+		return // unreachable, satisfies staticcheck SA5011
+	}
+
+	if !inst.IsWorktree() {
+		out.Error(fmt.Sprintf("session '%s' is not in a worktree", inst.Title), ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
+	if _, err := os.Stat(inst.WorktreePath); err != nil {
+		out.Error(fmt.Sprintf("worktree directory not found: %s", inst.WorktreePath), ErrCodeNotFound)
+		exitCLI(1)
+	}
+	scriptPath, _ := git.FindWorktreeSetupScript(inst.WorktreeRepoRoot)
+	if scriptPath == "" {
+		out.Error(fmt.Sprintf("no setup script found at %s", filepath.Join(inst.WorktreeRepoRoot, ".agent-deck", "worktree-setup.sh")), ErrCodeNotFound)
+		exitCLI(1)
+	}
+
+	start := time.Now()
+	if err := git.GateAndRunWorktreeSetupScript(inst.WorktreeRepoRoot, inst.WorktreePath, worktreeHookStdout(*jsonOutput), os.Stderr, session.GetWorktreeSettings().SetupTimeout()); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
+	elapsed := time.Since(start).Round(100 * time.Millisecond)
+	out.Print(fmt.Sprintf("Worktree setup script completed in %s", elapsed), map[string]interface{}{
+		"success":       true,
+		"session":       inst.Title,
+		"session_id":    inst.ID,
+		"worktree_path": inst.WorktreePath,
+		"script":        scriptPath,
+		"elapsed_ms":    elapsed.Milliseconds(),
+	})
 }
 
 // handleWorktreeCleanup finds and removes orphaned worktrees and sessions

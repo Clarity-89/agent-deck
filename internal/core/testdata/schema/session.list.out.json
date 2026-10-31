@@ -200,6 +200,12 @@
           "items": {
             "$ref": "#/$defs/tmux.Viewer"
           }
+        },
+        "worktree_branch": {
+          "type": "string"
+        },
+        "worktree_path": {
+          "type": "string"
         }
       },
       "required": [
