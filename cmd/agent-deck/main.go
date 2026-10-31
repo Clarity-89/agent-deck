@@ -2519,7 +2519,7 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 			// pointed at), never from backend.RepoDir() — see #1708.
 			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch,
 				wtSettings.CreateOptions(path),
-				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+				worktreeHookStdout(*jsonOutput), os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				if isWorktreeAlreadyExistsError(err) {
 					fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)

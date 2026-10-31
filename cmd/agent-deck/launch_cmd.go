@@ -447,7 +447,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 			// launched from), never from backend.RepoDir() — see #1708.
 			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch,
 				wtSettings.CreateOptions(path),
-				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+				worktreeHookStdout(*jsonOutput), os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 				exitCLI(1)

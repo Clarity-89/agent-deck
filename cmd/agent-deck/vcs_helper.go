@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
@@ -10,6 +11,17 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
+
+// worktreeHookStdout is where the worktree-setup script's own stdout goes.
+// Under --json the command's stdout is the reply and nothing else, since a
+// caller parses it whole; the script's output then joins its "Running…"
+// and outcome lines on stderr.
+func worktreeHookStdout(jsonOutput bool) io.Writer {
+	if jsonOutput {
+		return os.Stderr
+	}
+	return os.Stdout
+}
 
 // gitBackend is a thin adapter that satisfies vcs.Backend by wrapping
 // internal/git's existing free functions. It lives in cmd/agent-deck so
