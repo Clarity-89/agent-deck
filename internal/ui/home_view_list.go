@@ -847,9 +847,6 @@ func (h *Home) renderRemoteSessionItem(b *strings.Builder, item session.Item, se
 func (h *Home) renderRemoteSessionItemAtWidth(b *strings.Builder, item session.Item, selected bool, listWidth int) {
 	rs := item.RemoteSession
 	if rs == nil {
-		// Still emit a row: renderSessionList and mouseYToItemIndex assume
-		// every item renders exactly one line.
-		b.WriteString("\n")
 		return
 	}
 	if h.embeddedLayout && listWidth >= embeddedCardMinWidth {
