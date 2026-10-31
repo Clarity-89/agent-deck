@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -47,7 +46,7 @@ func (p *Pool) Start(name, command string, args []string, env map[string]string)
 	defer p.mu.Unlock()
 
 	if existing, exists := p.proxies[name]; exists {
-		// A socket adopted by DiscoverExistingSockets carries no command.
+		// A socket adopted by RegisterExternalSocket carries no command.
 		// Record it now so RestartProxy can respawn the MCP locally if the
 		// instance that served the socket goes away.
 		if existing.command == "" && existing.mcpProcess == nil {
@@ -70,12 +69,22 @@ func (p *Pool) Start(name, command string, args []string, env map[string]string)
 }
 
 func (p *Pool) ShouldPool(mcpName string) bool {
-	if !p.config.Enabled {
+	return p.config.Allows(mcpName)
+}
+
+// Allows reports whether this pool config lets mcpName be served from a pool
+// socket. It is the one decision for both the TUI pool (ShouldPool) and the
+// CLI path, which has no Pool and must still honour pool_mcps / exclude_mcps:
+// every config home of the user shares the pool socket dir, so a config that
+// did not opt a name in must never attach to another config's process of
+// that name.
+func (c *PoolConfig) Allows(mcpName string) bool {
+	if c == nil || !c.Enabled {
 		return false
 	}
 
-	if p.config.PoolAll {
-		for _, excluded := range p.config.ExcludeMCPs {
+	if c.PoolAll {
+		for _, excluded := range c.ExcludeMCPs {
 			if excluded == mcpName {
 				return false
 			}
@@ -83,7 +92,7 @@ func (p *Pool) ShouldPool(mcpName string) bool {
 		return true
 	}
 
-	for _, name := range p.config.PoolMCPs {
+	for _, name := range c.PoolMCPs {
 		if name == mcpName {
 			return true
 		}
@@ -399,31 +408,45 @@ type ProxyInfo struct {
 // /tmp/agentdeck-mcp-*.sock files are present: they are no longer adopted.
 var legacyTmpSocketNotice sync.Once
 
-// DiscoverExistingSockets scans this user's private pool socket dir (the one
-// NewSocketProxy creates sockets in) for live sockets served by another
-// agent-deck instance of the same user and registers them so this instance can
-// use them too. Only sockets that pass verifyOwnedSocket are adopted; the old
-// world-writable /tmp/agentdeck-mcp-*.sock locations are never trusted.
+// SocketSpec is what a pool socket serves: the MCP's command, args and env.
+type SocketSpec struct {
+	Command string
+	Args    []string
+	Env     map[string]string
+}
+
+// DiscoverExistingSockets adopts live sockets that another agent-deck
+// instance of the same user serves for the MCPs in specs, so this instance
+// can use them too. A socket is looked up by name and definition
+// (SocketFileName), so a socket another config home serves for the same name
+// with a different command, args or env is never adopted (#2966). Only
+// sockets that pass verifyOwnedSocket are adopted; the old world-writable
+// /tmp/agentdeck-mcp-*.sock locations are never trusted. Dead sockets of this
+// user for this config's names (definition-keyed and pre-#2966 name-only)
+// are removed when a dial is refused.
 // Returns count of discovered sockets.
-func (p *Pool) DiscoverExistingSockets() int {
+func (p *Pool) DiscoverExistingSockets(specs map[string]SocketSpec) int {
 	warnLegacyTmpSockets()
 
 	sockDir := mcpSocketDir()
-	matches, err := filepath.Glob(filepath.Join(sockDir, "mcp-*.sock"))
-	if err != nil {
-		poolLog.Warn("socket_scan_failed", slog.String("error", err.Error()))
-		return 0
+	// Remove dead sockets this config would use: its definition-keyed path
+	// and the pre-#2966 name-only path of each pooled name. Only a refused
+	// dial counts as dead; a slow or busy owner keeps its socket. Sockets of
+	// other names and definitions belong to other config homes.
+	for name, spec := range specs {
+		for _, socketPath := range []string{
+			socketPathIn(sockDir, name, spec.Command, spec.Args, spec.Env),
+			legacySocketPath(sockDir, name),
+		} {
+			if verifyOwnedSocket(socketPath) == nil && socketRefused(socketPath) {
+				poolLog.Debug("stale_socket_removed", slog.String("path", socketPath))
+				_ = os.Remove(socketPath)
+			}
+		}
 	}
 
 	discovered := 0
-	for _, socketPath := range matches {
-		// Extract MCP name from socket path: <sockDir>/mcp-{name}.sock
-		base := filepath.Base(socketPath)
-		name := strings.TrimSuffix(strings.TrimPrefix(base, "mcp-"), ".sock")
-		if name == "" {
-			continue
-		}
-
+	for name, spec := range specs {
 		// Skip if we already have this MCP
 		p.mu.RLock()
 		_, exists := p.proxies[name]
@@ -432,15 +455,14 @@ func (p *Pool) DiscoverExistingSockets() int {
 			continue
 		}
 
+		socketPath := socketPathIn(sockDir, name, spec.Command, spec.Args, spec.Env)
 		if err := verifyOwnedSocket(socketPath); err != nil {
-			poolLog.Warn("external_socket_rejected", slog.String("mcp", name), slog.String("error", err.Error()))
+			if !os.IsNotExist(err) {
+				poolLog.Warn("external_socket_rejected", slog.String("mcp", name), slog.String("error", err.Error()))
+			}
 			continue
 		}
-
-		// Check if socket is alive (owned by another instance)
 		if !isSocketAliveCheck(socketPath) {
-			poolLog.Debug("stale_socket_removed", slog.String("mcp", name))
-			os.Remove(socketPath)
 			continue
 		}
 
@@ -449,6 +471,13 @@ func (p *Pool) DiscoverExistingSockets() int {
 			poolLog.Warn("external_register_failed", slog.String("mcp", name), slog.String("error", err.Error()))
 			continue
 		}
+		// Record the definition so RestartProxy can respawn the MCP locally
+		// if the instance that served the socket goes away.
+		p.mu.Lock()
+		if proxy := p.proxies[name]; proxy != nil && proxy.command == "" && proxy.mcpProcess == nil {
+			proxy.command, proxy.args, proxy.env = spec.Command, spec.Args, spec.Env
+		}
+		p.mu.Unlock()
 
 		poolLog.Info("external_socket_discovered", slog.String("mcp", name), slog.String("path", socketPath))
 		discovered++

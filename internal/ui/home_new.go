@@ -180,6 +180,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		editSessionDialog:         NewEditSessionDialog(),
 		skillDialog:               NewSkillDialog(),
 		setupWizard:               NewSetupWizard(),
+		onboarding:                NewOnboardingOverlay(),
 		settingsPanel:             NewSettingsPanel(),
 		analyticsPanel:            NewAnalyticsPanel(),
 		geminiModelDialog:         NewGeminiModelDialog(),
@@ -257,6 +258,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		mru:                       session.NewMRUHistory(session.DefaultMRUCapacity),
 	}
 	h.sessionRenderSnapshot.Store(make(map[string]sessionRenderState))
+	h.newDialog.titleTaken = h.newSessionTitleTaken
 
 	h.reloadHotkeysFromConfig()
 
@@ -349,6 +351,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	if notifSettings.GetEnabled() && h.manageTmuxNotifications {
 		h.notificationsEnabled = true
 		h.notificationManager = session.NewNotificationManager(notifSettings.MaxShown, notifSettings.ShowAll, notifSettings.Minimal)
+		h.notificationManager.SetSortMode(notifSettings.GetSort())
 
 		// Initialize tmux status bar options for proper notification display
 		// Fixes truncation (default status-left-length is only 10 chars)

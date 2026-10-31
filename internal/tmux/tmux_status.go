@@ -1252,6 +1252,11 @@ func (s *Session) hasBusyIndicatorResolved(content string) bool {
 	if strings.EqualFold(tool, "opencode") {
 		spinnerContent = blankOpenCodeBlockArtLines(content)
 	}
+	// pi: a "── ⠴ Working ──" banner left above an idle composer is residue,
+	// not a live turn (#2948); only the banner on the composer counts.
+	if tool == "pi" {
+		spinnerContent = piLiveSpinnerContent(content, spinnerChars)
+	}
 	char, spinnerLine, found := findSpinnerInContent(spinnerContent, spinnerChars)
 
 	// Get or create spinner tracker
@@ -1409,8 +1414,9 @@ func (s *Session) hasErrorBannerIndicator(content string) bool {
 	// out. A reconnected session has no startup clock, so the hold text itself
 	// is the durable, timeout-specific reason. RespawnPane publishes a fresh
 	// startupAt before unlocking, preventing preserved old scrollback from
-	// poisoning the new generation.
-	if (s.startupTimedOut || s.startupAt.IsZero()) && strings.Contains(strings.ToLower(StripANSI(content)), "session startup timed out before the agent became interactive") {
+	// poisoning the new generation. A generation that armed a clock and then
+	// cleared it became interactive, so the banner there is stale (#2938).
+	if (s.startupTimedOut || (s.startupAt.IsZero() && !s.startupArmed)) && strings.Contains(strings.ToLower(StripANSI(content)), "session startup timed out before the agent became interactive") {
 		return true
 	}
 	tool := inferToolFromSessionFields(s.detectedTool, s.customToolName, s.launchCommand())
@@ -1545,6 +1551,35 @@ func (s *Session) CachedSubstateDetail() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastSubstateDetail
+}
+
+// SetCachedSubstateForTest seeds the cached substate so tests outside this
+// package can exercise layers that read it without classifying a real pane.
+func (s *Session) SetCachedSubstateForTest(sub Substate, detail string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastSubstate, s.lastSubstateDetail = sub, detail
+}
+
+// InheritCachedSubstate takes over prev's cached substate when both objects
+// carry the same tmux session name and this one has not classified anything
+// yet. The name is the only check: a restart through respawn-pane keeps the
+// name, so the old label shows until the next classification replaces it.
+func (s *Session) InheritCachedSubstate(prev *Session) {
+	if prev == nil || prev == s || prev.TmuxName() != s.TmuxName() {
+		return
+	}
+	// Read prev's pair under one lock, so a status pass between two reads
+	// cannot mix frames. Write s under its own lock: holding both would risk
+	// a lock-order inversion with any caller that inherits the other way round.
+	prev.mu.Lock()
+	sub, detail := prev.lastSubstate, prev.lastSubstateDetail
+	prev.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastSubstate == SubstateNone {
+		s.lastSubstate, s.lastSubstateDetail = sub, detail
+	}
 }
 
 // CachedSubstate returns the last substate computed by GetStatus/GetSubstate

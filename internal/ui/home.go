@@ -1043,9 +1043,23 @@ type Home struct {
 	// pendingRemoteCreate holds the remote create whose path the server
 	// reported missing, while the create-directory confirmation is open.
 	pendingRemoteCreate *remoteCreateDirNeededMsg
+	// reservedTitles counts the titles of dialog creates still in flight, so
+	// a second quick create derives a different name (#2913). Touched only on
+	// the UI goroutine: added on submit, released by sessionCreatedMsg.
+	reservedTitles map[string]int
+	// createDirName is the Name field as typed when a dialog create stopped at
+	// "Directory Not Found"; Cancel returns to the dialog with it (#2913).
+	createDirName     string
+	createDirFromForm bool
 	// sandboxProvisioner replaces provider.Provision for a "new sandbox"
 	// Where pick (tests stub it); nil uses defaultSandboxProvisioner.
 	sandboxProvisioner func(ctx context.Context, opts provider.ProvisionOptions) (*provider.Provisioned, error)
+	// sandboxProvisionMu guards the count of sandbox provisionings in
+	// flight; quit waits for them (waitSandboxProvisions) so a cancelled
+	// create still finishes its rollback (#2918).
+	sandboxProvisionMu   sync.Mutex
+	sandboxProvisionN    int
+	sandboxProvisionIdle chan struct{} // closed when the count drops to 0
 	// insertKeySender is the persistent dispatch path opened on
 	// enterInsertMode and closed on exitInsertMode (#1102 perf fix +
 	// remote support). Local sessions get a tmux.KeySender (control-mode
@@ -1102,6 +1116,17 @@ type Home struct {
 	// session's active window; >= 0 targets that specific window. When nil, the
 	// dispatch calls the tmux session directly. See issue #1369.
 	quickApproveSink func(inst *session.Instance, windowIndex int) error
+
+	// onboarding is the Welcome / "What you can do" overlay (onboarding.go).
+	onboarding *OnboardingOverlay
+	// onboardingCmds are queued by the overlay and handed out by Update.
+	onboardingCmds []tea.Cmd
+	// onboardingTourAfterCreate opens "What you can do" once the session
+	// started from the first-run Welcome is created.
+	onboardingTourAfterCreate bool
+	// onboardingLoginTempID marks the create of a Welcome login session, so
+	// sessionCreatedMsg attaches to it.
+	onboardingLoginTempID string
 }
 
 // reloadState preserves UI state during storage reload
@@ -2017,7 +2042,7 @@ func (h *Home) backgroundStatusUpdate() {
 		if sharedStatuses != nil {
 			for _, inst := range instances {
 				if s, ok := sharedStatuses[inst.ID]; ok && s.Acknowledged {
-					inst.SetAcknowledgedFromShared(true)
+					inst.SetAcknowledgedFromSharedAt(s.AcknowledgedAt)
 				}
 			}
 		}
@@ -2156,6 +2181,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Execute final shutdown logic after splash delay
 		return h, h.performFinalShutdown(bool(msg))
 
+	case onboardingStatusMsg, onboardingRecheckMsg:
+		h.handleOnboardingMsg(msg)
+		return h, nil
+
 	case askPollMsg, askSeenMsg, askDeliveredMsg, askCancelledMsg, askTickMsg, askCloseMsg:
 		return h, h.askDialog.HandleMsg(msg, func() bool { return h.canShowAsk(time.Now()) })
 
@@ -2177,6 +2206,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.updateSizes()
 		h.syncViewport() // Recalculate viewport when window size changes
 		h.setupWizard.SetSize(msg.Width, msg.Height)
+		if h.onboarding != nil {
+			h.onboarding.SetSize(msg.Width, msg.Height)
+		}
 		h.settingsPanel.SetSize(msg.Width, msg.Height)
 		h.watcherPanel.SetSize(msg.Width, msg.Height)
 		h.agentsPanel.SetSize(msg.Width, msg.Height)
@@ -2228,7 +2260,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.endDividerDrag()
 				h.syncPointerShape()
 			}
-			if h.setupWizard.IsVisible() {
+			if h.setupWizard.IsVisible() || h.onboarding.IsVisible() {
 				return h, nil
 			}
 			if h.toolVisibilityPanel != nil && h.toolVisibilityPanel.IsVisible() {
@@ -2448,8 +2480,15 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		h.reloadHotkeysFromConfig()
 
+		// A fresh install gets the Welcome in place of the setup wizard
+		// (onboarding.go); it then holds off the prompts below like the
+		// wizard did.
+		if firstLoad {
+			h.maybeStartOnboarding(msg.err == nil && len(msg.instances) == 0)
+		}
+
 		// Show hooks installation prompt (after splash screen is gone)
-		if !h.setupWizard.IsVisible() {
+		if !h.setupWizard.IsVisible() && !h.onboarding.IsVisible() {
 			h.showPendingHooksPrompt()
 		}
 
@@ -2526,6 +2565,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			h.instancesMu.Lock()
 			oldCount := len(h.instances)
+			session.CarryOverReloadState(h.instances, msg.instances)
 			h.instances = msg.instances
 			newCount := len(msg.instances)
 			uiLog.Debug("reload_load_sessions", slog.Int("old_count", oldCount), slog.Int("new_count", newCount), slog.String("profile", h.profile))
@@ -2724,9 +2764,19 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			slog.Bool("has_err", msg.err != nil),
 			slog.String("temp_id", msg.tempID),
 			slog.Bool("has_instance", msg.instance != nil))
+		h.releaseTitle(msg.reservedTitle)
 		// Remove the creating placeholder (if any) — always, on success or error
 		if msg.tempID != "" {
 			delete(h.creatingSessions, msg.tempID)
+		}
+		// The first create after the Welcome's dialog consumes the "What you
+		// can do" request whatever its outcome (success, error, or landing
+		// during a reload), so it never pops on a later, unrelated create. A
+		// Welcome login session's create is not that create.
+		showTour := false
+		if h.onboardingTourAfterCreate && (h.onboardingLoginTempID == "" || msg.tempID != h.onboardingLoginTempID) {
+			h.onboardingTourAfterCreate = false
+			showTour = msg.err == nil && msg.instance != nil
 		}
 
 		// Handle reload scenario: session was already started in tmux, we MUST save it to JSON
@@ -2739,6 +2789,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Skip in-memory state update (reload will handle that), but persist to disk
 			uiLog.Debug("reload_save_session_created", slog.String("id", msg.instance.ID), slog.String("title", msg.instance.Title))
 			h.instancesMu.Lock()
+			// Put it last in its group; a zero Order would land mid-group (#2933).
+			msg.instance.Order = session.NextSessionOrder(h.instances, msg.instance.GroupPath)
 			h.instances = append(h.instances, msg.instance)
 			h.instancesMu.Unlock()
 			// Force save to persist the session even during reload
@@ -2751,6 +2803,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Trigger another reload to pick up the new session in the UI
 			if h.storageWatcher != nil {
 				h.storageWatcher.TriggerReload()
+			}
+			if showTour {
+				h.openOnboarding(onboardingPageTour, false)
 			}
 			return h, nil
 		}
@@ -2802,6 +2857,20 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.setError(noticeError(h.err, msg.setupWarning))
 			}
 
+			// The first session made from the Welcome opens "What you can
+			// do" once; it is on screen when the user comes back from it.
+			if showTour {
+				h.openOnboarding(onboardingPageTour, false)
+			}
+			// A Welcome login session is attached right away: the tool's
+			// own sign-in flow runs in it, and the Welcome re-checks on return.
+			if h.onboardingLoginTempID != "" && msg.tempID == h.onboardingLoginTempID {
+				h.onboardingLoginTempID = ""
+				if attachTo := h.attachSession(msg.instance); attachTo != nil {
+					return h, tea.Batch(h.fetchPreview(msg.instance, msg.instance.ID, -1), attachTo)
+				}
+			}
+
 			// Auto-attach to the new session when [ui].attach_on_create is set,
 			// so creating a session "instantly opens" it instead of only moving
 			// the cursor to it. The session was just Start()ed (see
@@ -2836,6 +2905,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// CRITICAL: Save the forked session to JSON immediately to prevent orphaning
 			uiLog.Debug("reload_save_session_forked", slog.String("id", msg.instance.ID), slog.String("title", msg.instance.Title))
 			h.instancesMu.Lock()
+			// Put it last in its group; a zero Order would land mid-group (#2933).
+			msg.instance.Order = session.NextSessionOrder(h.instances, msg.instance.GroupPath)
 			h.instances = append(h.instances, msg.instance)
 			h.instancesMu.Unlock()
 			h.forceSaveInstances()
@@ -4876,6 +4947,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h, cmd
 		}
 
+		// The Welcome / "What you can do" overlay is modal too.
+		if h.onboarding.IsVisible() {
+			return h.handleOnboardingKey(msg)
+		}
+
 		// Handle delivery and watcher panels (before settings panel)
 		if h.triggersPanel.IsVisible() {
 			var cmd tea.Cmd
@@ -6220,117 +6296,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "n":
-		// Reset any stale remote target from a previously abandoned flow.
-		h.pendingRemoteName = ""
-		// If the cursor is on a remote group/session, open the same
-		// new-session dialog as for local items but remember the remote
-		// target (#1353). The submit handler routes the create to the remote
-		// via SSH with the chosen tool, so the #743 invariant still holds:
-		// the session is never created on localhost. (Previously this
-		// quick-created a shell on the remote with no tool selection.)
-		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
-			item := h.flatItems[h.cursor]
-			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
-				return h, h.showRemoteNewSessionDialog(item)
-			}
-		}
-
-		// Collect unique project paths sorted by most recently accessed
-		type pathInfo struct {
-			path           string
-			lastAccessedAt time.Time
-		}
-		pathMap := make(map[string]*pathInfo)
-		for _, inst := range h.instances {
-			if inst.ProjectPath == "" {
-				continue
-			}
-			// Prefer the original repo root over worktree paths so suggestions
-			// don't show ephemeral worktree directories.
-			p := inst.ProjectPath
-			if inst.WorktreeRepoRoot != "" {
-				p = inst.WorktreeRepoRoot
-			}
-			existing, ok := pathMap[p]
-			if !ok {
-				// First time seeing this path.
-				accessTime := inst.LastAccessedAt
-				if accessTime.IsZero() {
-					accessTime = inst.CreatedAt // Fall back to creation time.
-				}
-				pathMap[p] = &pathInfo{
-					path:           p,
-					lastAccessedAt: accessTime,
-				}
-			} else {
-				// Update if this instance was accessed more recently.
-				accessTime := inst.LastAccessedAt
-				if accessTime.IsZero() {
-					accessTime = inst.CreatedAt
-				}
-				if accessTime.After(existing.lastAccessedAt) {
-					existing.lastAccessedAt = accessTime
-				}
-			}
-		}
-
-		// Convert to slice and sort by most recent first
-		pathInfos := make([]*pathInfo, 0, len(pathMap))
-		for _, info := range pathMap {
-			pathInfos = append(pathInfos, info)
-		}
-		sort.Slice(pathInfos, func(i, j int) bool {
-			return pathInfos[i].lastAccessedAt.After(pathInfos[j].lastAccessedAt)
-		})
-
-		// Extract sorted paths
-		paths := make([]string, len(pathInfos))
-		for i, info := range pathInfos {
-			paths[i] = info.path
-		}
-		h.newDialog.SetPathSuggestions(paths)
-
-		// Load recent sessions for the picker
-		if recents, err := h.storage.LoadRecentSessions(); err == nil {
-			h.newDialog.SetRecentSessions(recents)
-		}
-
-		// Apply the preselected tool: explicit [default_tool] config wins,
-		// otherwise fall back to the last successfully-submitted tool remembered
-		// in the profile StateDB (UX top-3 #2). First run (neither set) leaves
-		// shell selected, unchanged.
-		h.newDialog.SetDefaultTool(resolveInitialTool(session.GetDefaultTool(), rememberedTool(h.stateDB())))
-
-		// Auto-select parent group from current cursor position
-		groupPath := session.DefaultGroupPath
-		groupName := session.DefaultGroupName
-		if h.groupScope != "" {
-			// Scoped mode: default to scope root
-			groupPath = h.groupScope
-			if group, exists := h.groupTree.Groups[h.groupScope]; exists {
-				groupName = group.Name
-			}
-		}
-		if h.cursor < len(h.flatItems) {
-			item := h.flatItems[h.cursor]
-			switch item.Type {
-			case session.ItemTypeGroup:
-				groupPath = item.Group.Path
-				groupName = item.Group.Name
-			case session.ItemTypeSession:
-				// Use the session's group
-				groupPath = item.Path
-				if group, exists := h.groupTree.Groups[groupPath]; exists {
-					groupName = group.Name
-				}
-			}
-		}
-		defaultPath := h.getDefaultPathForGroup(groupPath)
-		conductors := h.activeConductorSessions()
-		suggestedParentID := h.suggestConductorParent()
-		h.newDialog.ShowInGroup(groupPath, groupName, defaultPath, conductors, suggestedParentID)
-		h.newDialog.SetWhereChoices(newDialogWhereChoicesFromConfig())
-		return h, nil
+		return h, h.openNewSessionDialog()
 
 	case "N":
 		// Check if cursor is on a remote group/session — create on remote instead
@@ -6490,6 +6456,9 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if item.Type == session.ItemTypeSession && item.Session != nil {
 				tmuxSess := item.Session.GetTmuxSession()
 				if tmuxSess != nil {
+					// Visit time first: a publish in between then sees no
+					// visit, never a cleared mark with the old visit time.
+					item.Session.ClearAcknowledgedAt()
 					tmuxSess.ResetAcknowledged()
 					// Persist to SQLite so background sync doesn't overwrite.
 					//
@@ -6913,6 +6882,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// MRU walk forward (#2058): redo — step to the next session in visit order.
 		return h.handleMRUWalk(true)
 
+	case defaultHotkeyBindings[hotkeyShowAround]:
+		// "Show me around" (ASK-131): what you can do, then Tab to the
+		// agents and sign-in page. Never the first-run variant.
+		h.openOnboarding(onboardingPageTour, false)
+		return h, nil
+
 	case defaultHotkeyBindings[hotkeyReportProblem]:
 		// "Report a problem": form -> full preview -> explicit confirm -> file
 		// through internal/issuereport (gh when logged in, else the browser).
@@ -7049,7 +7024,7 @@ func (h *Home) attachSelectedLegacy() tea.Cmd {
 		parentInst.SyncSessionIDsToTmux()
 		parentInst.MarkAccessed()
 		if parentInst.GetStatusThreadSafe() == session.StatusWaiting {
-			tmuxSess.Acknowledge()
+			parentInst.AcknowledgeVisit()
 			if db := statedb.GetGlobal(); db != nil {
 				_ = db.SetAcknowledged(parentInst.ID, true)
 			}
@@ -7122,6 +7097,11 @@ func (h *Home) performFinalShutdown(shutdownPool bool) tea.Cmd {
 		}
 		// Signal background worker to stop
 		h.cancel()
+		// A sandbox being provisioned saw the cancel above; let it roll
+		// back, or the sandbox is left running.
+		if !h.waitSandboxProvisions(sandboxQuitWait) {
+			uiLog.Warn("sandbox_provision_quit_timeout")
+		}
 		// Wait for background worker to finish (prevents race on shutdown)
 		if h.statusWorkerDone != nil {
 			select {
@@ -7592,7 +7572,7 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 	// - YELLOW (waiting) sessions turn gray when user looks at them
 	// - Detach just lets polling take over naturally
 	if inst.GetStatusThreadSafe() == session.StatusWaiting {
-		tmuxSess.Acknowledge()
+		inst.AcknowledgeVisit()
 		// Persist ack to SQLite so other instances see it
 		if db := statedb.GetGlobal(); db != nil {
 			_ = db.SetAcknowledged(inst.ID, true)
@@ -7650,7 +7630,7 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 		// of escape codes races with the Bubble Tea renderer.
 
 		// Update last accessed time to detach time (more accurate than attach time)
-		inst.MarkAccessed()
+		h.markDetachAccessed(inst)
 
 		// NOTE: We don't acknowledge on detach anymore.
 		// Acknowledgment happens on ATTACH (only if session was waiting/yellow).
@@ -7716,6 +7696,28 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 
 		return statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: currentWorkDir, detachedAt: detachedAt}
 	})
+}
+
+// markDetachAccessed stamps the detach time on the session that was on screen
+// when the user detached. That is attached unless the user jumped away with
+// the notification bar's Ctrl+b 1-9 keys during the attach, which
+// consumeAckSignal recorded in lastNotifSwitchID (#2949). The value is only
+// read here; the detach paths below still consume it for cursor sync.
+func (h *Home) markDetachAccessed(attached *session.Instance) {
+	target := attached
+	h.lastNotifSwitchMu.Lock()
+	switchedID := h.lastNotifSwitchID
+	h.lastNotifSwitchMu.Unlock()
+	if switchedID != "" && (attached == nil || switchedID != attached.ID) {
+		h.instancesMu.RLock()
+		if switched := h.instanceByID[switchedID]; switched != nil {
+			target = switched
+		}
+		h.instancesMu.RUnlock()
+	}
+	if target != nil {
+		target.MarkAccessed()
+	}
 }
 
 func (h *Home) followAttachReturnCwd(msg statusUpdateMsg) {
@@ -8386,7 +8388,7 @@ func (h *Home) renderSessionItem(
 			hookStatus = h.hookWatcher.GetHookStatus(inst.ID)
 		}
 		confirmedTs, confirmedObserved := inst.LastObservedActivity()
-		ts := sessionActivityTime(inst.CreatedAt, inst.LastStartedAt, inst.LastActivityAt(), inst.LastAccessedAt, confirmedTs, confirmedObserved, hookStatus)
+		ts := sessionActivityTime(inst.CreatedAt, inst.LastStartedAt, inst.LastActivityAt(), inst.GetLastAccessedAtThreadSafe(), confirmedTs, confirmedObserved, hookStatus)
 		timestampBadge = tsStyle.Render(" " + formatRelativeTime(ts))
 	}
 
@@ -8850,4 +8852,130 @@ func (h *Home) handleSessionSwitcherKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Ignore other keys (incl. Tab) without disturbing the commit timer.
 		return h, nil
 	}
+}
+
+// openNewSessionDialog is the `n` key: the New Session dialog with this
+// folder, the remembered tool and the selected group filled in (ASK-110), or
+// the remote variant when the cursor is on a remote. The first-run Welcome
+// opens it the same way (onboarding.go).
+func (h *Home) openNewSessionDialog() tea.Cmd {
+	// Reset any stale remote target from a previously abandoned flow.
+	h.pendingRemoteName = ""
+	// If the cursor is on a remote group/session, open the same
+	// new-session dialog as for local items but remember the remote
+	// target (#1353). The submit handler routes the create to the remote
+	// via SSH with the chosen tool, so the #743 invariant still holds:
+	// the session is never created on localhost. (Previously this
+	// quick-created a shell on the remote with no tool selection.)
+	if h.cursor >= 0 && h.cursor < len(h.flatItems) {
+		item := h.flatItems[h.cursor]
+		if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
+			return h.showRemoteNewSessionDialog(item)
+		}
+	}
+	return h.openLocalNewSessionDialog()
+}
+
+// openLocalNewSessionDialog opens the new-session dialog for this machine,
+// whatever the cursor is on. A remote cursor row falls back to the default
+// group. The Welcome uses it directly: it promises a local session.
+func (h *Home) openLocalNewSessionDialog() tea.Cmd {
+	h.pendingRemoteName = ""
+
+	// Collect unique project paths sorted by most recently accessed
+	type pathInfo struct {
+		path           string
+		lastAccessedAt time.Time
+	}
+	pathMap := make(map[string]*pathInfo)
+	for _, inst := range h.instances {
+		if inst.ProjectPath == "" {
+			continue
+		}
+		// Prefer the original repo root over worktree paths so suggestions
+		// don't show ephemeral worktree directories.
+		p := inst.ProjectPath
+		if inst.WorktreeRepoRoot != "" {
+			p = inst.WorktreeRepoRoot
+		}
+		existing, ok := pathMap[p]
+		if !ok {
+			// First time seeing this path.
+			accessTime := inst.GetLastAccessedAtThreadSafe()
+			if accessTime.IsZero() {
+				accessTime = inst.CreatedAt // Fall back to creation time.
+			}
+			pathMap[p] = &pathInfo{
+				path:           p,
+				lastAccessedAt: accessTime,
+			}
+		} else {
+			// Update if this instance was accessed more recently.
+			accessTime := inst.GetLastAccessedAtThreadSafe()
+			if accessTime.IsZero() {
+				accessTime = inst.CreatedAt
+			}
+			if accessTime.After(existing.lastAccessedAt) {
+				existing.lastAccessedAt = accessTime
+			}
+		}
+	}
+
+	// Convert to slice and sort by most recent first
+	pathInfos := make([]*pathInfo, 0, len(pathMap))
+	for _, info := range pathMap {
+		pathInfos = append(pathInfos, info)
+	}
+	sort.Slice(pathInfos, func(i, j int) bool {
+		return pathInfos[i].lastAccessedAt.After(pathInfos[j].lastAccessedAt)
+	})
+
+	// Extract sorted paths
+	paths := make([]string, len(pathInfos))
+	for i, info := range pathInfos {
+		paths[i] = info.path
+	}
+	h.newDialog.SetPathSuggestions(paths)
+
+	// Load recent sessions for the picker
+	if recents, err := h.storage.LoadRecentSessions(); err == nil {
+		h.newDialog.SetRecentSessions(recents)
+	}
+
+	// Apply the preselected tool: explicit [default_tool] config wins,
+	// otherwise fall back to the last successfully-submitted tool remembered
+	// in the profile StateDB (UX top-3 #2). First run (neither set) leaves
+	// shell selected, unchanged.
+	h.newDialog.SetDefaultTool(resolveInitialTool(session.GetDefaultTool(), rememberedTool(h.stateDB())))
+
+	// Auto-select parent group from current cursor position
+	groupPath := session.DefaultGroupPath
+	groupName := session.DefaultGroupName
+	if h.groupScope != "" {
+		// Scoped mode: default to scope root
+		groupPath = h.groupScope
+		if group, exists := h.groupTree.Groups[h.groupScope]; exists {
+			groupName = group.Name
+		}
+	}
+	if h.cursor < len(h.flatItems) {
+		item := h.flatItems[h.cursor]
+		switch item.Type {
+		case session.ItemTypeGroup:
+			groupPath = item.Group.Path
+			groupName = item.Group.Name
+		case session.ItemTypeSession:
+			// Use the session's group
+			groupPath = item.Path
+			if group, exists := h.groupTree.Groups[groupPath]; exists {
+				groupName = group.Name
+			}
+		}
+	}
+	defaultPath := h.getDefaultPathForGroup(groupPath)
+	conductors := h.activeConductorSessions()
+	suggestedParentID := h.suggestConductorParent()
+	h.newDialog.ShowInGroup(groupPath, groupName, defaultPath, conductors, suggestedParentID)
+	h.newDialog.SetWhereChoices(newDialogWhereChoicesFromConfig())
+	return nil
 }

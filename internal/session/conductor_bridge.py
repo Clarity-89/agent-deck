@@ -201,9 +201,20 @@ HEARTBEAT_SKIP_LIMIT = 3
 # Mirror the deployed bridge's file logging (<data>/conductor/bridge.log) when
 # the conductor data dir already exists. Guard so importing this module in an
 # environment without that dir (e.g. CI/tests) never fails at import time.
+def _stdout_is_log_file() -> bool:
+    """True when stdout already is bridge.log, as under the launchd plist and
+    systemd unit (issue #2946); adding a FileHandler then logs every line twice."""
+    try:
+        out = os.fstat(sys.stdout.fileno())
+        log_file = os.stat(LOG_PATH)
+    except (AttributeError, OSError, ValueError):
+        return False
+    return (out.st_dev, out.st_ino) == (log_file.st_dev, log_file.st_ino)
+
+
 _log_handlers = [logging.StreamHandler(sys.stdout)]
 try:
-    if CONDUCTOR_DIR.exists():
+    if CONDUCTOR_DIR.exists() and not _stdout_is_log_file():
         _log_handlers.append(logging.FileHandler(LOG_PATH, encoding="utf-8"))
 except OSError:
     pass
@@ -1648,11 +1659,15 @@ def get_sessions_list(
 
 
 def get_sessions_list_all(profiles: list[str]) -> list[tuple[str, dict]]:
-    """Get sessions from all profiles, each tagged with profile name."""
+    """Get the sessions to show a user from all profiles, each tagged with
+    profile name. Archived sessions are left out, the same rule as `status`.
+    get_sessions_list keeps them: conductor dedupe must see archived rows."""
     all_sessions = []
     for profile in profiles:
         sessions = get_sessions_list(profile)
         for s in sessions or []:
+            if s.get("archived"):
+                continue
             all_sessions.append((profile, s))
     return all_sessions
 
@@ -2782,7 +2797,7 @@ def create_telegram_bot(config: dict):
         await message.answer(
             "Conductor Commands:\n"
             "/status    - Aggregated status across all profiles\n"
-            "/sessions  - List all sessions (all profiles)\n"
+            "/sessions  - List active sessions (all profiles)\n"
             "/restart   - Restart a conductor (specify name)\n"
             "/help      - This message\n\n"
             f"Conductors: {', '.join(names) if names else 'none'}\n"
@@ -3626,7 +3641,7 @@ def create_slack_app(config: dict):
         await respond(
             "Conductor Commands:\n"
             "/ad-status    - Aggregated status across all profiles\n"
-            "/ad-sessions  - List all sessions (all profiles)\n"
+            "/ad-sessions  - List active sessions (all profiles)\n"
             "/ad-restart   - Restart a conductor (specify name)\n"
             "/ad-help      - This message\n\n"
             f"Conductors: {', '.join(names) if names else 'none'}\n"
@@ -3814,7 +3829,7 @@ def create_discord_bot(config: dict):
 
     @bot.tree.command(
         name="ad-sessions",
-        description="List all sessions (all profiles)",
+        description="List active sessions (all profiles)",
         guild=g,
     )
     async def dc_cmd_sessions(interaction: discord.Interaction):
@@ -3923,7 +3938,7 @@ def create_discord_bot(config: dict):
         await interaction.response.send_message(
             "**Conductor Commands:**\n"
             "`/ad-status`    - Aggregated status across all profiles\n"
-            "`/ad-sessions`  - List all sessions (all profiles)\n"
+            "`/ad-sessions`  - List active sessions (all profiles)\n"
             "`/ad-restart`   - Restart a conductor (specify name)\n"
             "`/ad-help`      - This message\n\n"
             f"**Conductors:** {', '.join(names) if names else 'none'}\n"
@@ -4267,7 +4282,7 @@ def mattermost_command_reply(command: str, argument: str) -> str:
     return (
         "Conductor commands:\n"
         "- `!status`: aggregated status across all profiles\n"
-        "- `!sessions`: list all sessions (all profiles)\n"
+        "- `!sessions`: list active sessions (all profiles)\n"
         "- `!restart [name]`: restart a conductor (default: the first)\n"
         "- `!help`: this message\n\n"
         f"Conductors: {', '.join(names) if names else 'none'}\n"
@@ -5056,6 +5071,11 @@ async def heartbeat_loop(
                     if s_title.startswith("conductor-"):
                         continue
                     if s_group != name and not s_group.startswith(f"{name}/"):
+                        continue
+                    # Archived children neither count nor wake the conductor, as
+                    # in `status`. `sessions` keeps them: the inbox lookup below
+                    # reads the full list.
+                    if s.get("archived"):
                         continue
                     scoped_sessions.append(s)
 

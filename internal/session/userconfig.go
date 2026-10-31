@@ -139,6 +139,10 @@ type UserConfig struct {
 	// (docs/comms.md). Off by default while the ledger is canaried.
 	Comms CommsSettings `toml:"comms,omitempty"`
 
+	// Trace is the [trace] section: agent activity tracing (ASK-129,
+	// internal/trace). Off by default; AGENTDECK_TRACE overrides it.
+	Trace TraceSettings `toml:"trace,omitempty"`
+
 	// MCPs defines available MCP servers for the MCP Manager
 	// These can be attached/detached per-project via the MCP Manager (M key)
 	MCPs map[string]MCPDef `toml:"mcps,omitempty"`
@@ -348,6 +352,24 @@ type UserConfig struct {
 	// Harnesses overrides the core install/login table per harness
 	// ([harnesses.<name>] binary, install_command, login_command, docs_url).
 	Harnesses map[string]harness.Override `toml:"harnesses,omitempty"`
+}
+
+// TraceSettings is the [trace] section.
+type TraceSettings struct {
+	// Level is off (default), metadata (ids, tool names, timings, status)
+	// or summaries (adds a short scrubbed shape summary per tool call).
+	Level string `toml:"level,omitempty"`
+}
+
+// TraceLevelSetting returns the configured [trace] level string ("" when
+// unset or the config is unreadable). The env override is applied by the
+// caller (trace.ResolveLevel).
+func TraceLevelSetting() string {
+	cfg, _ := LoadUserConfig()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Trace.Level
 }
 
 // CommsSettings is the [comms] section.
@@ -1154,6 +1176,16 @@ type TelemetrySettings struct {
 
 	// Level is "full" (default) or "basic". Config can only lower the level.
 	Level string `toml:"level,omitempty"`
+
+	// OrgID is an opaque org id (a-z, 0-9, inner dashes, 3-40 chars, or a
+	// UUID) added as the "org" property to detailed events. A managed
+	// configuration's org_id wins over it. Default: none.
+	OrgID string `toml:"org_id,omitempty"`
+
+	// CrashDSN turns on crash and error reports to this Sentry DSN
+	// (https://<public key>@<host>/<project>). A managed configuration's
+	// crash_dsn wins over it. Default: none (crash reports off).
+	CrashDSN string `toml:"crash_dsn,omitempty"`
 }
 
 // OpenClawSettings configures the OpenClaw gateway connection.
@@ -1958,6 +1990,32 @@ type NotificationsConfig struct {
 	// on by default; this covers the operator, including TOP-LEVEL sessions with
 	// no parent, which the transition path cannot reach at all.
 	Desktop bool `toml:"desktop,omitempty"`
+
+	// Sort picks the order of the notification bar (and so which session each
+	// Ctrl+b 1-9 key jumps to). "waiting" (default) lists the session that
+	// started waiting most recently first. "last_accessed" lists the session
+	// you attached to most recently first, like Alt+Tab (#2949). Any other
+	// value falls back to "waiting".
+	Sort string `toml:"sort,omitempty"`
+}
+
+// Notification bar sort modes for [notifications] sort.
+const (
+	NotificationSortWaiting      = "waiting"
+	NotificationSortLastAccessed = "last_accessed"
+)
+
+// GetSort returns the normalized notification bar sort mode. Unknown or empty
+// values return NotificationSortWaiting so the default order never changes.
+func (n NotificationsConfig) GetSort() string {
+	return normalizeNotificationSort(n.Sort)
+}
+
+func normalizeNotificationSort(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), NotificationSortLastAccessed) {
+		return NotificationSortLastAccessed
+	}
+	return NotificationSortWaiting
 }
 
 // GetDesktopEnabled reports whether desktop notifications are enabled.

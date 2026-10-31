@@ -11,10 +11,13 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/mattn/go-runewidth"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/provider"
@@ -110,6 +113,11 @@ func handleRemote(profile string, args []string) {
 // return through its own context handling after its ssh groups are gone.
 const remoteSignalGrace = 2 * time.Second
 
+// remoteSignalProviderWait bounds how long a signalled remote command waits
+// for provider work (a rollback or destroy, each bounded at 2 minutes by
+// the provider package) before it exits anyway.
+const remoteSignalProviderWait = 3 * time.Minute
+
 // installRemoteSignalCleanup makes a signal to any `remote ...` command kill
 // its ssh process groups before the CLI exits. ssh runs in its own process
 // group (so a timeout can kill everything it started), which also means the
@@ -123,13 +131,33 @@ func installRemoteSignalCleanup() {
 	go func() {
 		sig := <-sigs
 		session.KillSSHProcesses()
-		time.Sleep(remoteSignalGrace)
+		awaitRemoteSignalExit(sigs, providerWork, remoteSignalGrace, remoteSignalProviderWait)
 		code := 1
 		if s, ok := sig.(syscall.Signal); ok {
 			code = 128 + int(s)
 		}
 		exitCLI(code)
 	}()
+}
+
+// awaitRemoteSignalExit returns when a signalled remote command may exit:
+// after grace, or, while provider work is in flight (a sandbox create
+// rolling back, a destroy), once that work is done, so the sandbox is not
+// left running. That wait is bounded by maxWait, and a second signal ends
+// it at once.
+func awaitRemoteSignalExit(sigs <-chan os.Signal, work *providerWorkTracker, grace, maxWait time.Duration) {
+	if !work.busy() {
+		time.Sleep(grace)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "Waiting for the sandbox provider to clean up (press Ctrl-C again to quit now)...")
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	select {
+	case <-work.done():
+	case <-sigs:
+	case <-timer.C:
+	}
 }
 
 func isRemoteManagementCommand(name string) bool {
@@ -382,27 +410,51 @@ func handleRemoteAdd(args []string) {
 }
 
 func handleRemoteRemove(args []string) {
+	if code := runRemoteRemove(args); code != 0 {
+		exitCLI(code)
+	}
+}
+
+// runRemoteRemove is `remote remove <name>`: forget the remote. For a
+// provider sandbox it says the sandbox keeps running and points to `remote
+// destroy`; on a terminal it asks first.
+func runRemoteRemove(args []string) int {
+	out := providerDeps.stdout
 	if len(args) < 1 {
-		fmt.Println("Usage: agent-deck remote remove <name>")
-		exitCLI(1)
+		fmt.Fprintln(out, "Usage: agent-deck remote remove <name>")
+		return 1
 	}
 
 	name := args[0]
 
 	config, err := session.LoadUserConfig()
 	if err != nil {
-		fmt.Printf("Error: failed to load config: %v\n", err)
-		exitCLI(1)
+		fmt.Fprintf(out, "Error: failed to load config: %v\n", err)
+		return 1
 	}
 
-	if config.Remotes == nil {
-		fmt.Printf("Error: remote '%s' not found\n", name)
-		exitCLI(1)
+	rc, exists := config.Remotes[name]
+	if !exists {
+		fmt.Fprintf(out, "Error: remote '%s' not found\n", name)
+		return 1
 	}
 
-	if _, exists := config.Remotes[name]; !exists {
-		fmt.Printf("Error: remote '%s' not found\n", name)
-		exitCLI(1)
+	if provider.IsSandbox(rc) {
+		errOut := providerDeps.stderr
+		files := filepath.Dir(rc.SSHConfig)
+		if rc.SSHConfig == "" {
+			files, _ = provider.SandboxDir(name)
+		}
+		fmt.Fprintf(errOut, "Warning: '%s' is a sandbox (provider %s). Removing the remote leaves sandbox %s still running and its ssh files in %s.\n", name, rc.Provider, rc.SandboxID, files)
+		fmt.Fprintf(errOut, "  To stop and destroy it instead: agent-deck remote destroy %s\n", name)
+		if providerDeps.isTTY() {
+			fmt.Fprintf(out, "Forget '%s' and leave the sandbox running? [y/N] ", name)
+			answer, _ := bufio.NewReader(providerDeps.stdin).ReadString('\n')
+			if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+				fmt.Fprintln(out, "Aborted. Nothing was changed.")
+				return 1
+			}
+		}
 	}
 
 	delete(config.Remotes, name)
@@ -413,11 +465,12 @@ func handleRemoteRemove(args []string) {
 	}
 
 	if err := session.SaveUserConfig(config); err != nil {
-		fmt.Printf("Error: failed to save config: %v\n", err)
-		exitCLI(1)
+		fmt.Fprintf(out, "Error: failed to save config: %v\n", err)
+		return 1
 	}
 
-	fmt.Printf("Removed remote '%s'\n", name)
+	fmt.Fprintf(out, "Removed remote '%s'\n", name)
+	return 0
 }
 
 func handleRemoteList(args []string) {
@@ -778,23 +831,7 @@ func handleRemoteSessions(args []string) {
 
 		if !jsonOutput {
 			fmt.Printf("\n═══ Remote: %s (%s) ═══\n\n", name, rc.Host)
-			if len(sessions) == 0 {
-				fmt.Println("  No sessions found.")
-			} else {
-				fmt.Printf("  %-20s %-15s %-10s %s\n", "TITLE", "TOOL", "STATUS", "ID")
-				fmt.Printf("  %s\n", strings.Repeat("-", 60))
-				for _, s := range sessions {
-					title := s.Title
-					if len(title) > 20 {
-						title = title[:17] + "..."
-					}
-					id := s.ID
-					if len(id) > 8 {
-						id = id[:8]
-					}
-					fmt.Printf("  %-20s %-15s %-10s %s\n", title, s.Tool, s.Status, id)
-				}
-			}
+			writeRemoteSessionsText(os.Stdout, sessions)
 		}
 	}
 
@@ -806,6 +843,38 @@ func handleRemoteSessions(args []string) {
 	}
 	if envelope && len(output.Errors) != 0 {
 		exitCLI(1)
+	}
+}
+
+// writeRemoteSessionsText prints one remote's session table for the text
+// output of `remote sessions`. Archived rows are left out (#2972): `list
+// --json` on the remote keeps them with "archived": true, and an archived
+// session keeps a live-looking status. The JSON outputs still carry them.
+// Titles are cut by display width, so a multi-byte character is never split.
+func writeRemoteSessionsText(w io.Writer, sessions []session.RemoteSessionInfo) {
+	live := make([]session.RemoteSessionInfo, 0, len(sessions))
+	for _, s := range sessions {
+		if !s.Archived {
+			live = append(live, s)
+		}
+	}
+	archived := len(sessions) - len(live)
+	if len(live) == 0 {
+		fmt.Fprintln(w, "  No sessions found.")
+	} else {
+		fmt.Fprintf(w, "  %-20s %-15s %-10s %s\n", "TITLE", "TOOL", "STATUS", "ID")
+		fmt.Fprintf(w, "  %s\n", strings.Repeat("-", 60))
+		for _, s := range live {
+			title := runewidth.FillRight(truncateWidth(s.Title, 20), 20)
+			id := s.ID
+			if len(id) > 8 {
+				id = id[:8]
+			}
+			fmt.Fprintf(w, "  %s %-15s %-10s %s\n", title, s.Tool, s.Status, id)
+		}
+	}
+	if archived > 0 {
+		fmt.Fprintf(w, "  (%d archived not shown; --json lists them)\n", archived)
 	}
 }
 

@@ -651,6 +651,7 @@ type Instance struct {
 	// carrying one must not revert ClaudeSessionID to the stalled copy.
 	claudeSupersededIDs         map[string]struct{}
 	hookLastUpdate              time.Time // When hook status was last received
+	acknowledgedAt              time.Time // When the user last marked this session seen (from SQLite on load)
 	linkedClaudeSessionID       string    // Last Claude id confirmClaudeSessionLink wrote a session_links row for
 	skipRecoveryTurn            bool      // SkipConductorRecoveryTurn: the next spawn sends no recovery turn
 	restartReason               string    // SetRestartReason: why the next restart happens, for its resume note
@@ -1178,15 +1179,26 @@ func (inst *Instance) SetToolThreadSafe(t string) {
 // the attach path (see attachSession's no-synchronous-save note); one
 // UPDATE is not.
 func (inst *Instance) MarkAccessed() {
-	inst.LastAccessedAt = time.Now()
+	now := time.Now()
+	inst.mu.Lock()
+	inst.LastAccessedAt = now
+	inst.mu.Unlock()
 	if err := inst.withOwningStateDB(func(db *statedb.StateDB) error {
-		return db.WriteLastAccessed(inst.ID, inst.LastAccessedAt)
+		return db.WriteLastAccessed(inst.ID, now)
 	}); err != nil && !errors.Is(err, errNoStateDB) {
 		sessionLog.Debug("last_accessed_persist_failed",
 			slog.String("instance", inst.ID),
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// GetLastAccessedAtThreadSafe returns LastAccessedAt under the read lock, for
+// readers off the UI goroutine such as the notification bar sync (#2949).
+func (inst *Instance) GetLastAccessedAtThreadSafe() time.Time {
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.LastAccessedAt
 }
 
 // GetLastActivityTime returns when the session was last active (content changed)
@@ -1227,8 +1239,8 @@ func (inst *Instance) DisplayLastActivityTime() time.Time {
 	if ok {
 		return ts
 	}
-	if !inst.LastAccessedAt.IsZero() {
-		return inst.LastAccessedAt
+	if la := inst.GetLastAccessedAtThreadSafe(); !la.IsZero() {
+		return la
 	}
 	return inst.CreatedAt
 }
@@ -2397,7 +2409,13 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 			// Reset stale acknowledged flag from ReconnectSessionLazy.
 			// Without this, sessions loaded from SQLite with previousStatus="idle"
 			// would report idle even when the hook file says waiting/running.
-			if i.tmuxSession != nil && (hs.Status == "running" || hs.Status == "waiting") {
+			// A "waiting" event older than the user's last visit is the turn
+			// they already saw: keep the visit, or every reload undoes it. A
+			// permission prompt or notification still needs an answer, so it
+			// always resets, as UpdateHookStatus treats it.
+			needsAnswer := hs.Event == "PermissionRequest" || hs.Event == "Notification"
+			if i.tmuxSession != nil && (hs.Status == "running" ||
+				(hs.Status == "waiting" && (needsAnswer || !HookPredatesVisit(hs.UpdatedAt, hs.ReceivedAt, i.acknowledgedAt)))) {
 				i.tmuxSession.ResetAcknowledged()
 			}
 		}
@@ -2427,7 +2445,8 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	// When this path is stale/missing, control naturally falls through to tmux
 	// polling and tool-specific session sync (tmux env/process-files/disk).
 	if HookStatusTool(i.Tool) && i.hookStatus != "" &&
-		time.Since(i.hookLastUpdate) < hookFastPathFreshnessForTool(i.Tool, i.hookStatus) {
+		(time.Since(i.hookLastUpdate) < hookFastPathFreshnessForTool(i.Tool, i.hookStatus) ||
+			i.hookHeldByTerminalEventLocked()) {
 		i.hookLagFlipped = false
 		i.bgWorkActive = false
 		i.bgWork = tmux.BackgroundWork{}
@@ -2482,11 +2501,16 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 			if IsCodexCompatible(i.Tool) {
 				// Codex completion should surface as attention-needed.
 				// Keep this as waiting and let tmux settle to idle if the user
-				// has acknowledged and no new activity appears.
-				if i.tmuxSession != nil {
-					i.tmuxSession.ResetAcknowledged()
+				// has acknowledged and no new activity appears. A completion
+				// older than the user's last visit was already seen.
+				if HookPredatesVisit(i.hookLastUpdate, time.Time{}, i.acknowledgedAt) {
+					i.Status = StatusIdle
+				} else {
+					if i.tmuxSession != nil {
+						i.tmuxSession.ResetAcknowledged()
+					}
+					i.Status = StatusWaiting
 				}
-				i.Status = StatusWaiting
 			} else {
 				// Claude fires its Stop hook (→ "waiting") when the FOREGROUND turn
 				// ends, including the turn that launched a Workflow, background
@@ -3201,4 +3225,30 @@ func (i *Instance) CaptureLoadedMCPs() {
 	}
 
 	i.LoadedMCPNames = mcpInfo.AllNames()
+}
+
+// HookPredatesVisit reports whether a hook event happened before the user's
+// last visit. The hook "ts" is whole seconds, so without the handler's
+// received time a Stop in the visit's own second counts as newer: a seen turn
+// shown as new beats a new turn shown as seen.
+func HookPredatesVisit(updated, received, visit time.Time) bool {
+	if !received.IsZero() {
+		return received.Before(visit)
+	}
+	return updated.Before(visit.Truncate(time.Second))
+}
+
+// AcknowledgedAt returns when the user last marked this session seen, as
+// loaded from storage, or zero when unknown.
+func (i *Instance) AcknowledgedAt() time.Time {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.acknowledgedAt
+}
+
+// ClearAcknowledgedAt drops the visit time once the session is marked unread.
+func (i *Instance) ClearAcknowledgedAt() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.acknowledgedAt = time.Time{}
 }

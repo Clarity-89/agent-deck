@@ -264,7 +264,7 @@ func SortInstancesByActionable(insts []*Instance) {
 			if pi != pj {
 				return pi < pj
 			}
-			ai, aj := insts[i].LastAccessedAt, insts[j].LastAccessedAt
+			ai, aj := insts[i].GetLastAccessedAtThreadSafe(), insts[j].GetLastAccessedAtThreadSafe()
 			if !ai.Equal(aj) {
 				return ai.After(aj)
 			}
@@ -296,6 +296,38 @@ func currentGroupSortMode() string {
 		return v
 	}
 	return "creation"
+}
+
+// nextOrder returns the Order that puts a new session last among sessions:
+// max(Order)+1, or 0 for none. len(sessions) is wrong once orders have gaps or
+// duplicates (#2933).
+func nextOrder(sessions []*Instance) int {
+	next := 0
+	for _, s := range sessions {
+		if s.Order >= next {
+			next = s.Order + 1
+		}
+	}
+	return next
+}
+
+// NextSessionOrder returns the Order that puts a new session last in
+// groupPath ("" means the default group), computed over instances.
+func NextSessionOrder(instances []*Instance, groupPath string) int {
+	if groupPath == "" {
+		groupPath = DefaultGroupPath
+	}
+	var inGroup []*Instance
+	for _, inst := range instances {
+		p := inst.GroupPath
+		if p == "" {
+			p = DefaultGroupPath
+		}
+		if p == groupPath {
+			inGroup = append(inGroup, inst)
+		}
+	}
+	return nextOrder(inGroup)
 }
 
 // NewGroupTree creates a new group tree from instances
@@ -1681,7 +1713,7 @@ func (t *GroupTree) AddSession(inst *Instance) {
 		t.Expanded[groupPath] = true
 		t.rebuildGroupList()
 	}
-	inst.Order = len(group.Sessions)
+	inst.Order = nextOrder(group.Sessions)
 	group.Sessions = append(group.Sessions, inst)
 	t.updateGroupDefaultPath(groupPath)
 	t.initializeDerivedSnapshots()
@@ -1821,7 +1853,7 @@ func mostRecentPathForSessions(sessions []*Instance) string {
 		if s.ProjectPath == "" {
 			continue
 		}
-		if mostRecent == nil || s.LastAccessedAt.After(mostRecent.LastAccessedAt) {
+		if mostRecent == nil || s.GetLastAccessedAtThreadSafe().After(mostRecent.GetLastAccessedAtThreadSafe()) {
 			mostRecent = s
 		}
 	}
