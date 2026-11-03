@@ -17,7 +17,8 @@ import (
 // By default only sessions in stopped/error state may be removed; --force
 // bypasses the gate. --all-errored removes every session in error state.
 // --prune-worktree additionally kills the tmux process and removes any git
-// worktree associated with the session (registry-only by default).
+// worktree associated with the session (registry-only by default), and
+// --delete-branch then deletes the branch that worktree was on.
 //
 // Claude transcripts under ~/.claude/projects/<slug>/ are never touched.
 func handleSessionRemove(profile string, args []string) {
@@ -28,6 +29,7 @@ func handleSessionRemove(profile string, args []string) {
 	force := fs.Bool("force", false, "Remove even when the session is running/waiting/idle; with --all-errored, also include pinned sessions (destructive)")
 	allErrored := fs.Bool("all-errored", false, "Remove every unpinned session currently in the 'error' state (bulk); pinned sessions are skipped unless --force is given")
 	pruneWorktree := fs.Bool("prune-worktree", false, "Also remove the session's git worktree (destructive: discards uncommitted work; a worktree another session uses is kept)")
+	deleteBranch := fs.Bool("delete-branch", false, "With --prune-worktree, also delete the removed worktree's branch (destructive: unpushed commits are lost; the repository's default branch is kept)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session remove <id|title> [options]")
@@ -38,7 +40,8 @@ func handleSessionRemove(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("This is registry-only by default: Claude transcripts under")
 		fmt.Println("~/.claude/projects/ are preserved. Pass --prune-worktree to also")
-		fmt.Println("kill the process and delete the git worktree (destructive).")
+		fmt.Println("kill the process and delete the git worktree (destructive), and")
+		fmt.Println("--delete-branch to delete the worktree's branch with it.")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -50,6 +53,10 @@ func handleSessionRemove(profile string, args []string) {
 
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(*jsonOutput, quietMode)
+	if *deleteBranch && !*pruneWorktree {
+		out.Error("--delete-branch requires --prune-worktree", ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
 
 	storage, instances, groups, err := loadSessionData(profile)
 	if err != nil {
@@ -58,7 +65,7 @@ func handleSessionRemove(profile string, args []string) {
 	}
 
 	if *allErrored {
-		removeAllErrored(out, storage, instances, groups, *pruneWorktree, *force)
+		removeAllErrored(out, storage, instances, groups, *pruneWorktree, *deleteBranch, *force)
 		return
 	}
 
@@ -103,7 +110,7 @@ func handleSessionRemove(profile string, args []string) {
 	inst.RecordTelemetryEnd(telemetry.EndDelete)
 
 	if *pruneWorktree {
-		pruneSessionWorktree(inst, instances)
+		pruneSessionWorktree(inst, instances, *deleteBranch)
 	}
 
 	// v1.9.1 (#909): RemoveSessionAndVerify replaces the
@@ -145,6 +152,7 @@ func removeAllErrored(
 	instances []*session.Instance,
 	groups []*session.GroupData,
 	pruneWorktree bool,
+	deleteBranch bool,
 	force bool,
 ) {
 	var doomed []*session.Instance
@@ -162,7 +170,7 @@ func removeAllErrored(
 		doomed = append(doomed, inst)
 	}
 
-	removed := bulkRemoveSessions(out, storage, instances, groups, doomed, pruneWorktree)
+	removed := bulkRemoveSessions(out, storage, instances, groups, doomed, pruneWorktree, deleteBranch)
 
 	msg := fmt.Sprintf("Removed %d errored session(s)", len(removed))
 	if skipped > 0 {
@@ -187,7 +195,8 @@ func removeAllErrored(
 //     SIGTERM→SIGKILL escalation is how a 33-hour orphan claude process with a
 //     since-deleted AGENTDECK_INSTANCE_ID was created.
 //   - pruneWorktree is OPT-IN: it force-deletes the git worktree directory,
-//     destroying uncommitted work. Never infer it.
+//     destroying uncommitted work. Never infer it. deleteBranch, opt-in too,
+//     then deletes the branch a removed worktree was on.
 //   - SaveGroupsOnly, never SaveWithGroups (#909): a full-table rewrite's
 //     INSERT OR REPLACE resurrects the rows we just deleted. NewGroupTreeWithGroups
 //     over the SURVIVING set also preserves groups whose last session just went
@@ -206,6 +215,7 @@ func bulkRemoveSessions(
 	groups []*session.GroupData,
 	doomed []*session.Instance,
 	pruneWorktree bool,
+	deleteBranch bool,
 ) []removedSessionRow {
 	doomedIDs := make(map[string]bool, len(doomed))
 	for _, inst := range doomed {
@@ -224,7 +234,7 @@ func bulkRemoveSessions(
 		saveStoppedBeforeRemoval(storage, inst)
 		_ = inst.KillAndWait()
 		if pruneWorktree {
-			pruneSessionWorktree(inst, remaining)
+			pruneSessionWorktree(inst, remaining, deleteBranch)
 		}
 		if err := storage.DeleteInstance(inst.ID); err != nil {
 			out.Error(fmt.Sprintf("failed to remove session %s: %v", inst.ID, err), ErrCodeInvalidOperation)
@@ -291,17 +301,18 @@ func saveStoppedBeforeRemoval(storage *session.Storage, inst *session.Instance) 
 	}
 }
 
-// pruneSessionWorktree kills the session and removes its git worktree (if any).
-// Errors are logged to stderr but never block the remove; a worktree that
-// stays behind is always said so on stderr, so a caller reading it can tell
-// a kept directory from a removed one.
+// pruneSessionWorktree kills the session and removes its git worktree (if any),
+// and with deleteBranch the branch the worktree was on. Errors are logged to
+// stderr but never block the remove; a worktree or branch that stays behind is
+// always said so on stderr, so a caller reading it can tell a kept one from a
+// removed one.
 //
 // Uses KillAndWait so the SIGTERM→SIGKILL escalation completes before
 // this short-lived CLI exits (issue #59, v1.7.68).
 //
 // A worktree another session in others still works in is kept (#1449), as the
 // TUI's delete keeps it: removing it would strand that session.
-func pruneSessionWorktree(inst *session.Instance, others []*session.Instance) {
+func pruneSessionWorktree(inst *session.Instance, others []*session.Instance, deleteBranch bool) {
 	_ = inst.KillAndWait()
 	if !inst.IsWorktree() {
 		return
@@ -315,17 +326,53 @@ func pruneSessionWorktree(inst *session.Instance, others []*session.Instance) {
 		fmt.Fprintf(os.Stderr, "warn: worktree remove failed for %s: %v\n", inst.ID, err)
 		return
 	}
-	// A worktree_reuse row points at the main working tree, which stays
-	// (#1200); git would only refuse it, and that refusal is not a failure.
-	// A directory already gone leaves only its admin entry, which prune takes.
+	if removeWorktree(inst, backend) && deleteBranch {
+		deleteWorktreeBranch(inst, backend)
+	}
+}
+
+// removeWorktree removes inst's worktree and reports whether its directory is
+// gone, which frees its branch. A worktree_reuse row points at the main
+// working tree, which stays (#1200); git would only refuse it, and that
+// refusal is not a failure. A directory already gone leaves only its admin
+// entry, which prune takes.
+func removeWorktree(inst *session.Instance, backend vcs.Backend) bool {
 	if backend.Type() == vcs.TypeGit && !git.IsLinkedWorktree(inst.WorktreePath) {
 		_ = backend.PruneWorktrees()
-		return
+		_, err := os.Stat(inst.WorktreePath)
+		return os.IsNotExist(err)
 	}
-	if err := backend.RemoveWorktree(inst.WorktreePath, true); err != nil {
+	err := backend.RemoveWorktree(inst.WorktreePath, true)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "warn: worktree remove failed for %s: %v\n", inst.ID, err)
 	}
 	_ = backend.PruneWorktrees()
+	return err == nil
+}
+
+// deleteWorktreeBranch deletes the branch inst's worktree was on. Forced: a
+// branch merged by squash is no ancestor of the branch it went into, and
+// the caller asked for the branch to go. The repository's default branch is
+// kept, and git refuses a branch checked out in another worktree; a branch
+// already gone is nothing to do. A row from before the branch was recorded
+// has nothing to delete, which is said, so the caller does not take the
+// branch for gone.
+func deleteWorktreeBranch(inst *session.Instance, backend vcs.Backend) {
+	branch := inst.WorktreeBranch
+	if branch == "" {
+		fmt.Fprintf(os.Stderr, "warn: branch delete failed for %s: no branch recorded for the worktree\n", inst.ID)
+		return
+	}
+	if !backend.BranchExists(branch) {
+		return
+	}
+	if defaultBranch, err := backend.GetDefaultBranch(); err == nil && defaultBranch == branch {
+		fmt.Fprintf(os.Stderr, "note: branch %s kept: the repository's default branch\n", branch)
+		return
+	}
+	if err := backend.DeleteBranch(branch, true); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: branch delete failed for %s: %v\n", inst.ID, err)
+	}
 }
 
 // worktreeBackend is the backend that removes inst's worktree: the recorded

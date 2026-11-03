@@ -26,6 +26,9 @@
 //  6. `session remove --prune-worktree` removes a worktree whose row has a
 //     stale or empty repository root, leaves the main working tree of a
 //     worktree_reuse row without a word, and warns when a worktree stays.
+//  7. `session remove --prune-worktree --delete-branch` deletes the removed
+//     worktree's branch, which --prune-worktree alone keeps; the flag needs
+//     --prune-worktree.
 
 package main
 
@@ -430,6 +433,69 @@ func TestSessionRemove_PruneRemovesWorktreeWithStaleRepoRoot(t *testing.T) {
 	}
 	if strings.Contains(string(listing), filepath.Base(wtStale)) {
 		t.Fatalf("the repository still lists the removed worktree:\n%s", listing)
+	}
+}
+
+// branchExists reports whether repo has a local branch of that name.
+func branchExists(repo, branch string) bool {
+	return exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil
+}
+
+// --prune-worktree alone keeps the branch the worktree was on, as it always
+// has; --delete-branch deletes it with the worktree, so the same branch can
+// be made anew. Unmerged, so the delete has to be forced; `main` stays.
+func TestSessionRemove_DeleteBranchGoesWithTheWorktree(t *testing.T) {
+	sb := removeSandbox(t)
+	repo, wtKept := newSandboxWorktree(t, sb, "branch-kept")
+	_, wtGone := newSandboxWorktree(t, sb, "branch-gone")
+	seedDeadSession(t, sb, "branch-kept", wtKept, repo)
+	seedDeadSession(t, sb, "branch-gone", wtGone, repo)
+
+	out, err := runRemoveCLI(t, sb, "session", "remove", "--force", "--prune-worktree", "branch-kept")
+	if err != nil {
+		t.Fatalf("session remove --prune-worktree: %v\n%s", err, out)
+	}
+	if !branchExists(repo, "branch-kept") {
+		t.Fatal("--prune-worktree alone deleted the worktree's branch")
+	}
+
+	out, err = runRemoveCLI(t, sb, "session", "remove", "--force", "--prune-worktree", "--delete-branch", "branch-gone")
+	if err != nil {
+		t.Fatalf("session remove --prune-worktree --delete-branch: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "warn:") {
+		t.Fatalf("remove --delete-branch warned although the branch was deletable:\n%s", out)
+	}
+	if _, err := os.Stat(wtGone); !os.IsNotExist(err) {
+		t.Fatalf("remove --delete-branch kept the worktree %s (stat err %v)", wtGone, err)
+	}
+	if branchExists(repo, "branch-gone") {
+		t.Fatal("remove --delete-branch kept the removed worktree's branch")
+	}
+	if !branchExists(repo, "main") {
+		t.Fatal("remove --delete-branch deleted main")
+	}
+}
+
+// --delete-branch without --prune-worktree is a refusal, not a silent no-op:
+// a branch cannot go while its worktree stays.
+func TestSessionRemove_DeleteBranchNeedsPruneWorktree(t *testing.T) {
+	sb := removeSandbox(t)
+	repo, wt := newSandboxWorktree(t, sb, "needs-prune")
+	seedDeadSession(t, sb, "needs-prune", wt, repo)
+
+	out, err := runRemoveCLI(t, sb, "session", "remove", "--force", "--delete-branch", "needs-prune")
+	if err == nil {
+		t.Fatalf("session remove --delete-branch without --prune-worktree succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "--delete-branch requires --prune-worktree") {
+		t.Fatalf("refusal does not name the missing flag:\n%s", out)
+	}
+	if loadSandboxRow(t, sb, "needs-prune") == nil {
+		t.Fatal("a refused remove deleted the row")
+	}
+	if !branchExists(repo, "needs-prune") {
+		t.Fatal("a refused remove deleted the branch")
 	}
 }
 

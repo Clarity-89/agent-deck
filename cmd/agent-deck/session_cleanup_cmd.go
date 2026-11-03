@@ -310,7 +310,9 @@ func handleSessionCleanup(profile string, args []string) {
 		return
 	}
 
-	removed := bulkRemoveSessions(out, storage, instances, groups, candidates, *pruneWorktree)
+	// Branches stay: cleanup has no flag for them, and a dead session's
+	// branch may hold commits pushed nowhere.
+	removed := bulkRemoveSessions(out, storage, instances, groups, candidates, *pruneWorktree, false)
 
 	msg := fmt.Sprintf("Removed %d dead session(s).", len(removed))
 	if pinnedSkipped > 0 {
