@@ -24,7 +24,10 @@ func sharedWtBranchExists(t *testing.T, repo, branch string) bool {
 	return cmd.Run() == nil
 }
 
-// TestOtherSessionsShareWorktree reports the shared-use predicate directly.
+// TestOtherSessionsShareWorktree reports the shared-use predicate directly: a
+// session on the same worktree, or opened in or below it, shares; one in the
+// repository the worktree came from, or in a sibling whose name only starts
+// the same, does not.
 func TestOtherSessionsShareWorktree(t *testing.T) {
 	repo := issue1200InitRepo(t)
 	wt := issue1200AddWorktree(t, repo, "shared-feat")
@@ -33,6 +36,13 @@ func TestOtherSessionsShareWorktree(t *testing.T) {
 	target := &Instance{ID: "a", WorktreePath: wt, WorktreeRepoRoot: repo}
 	sameWt := &Instance{ID: "b", WorktreePath: wt, WorktreeRepoRoot: repo}
 	diffWt := &Instance{ID: "c", WorktreePath: otherWt, WorktreeRepoRoot: repo}
+	insideDir := filepath.Join(wt, "pkg")
+	if err := os.MkdirAll(insideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inside := &Instance{ID: "e", ProjectPath: insideDir}
+	inRepo := &Instance{ID: "f", ProjectPath: repo}
+	sibling := &Instance{ID: "g", ProjectPath: wt + "2"}
 
 	cases := []struct {
 		name   string
@@ -46,6 +56,9 @@ func TestOtherSessionsShareWorktree(t *testing.T) {
 		{"mixed: one shares, one does not", []*Instance{diffWt, sameWt}, true},
 		{"nil entries are skipped", []*Instance{nil, diffWt}, false},
 		{"non-worktree entries are skipped", []*Instance{{ID: "d"}}, false},
+		{"a session opened inside the worktree", []*Instance{inside}, true},
+		{"a session in the repository the worktree came from", []*Instance{inRepo}, false},
+		{"a session in a sibling whose name only starts the same", []*Instance{sibling}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

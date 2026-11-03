@@ -6,8 +6,10 @@ import (
 	"os"
 
 	"github.com/asheshgoplani/agent-deck/internal/events"
+	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
+	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
 
 // handleSessionRemove deletes a session from the registry.
@@ -290,7 +292,9 @@ func saveStoppedBeforeRemoval(storage *session.Storage, inst *session.Instance) 
 }
 
 // pruneSessionWorktree kills the session and removes its git worktree (if any).
-// Errors are logged to stderr but never block the remove.
+// Errors are logged to stderr but never block the remove; a worktree that
+// stays behind is always said so on stderr, so a caller reading it can tell
+// a kept directory from a removed one.
 //
 // Uses KillAndWait so the SIGTERM→SIGKILL escalation completes before
 // this short-lived CLI exits (issue #59, v1.7.68).
@@ -306,12 +310,35 @@ func pruneSessionWorktree(inst *session.Instance, others []*session.Instance) {
 		fmt.Fprintf(os.Stderr, "note: worktree %s kept: another session still uses it\n", FormatPath(inst.WorktreePath))
 		return
 	}
-	if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
-		if err := backend.RemoveWorktree(inst.WorktreePath, true); err != nil {
-			fmt.Fprintf(os.Stderr, "warn: worktree remove failed for %s: %v\n", inst.ID, err)
-		}
-		_ = backend.PruneWorktrees()
+	backend, err := worktreeBackend(inst)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: worktree remove failed for %s: %v\n", inst.ID, err)
+		return
 	}
+	// A worktree_reuse row points at the main working tree, which stays
+	// (#1200); git would only refuse it, and that refusal is not a failure.
+	// A directory already gone leaves only its admin entry, which prune takes.
+	if backend.Type() == vcs.TypeGit && !git.IsLinkedWorktree(inst.WorktreePath) {
+		_ = backend.PruneWorktrees()
+		return
+	}
+	if err := backend.RemoveWorktree(inst.WorktreePath, true); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: worktree remove failed for %s: %v\n", inst.ID, err)
+	}
+	_ = backend.PruneWorktrees()
+}
+
+// worktreeBackend is the backend that removes inst's worktree: the recorded
+// repository root's, or the worktree's own when that root is empty, on a row
+// from before it was stored, or stale once the repository moved. The
+// worktree still knows its repository either way.
+func worktreeBackend(inst *session.Instance) (vcs.Backend, error) {
+	if inst.WorktreeRepoRoot != "" {
+		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
+			return backend, nil
+		}
+	}
+	return detectAndCreateBackend(inst.WorktreePath)
 }
 
 // dropInstance returns a new slice with the given id filtered out.

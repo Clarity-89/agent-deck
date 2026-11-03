@@ -39,10 +39,11 @@ func IsRemovableWorktree(inst *Instance) bool {
 }
 
 // OtherSessionsShareWorktree reports whether any instance in others (other than
-// target itself) still references target's worktree directory. Paths are
-// compared canonically (EvalSymlinks), so a symlinked alias to the same
-// directory counts as a sharer. nil entries, target's own ID, and non-worktree
-// instances are skipped.
+// target itself) still works in target's worktree directory: its own worktree
+// is that directory, or its project path is that directory or below it, as a
+// session opened inside the worktree without a worktree of its own is. Paths
+// are compared canonically (EvalSymlinks), so a symlinked alias to the same
+// directory counts as a sharer. nil entries and target's own ID are skipped.
 //
 // This is the missing guard behind issue #1449: finishing one of several
 // sessions that share a single worktree must not remove the shared directory or
@@ -60,12 +61,13 @@ func OtherSessionsShareWorktree(target *Instance, others []*Instance) bool {
 		if o == nil || o.ID == target.ID {
 			continue
 		}
-		owt := strings.TrimSpace(o.WorktreePath)
-		if owt == "" {
-			continue
-		}
-		if canonicalPath(owt) == targetCanon {
-			return true
+		for _, p := range []string{o.WorktreePath, o.ProjectPath} {
+			if p = strings.TrimSpace(p); p == "" {
+				continue
+			}
+			if _, within := pathWithin(targetCanon, canonicalPath(p)); within {
+				return true
+			}
 		}
 	}
 	return false

@@ -23,6 +23,9 @@
 //     removed.
 //  5. `session remove --prune-worktree` and `remove` keep a worktree another
 //     session still works in (#1449), on the single and the bulk path alike.
+//  6. `session remove --prune-worktree` removes a worktree whose row has a
+//     stale or empty repository root, leaves the main working tree of a
+//     worktree_reuse row without a word, and warns when a worktree stays.
 
 package main
 
@@ -393,6 +396,89 @@ func TestSessionRemove_AllErroredPruneKeepsWorktreeOfSurvivor(t *testing.T) {
 	}
 	if _, err := os.Stat(wtKept); err != nil {
 		t.Fatalf("worktree a surviving session still uses was deleted (#1449): %v", err)
+	}
+}
+
+// A row whose recorded repository root is stale, the repository moved since,
+// or empty, from before the root was stored, still loses its worktree: the
+// worktree itself knows its repository. Before, prune skipped such a row
+// without a word, and the directory stayed behind.
+func TestSessionRemove_PruneRemovesWorktreeWithStaleRepoRoot(t *testing.T) {
+	sb := removeSandbox(t)
+	repo, wtStale := newSandboxWorktree(t, sb, "stale-root")
+	_, wtEmpty := newSandboxWorktree(t, sb, "empty-root")
+	seedDeadSession(t, sb, "stale-root", wtStale, filepath.Join(sb.Home, "moved-away"))
+	seedDeadSession(t, sb, "empty-root", wtEmpty, "")
+
+	for _, id := range []string{"stale-root", "empty-root"} {
+		out, err := runRemoveCLI(t, sb, "session", "remove", "--force", "--prune-worktree", id)
+		if err != nil {
+			t.Fatalf("session remove --prune-worktree %s: %v\n%s", id, err, out)
+		}
+		if strings.Contains(out, "warn:") {
+			t.Fatalf("remove --prune-worktree %s warned although the worktree was removable:\n%s", id, out)
+		}
+	}
+	for _, wt := range []string{wtStale, wtEmpty} {
+		if _, err := os.Stat(wt); !os.IsNotExist(err) {
+			t.Fatalf("remove --prune-worktree kept %s, whose row had a stale repository root (stat err %v)", wt, err)
+		}
+	}
+	listing, err := exec.Command("git", "-C", repo, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(listing), filepath.Base(wtStale)) {
+		t.Fatalf("the repository still lists the removed worktree:\n%s", listing)
+	}
+}
+
+// A worktree_reuse row points at the main working tree, which stays (#1200).
+// It stays quietly: git's refusal to remove it is not a failure to report.
+func TestSessionRemove_PruneLeavesMainWorkingTreeQuietly(t *testing.T) {
+	sb := removeSandbox(t)
+	repo, _ := newSandboxWorktree(t, sb, "reuse")
+	sentinel := filepath.Join(repo, "uncommitted.txt")
+	if err := os.WriteFile(sentinel, []byte("work in progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedDeadSession(t, sb, "reuse", repo, repo)
+
+	out, err := runRemoveCLI(t, sb, "session", "remove", "--force", "--prune-worktree", "reuse")
+	if err != nil {
+		t.Fatalf("session remove --prune-worktree reuse: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("remove --prune-worktree touched the main working tree (#1200): %v", err)
+	}
+	if strings.Contains(out, "warn:") {
+		t.Fatalf("remove --prune-worktree warned about the main working tree it must leave:\n%s", out)
+	}
+}
+
+// A worktree nothing can remove, its repository gone with the admin entry
+// the worktree's .git names, stays, and stderr says so: a caller must be
+// able to tell a kept directory from a removed one.
+func TestSessionRemove_PruneWarnsWhenTheWorktreeStays(t *testing.T) {
+	sb := removeSandbox(t)
+	repo, wt := newSandboxWorktree(t, sb, "orphan")
+	seedDeadSession(t, sb, "orphan", wt, repo)
+	if err := os.RemoveAll(repo); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runRemoveCLI(t, sb, "session", "remove", "--force", "--prune-worktree", "orphan")
+	if err != nil {
+		t.Fatalf("session remove --prune-worktree orphan: %v\n%s", err, out)
+	}
+	if row := loadSandboxRow(t, sb, "orphan"); row != nil {
+		t.Fatalf("row still present after remove: %+v", row)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("a worktree without a repository was deleted unconfirmed: %v", err)
+	}
+	if !strings.Contains(out, "warn: worktree remove failed for orphan:") {
+		t.Fatalf("remove --prune-worktree kept the worktree without saying so:\n%s", out)
 	}
 }
 
