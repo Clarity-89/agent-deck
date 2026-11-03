@@ -63,7 +63,8 @@ const restartResumeMaxScan = 1 << 20
 // profile has any more.
 const restartTokenOrphanAge = 24 * time.Hour
 
-// restartBootTimeout is how long the new process has to reach its prompt.
+// restartBootTimeout is how long the new process has to reach its prompt. It
+// also bounds a fresh start's wait for its boot to show (fresh_start.go).
 // AGENTDECK_RESTART_BOOT_TIMEOUT overrides it (tests).
 func restartBootTimeout() time.Duration {
 	if d, err := time.ParseDuration(os.Getenv("AGENTDECK_RESTART_BOOT_TIMEOUT")); err == nil && d > 0 {
@@ -99,10 +100,16 @@ type restartSpawned struct {
 func (i *Instance) SetRestartReason(reason string) { i.restartReason = reason }
 
 func restartTokenPath(id, suffix string) (string, error) {
+	return runtimeTokenPath("restart-resume", id, suffix)
+}
+
+// runtimeTokenPath is session id's token file in runtime/<dir>: restart-resume
+// here, fresh-start for a fresh start's token (fresh_start.go).
+func runtimeTokenPath(dir, id, suffix string) (string, error) {
 	if id == "" || strings.ContainsAny(id, `/\`) || strings.Contains(id, "..") {
 		return "", fmt.Errorf("invalid session id %q", id)
 	}
-	return runtimeDataPath(filepath.Join("restart-resume", id+suffix))
+	return runtimeDataPath(filepath.Join(dir, id+suffix))
 }
 
 // noteRestartToken records the token before a restart. Only a child idle at
@@ -200,8 +207,12 @@ var restartPIDAlive = func(pid int) bool {
 	return err == nil && proc.Signal(syscall.Signal(0)) == nil
 }
 
-func writeRestartFile(id, suffix string, v any) {
-	path, err := restartTokenPath(id, suffix)
+func writeRestartFile(id, suffix string, v any) { writeTokenFile("restart-resume", id, suffix, v) }
+
+// writeTokenFile writes one token file atomically (a temp file renamed over
+// it), so a reader sees the old file or the new one, never part of one.
+func writeTokenFile(dir, id, suffix string, v any) {
+	path, err := runtimeTokenPath(dir, id, suffix)
 	if err != nil {
 		return
 	}
@@ -215,7 +226,7 @@ func writeRestartFile(id, suffix string, v any) {
 		}
 	}
 	if err != nil {
-		sessionLog.Warn("restart_token_write_failed", slog.String("instance_id", id), slog.String("error", err.Error()))
+		sessionLog.Warn("restart_token_write_failed", slog.String("dir", dir), slog.String("instance_id", id), slog.String("error", err.Error()))
 	}
 }
 
@@ -654,6 +665,29 @@ var restartSessionStartSince = func(id string, since time.Time) bool {
 		}
 	}
 	return false
+}
+
+// hookHistoryTurnSince reads child id's hook event history from since: seen
+// when it holds a SessionStart, turn when one is neither SessionStart nor
+// SessionEnd (a SessionEnd may be an older process's, landing late) or is a
+// second SessionStart.
+func hookHistoryTurnSince(id string, since time.Time) (turn, seen bool) {
+	starts := 0
+	for _, ev := range restartHookHistory(id) {
+		if ev.At.Before(since) {
+			continue
+		}
+		switch e := strings.TrimSpace(ev.Event); {
+		case strings.EqualFold(e, "SessionStart"):
+			seen = true
+			if starts++; starts > 1 {
+				return true, true
+			}
+		case !strings.EqualFold(e, "SessionEnd"):
+			return true, true
+		}
+	}
+	return false, seen
 }
 
 // restartHistoryClockLag bounds how much later the hook handler's history

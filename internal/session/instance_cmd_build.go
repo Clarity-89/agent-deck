@@ -30,6 +30,9 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	if !IsClaudeCompatible(i.Tool) {
 		return baseCommand
 	}
+	// #2954: set below by each branch that starts a new conversation
+	// (--session-id, nothing to resume); the spawn records it (noteFreshStart).
+	i.launchesFresh.Store(false)
 
 	// Default empty baseCommand to "claude" so the Claude-build branch below
 	// runs. An Instance row with tool=claude and an empty Command field
@@ -152,6 +155,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 					freshID := generateUUID()
 					i.ClaudeSessionID = freshID
 					i.markClaudeSessionIDVerified()
+					i.launchesFresh.Store(freshStartObservable(claudeCmd))
 					return fmt.Sprintf(`%sexec %s%s --session-id "%s"%s`,
 						bashExportPrefix, execEnvPrefix, claudeCmd, freshID, extraFlags)
 				}
@@ -191,6 +195,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 				if q := shellescape.Quote(freshID); q != freshID {
 					sessionIDArg = q
 				}
+				i.launchesFresh.Store(freshStartObservable(claudeCmd))
 				return fmt.Sprintf(
 					`%sexec %s%s --session-id %s%s`,
 					bashExportPrefix, execEnvPrefix, claudeCmd, sessionIDArg, extraFlags)
@@ -219,6 +224,8 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 		i.ClaudeSessionID = sessionUUID
 		// #1815: minted here for this session — vouched ownership.
 		i.markClaudeSessionIDVerified()
+		// A startup query (#725) starts a turn at once: no boot at an empty prompt.
+		i.launchesFresh.Store(freshStartObservable(claudeCmd) && i.StartupQuery == "")
 
 		// Startup query (#725, v1.7.67): appended as one shell-quoted
 		// positional arg so multi-word queries survive bash -c. Empty
@@ -285,6 +292,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 // in both cases there is no alias downstream to defer to.
 func (i *Instance) buildBashExportPrefix(skipConfigDirForCustomCommand bool) string {
 	prefix := fmt.Sprintf("export AGENTDECK_INSTANCE_ID=%s; export AGENTDECK_PROFILE=%s; ", shellescape.Quote(i.ID), shellescape.Quote(sessionProfileEnvValue()))
+	i.configDirLeftToCommand = skipConfigDirForCustomCommand
 	if IsClaudeConfigDirExplicitForInstance(i) && !skipConfigDirForCustomCommand {
 		// Issue #922 (reporter @bautrey): see applyWorkerScratchOverride.
 		configDir := i.applyWorkerScratchOverride(GetClaudeConfigDirForInstance(i))
@@ -1460,6 +1468,9 @@ func (i *Instance) buildCopilotCommand(baseCommand string) string {
 // Respects: CLAUDE_CONFIG_DIR, dangerous_mode, and [shell].env_files + init_script
 // CLAUDE_SESSION_ID is set via host-side SetEnvironment (called by SyncSessionIDsToTmux after restart)
 func (i *Instance) buildClaudeResumeCommand() string {
+	// #2954: set below where the command starts a new conversation.
+	i.launchesFresh.Store(false)
+
 	// Source env files and init_script so resumed sessions have the same
 	// shell environment as freshly started ones (fixes #409).
 	envPrefix := i.buildEnvSourceCommand()
@@ -1544,6 +1555,7 @@ func (i *Instance) buildClaudeResumeCommand() string {
 			slog.String("refused_session_id", logging.SanitizeValue(refused)),
 			slog.String("path", logging.SanitizeValue(i.ProjectPath)),
 			slog.String("reason", "identity_guard_fresh_session"))
+		i.launchesFresh.Store(freshStartObservable(claudeCmd))
 		return fmt.Sprintf("%s%s%s --session-id %s%s",
 			envPrefix, bashExportPrefix, claudeCmd, fresh, extraFlags)
 	}
@@ -1608,6 +1620,7 @@ func (i *Instance) buildClaudeResumeCommand() string {
 			envPrefix, bashExportPrefix, claudeCmd, shellescape.Quote(i.ClaudeSessionID), extraFlags)
 	}
 	// Session was never interacted with - use --session-id to create fresh session.
+	i.launchesFresh.Store(freshStartObservable(claudeCmd))
 	return fmt.Sprintf("%s%sexec %s --session-id %s%s",
 		envPrefix, bashExportPrefix, claudeCmd, shellescape.Quote(i.ClaudeSessionID), extraFlags)
 }

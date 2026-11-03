@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
 
 // A fake that ignores SIGHUP must still exit when its pane closes.
@@ -50,6 +52,7 @@ func TestClaudeLikeFakeExitsWhenItsPaneIsGone(t *testing.T) {
 // fake here ignores SIGHUP, as Claude Code 2.1.27+ does, which turns the
 // scheduling race into a certain one: it outlives kill-session.
 func TestIssue2921ClaudeLikeFakeIsGoneWhenItsCleanupReturns(t *testing.T) {
+	testutil.RequireTmux(t)
 	var script string
 	t.Run("fixture", func(t *testing.T) {
 		_, transcript := claudeLikeFakeControl(t, "busy", map[string]any{claudeLikeFakeIgnoresHangup: true})
