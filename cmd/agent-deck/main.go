@@ -3560,8 +3560,7 @@ func handleRemove(profile string, args []string) {
 	// Uses the synchronous variant so the SIGTERM→SIGKILL escalation finishes
 	// before this short-lived CLI exits — otherwise SIGHUP-immune claude
 	// processes survive as orphans (issue #59, v1.7.68).
-	saveStoppedBeforeRemoval(storage, inst)
-	if err := inst.KillAndWait(); err != nil {
+	if err := killForRemoval(storage, inst); err != nil {
 		// Only warn if the session actually existed (ignore "not found" errors)
 		if inst.Exists() && !*jsonOutput {
 			fmt.Printf("Warning: failed to kill tmux session: %v\n", err)

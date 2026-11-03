@@ -185,3 +185,36 @@ func TestIssue2806_RemoveSavesStoppedBeforeWorktreeRemoval(t *testing.T) {
 		})
 	}
 }
+
+// A removal saved stopped before its kill, so the notify daemon sampled a
+// stopped row with a live pane, took it for a start and wrote waiting, then
+// error once the pane went; the row stayed error until it was deleted, and
+// the session's watchers heard it fail. The removal now kills first and saves
+// stopped after, as a stop does: the error the daemon commits while the pane
+// dies is replaced.
+func TestRemoveKillWinsOverADaemonSampleOfTheDyingPane(t *testing.T) {
+	_, id := defect317StartedSession(t, "remove-race")
+	storage, instances, _, err := loadSessionData("_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	inst, msg, _ := ResolveSession(id, instances)
+	if inst == nil {
+		t.Fatal(msg)
+	}
+	session.StopAfterKillHook = func(id string) {
+		if err := storage.GetDB().WriteStatus(id, string(session.StatusError), "shell"); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { session.StopAfterKillHook = nil })
+
+	_ = killForRemoval(storage, inst)
+	if inst.Exists() {
+		t.Fatal("the removal's kill left the tmux session alive")
+	}
+	if got := issue2806RowStatus(t, id); got != string(session.StatusStopped) {
+		t.Fatalf("row after the removal's kill = %q, want %q: a daemon sample of the dying pane stood", got, session.StatusStopped)
+	}
+}

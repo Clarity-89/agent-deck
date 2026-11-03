@@ -105,8 +105,7 @@ func handleSessionRemove(profile string, args []string) {
 	//
 	// KillAndWait runs the SIGTERM→SIGKILL escalation synchronously so
 	// the kill completes before this short-lived CLI exits.
-	saveStoppedBeforeRemoval(storage, inst)
-	_ = inst.KillAndWait()
+	_ = killForRemoval(storage, inst)
 	inst.RecordTelemetryEnd(telemetry.EndDelete)
 
 	if *pruneWorktree {
@@ -231,8 +230,7 @@ func bulkRemoveSessions(
 	removed := make([]removedSessionRow, 0, len(doomed))
 	removedIDs := make([]string, 0, len(doomed))
 	for _, inst := range doomed {
-		saveStoppedBeforeRemoval(storage, inst)
-		_ = inst.KillAndWait()
+		_ = killForRemoval(storage, inst)
 		if pruneWorktree {
 			pruneSessionWorktree(inst, remaining, deleteBranch)
 		}
@@ -285,20 +283,21 @@ func warnRemovedSessionCleanup(r session.RemovedSessionCleanup, id string, jsonO
 	}
 }
 
-// saveStoppedBeforeRemoval saves the row as stopped before a removal kills
-// the session (#2806). The row is deleted only after the kill and, with a
-// worktree, after `git worktree remove`, which can take longer than the
-// notify daemon's 5 s death grace on a big tree. Until then the daemon would
-// read the old row with no pane and tell the parent the child "exited while
-// idle". A stopped row is a deliberate end, so it never does. Best-effort: a
-// failed write leaves the old behavior.
-func saveStoppedBeforeRemoval(storage *session.Storage, inst *session.Instance) {
-	if storage == nil || inst == nil {
-		return
-	}
-	if db := storage.GetDB(); db != nil {
-		_ = db.WriteStatus(inst.ID, string(session.StatusStopped), inst.Tool)
-	}
+// killForRemoval kills inst before a removal deletes its row, and saves the
+// row as stopped right after the kill, as a stop does (defect 317). The row
+// is deleted only after the kill and, with a worktree, after `git worktree
+// remove`, which can take longer than the notify daemon's 5 s death grace on
+// a big tree (#2806). A stopped row is a deliberate end, so the daemon never
+// tells the parent the child "exited while idle". Saved before the kill, the
+// stopped row with its pane still alive read to the daemon as a start: it
+// wrote waiting, then error once the pane went, and the row stayed error
+// until it was deleted. An error the daemon samples during the kill itself
+// is replaced here.
+func killForRemoval(storage *session.Storage, inst *session.Instance) error {
+	pre := session.BeforeStopKill(storage, inst.ID)
+	err := inst.KillAndWait()
+	session.WriteStoppedAfterKill(storage, inst, pre)
+	return err
 }
 
 // pruneSessionWorktree kills the session and removes its git worktree (if any),
