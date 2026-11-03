@@ -28,6 +28,8 @@ agent-deck has one human maintainer and a fleet of AI agents that do the heavy l
    ```bash
    FULL_TESTS=1 skills/agent-deck/scripts/contributing/self-check.sh pr-body.md
    ```
+   Process fixtures must exit on terminal EOF and stop their children before deleting sandbox directories.
+   Keep cleanup checks active on macOS; `/proc`-only checks cannot detect leaks there.
 3. **Evidence.** For behavior changes, show real output: a terminal capture, logs, or before/after behavior. Mock-only proof is not enough for changes users will feel.
 4. **The human need behind the diff.** The single highest-signal thing you can write is one real sentence about what you were doing when you hit this. It is what separates a real fix from a speculative one, and it is the first thing a reviewer reads.
 5. **A filled-in PR template.** Problem, why, user impact, evidence, disclosure. It takes five minutes and it is what the validation pipeline reads first.

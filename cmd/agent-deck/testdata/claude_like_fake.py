@@ -109,7 +109,10 @@ while True:
     poll_phase(); absorb()
     if phase in ('busy', 'stream', 'booting') and time.monotonic() - last_tick > 1: render(); last_tick = time.monotonic()
     if not select.select([0], [], [], 0.05)[0]: continue
-    chunk = ESC_RE.sub(b'', os.read(0, 65536))  # drops bracketed-paste 200~/201~ framing
+    # HUP may be ignored; EOF still ends the fake when its pane closes.
+    data = os.read(0, 65536)
+    if not data: break
+    chunk = ESC_RE.sub(b'', data)  # drops bracketed-paste 200~/201~ framing
     changed = False
     for ch in chunk.decode('utf-8', errors='replace'):
         if ch == '\r':

@@ -1,13 +1,42 @@
 package main
 
 import (
-	"bytes"
-	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
+	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
+
+// A fake that ignores SIGHUP must still exit when its pane closes.
+func TestClaudeLikeFakeExitsWhenItsPaneIsGone(t *testing.T) {
+	sess, transcript := claudeLikeFakeControl(t, "idle", map[string]any{claudeLikeFakeIgnoresHangup: true})
+	script := filepath.Join(filepath.Dir(transcript), "claude")
+	t.Cleanup(func() {
+		for _, raw := range liveProcessesRunning(t, script) {
+			if pid, err := strconv.Atoi(raw); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	if len(liveProcessesRunning(t, script)) == 0 {
+		t.Fatalf("the Claude-like fake (%s) is not running", script)
+	}
+	// Kill the pane without agent-deck's process escalation masking EOF handling.
+	if out, err := exec.Command("tmux", "kill-session", "-t", sess.TmuxName()).CombinedOutput(); err != nil {
+		t.Fatalf("kill-session: %v\n%s", err, out)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for pids := liveProcessesRunning(t, script); len(pids) > 0; pids = liveProcessesRunning(t, script) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the Claude-like fake (%s) outlived its pane: pids %v", script, pids)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
 
 // Issue #2921: TestGuardedSendLeavesBusyOperatorDraftAlone failed on its
 // TempDir cleanup ("directory not empty"). The Claude-like fake rewrites
@@ -21,9 +50,6 @@ import (
 // fake here ignores SIGHUP, as Claude Code 2.1.27+ does, which turns the
 // scheduling race into a certain one: it outlives kill-session.
 func TestIssue2921ClaudeLikeFakeIsGoneWhenItsCleanupReturns(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("finds the fake's process through /proc")
-	}
 	var script string
 	t.Run("fixture", func(t *testing.T) {
 		_, transcript := claudeLikeFakeControl(t, "busy", map[string]any{claudeLikeFakeIgnoresHangup: true})
@@ -32,31 +58,24 @@ func TestIssue2921ClaudeLikeFakeIsGoneWhenItsCleanupReturns(t *testing.T) {
 	if script == "" {
 		t.Fatal("fixture did not start")
 	}
-	if pids := liveProcessesRunning(script); len(pids) > 0 {
+	if pids := liveProcessesRunning(t, script); len(pids) > 0 {
 		t.Fatalf("the Claude-like fake (%s) was still running after its fixture's cleanup returned: pids %v", script, pids)
 	}
 }
 
-// liveProcessesRunning lists the non-zombie processes whose argv names path.
-func liveProcessesRunning(path string) []string {
-	entries, _ := os.ReadDir("/proc")
+// A zombie cannot write into a directory whose fixture is being removed.
+func liveProcessesRunning(t *testing.T, path string) []string {
+	t.Helper()
+	out, err := exec.Command("/bin/ps", "-axww", "-o", "pid=,stat=,command=").Output()
+	if err != nil {
+		t.Fatalf("list processes: %v", err)
+	}
 	var pids []string
-	for _, e := range entries {
-		if e.Name()[0] < '0' || e.Name()[0] > '9' {
-			continue
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && !strings.HasPrefix(fields[1], "Z") && slices.Contains(fields[2:], path) {
+			pids = append(pids, fields[0])
 		}
-		argv, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
-		if err != nil || !bytes.Contains(argv, []byte(path)) {
-			continue
-		}
-		stat, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
-		if err != nil {
-			continue // exited between the reads
-		}
-		if i := bytes.LastIndexByte(stat, ')'); i >= 0 && strings.HasPrefix(string(stat[i+1:]), " Z") {
-			continue // a zombie cannot write
-		}
-		pids = append(pids, e.Name())
 	}
 	return pids
 }
