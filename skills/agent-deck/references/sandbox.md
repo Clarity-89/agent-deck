@@ -2,7 +2,7 @@
 
 ## Overview
 
-Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Codex CLI, Gemini CLI) inside isolated Docker containers while maintaining access to your project files and credentials.
+Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Codex CLI, Gemini CLI, omp) inside isolated Docker containers while maintaining access to your project files and credentials.
 
 **Key Features:**
 - One container per session
@@ -88,9 +88,9 @@ See the full [Configuration Reference](config-reference.md) for details.
 
 ## Shared Sandbox Directories
 
-Agent Deck automatically shares your host tool credentials with sandboxed containers so agents can authenticate without re-login. This works for all supported tools: Claude Code, Codex, Gemini, and OpenCode.
+Agent Deck automatically shares your host tool credentials with sandboxed containers so agents can authenticate without re-login. This works for all supported tools: Claude Code, Codex, Gemini, OpenCode, and omp.
 
-For each tool whose host config directory exists (e.g. `~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.local/share/opencode/`, `~/.local/state/opencode/`, `~/.config/opencode/`), Agent Deck syncs credential files into a **shared sandbox directory** and bind-mounts it into containers:
+For each tool whose host config directory exists (e.g. `~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.omp/`, `~/.local/share/opencode/`, `~/.local/state/opencode/`, `~/.config/opencode/`), Agent Deck syncs credential files into a **shared sandbox directory** and bind-mounts it into containers:
 
 1. On every session start, host config files are synced into `~/<tool>/sandbox/`.
 2. **Seed files** (e.g. onboarding flags) use write-once semantics — they are only written if absent, preserving any state accumulated by the container.
@@ -102,6 +102,7 @@ For each tool whose host config directory exists (e.g. `~/.claude/`, `~/.codex/`
 
 - **Top-level files** from each tool's config directory (auth tokens, credentials, config files). Subdirectories are skipped by default to keep the sandbox small.
 - **Specific subdirectories** listed per tool (e.g. Claude Code's `plugins/` and `skills/` are copied recursively so extensions work inside the container).
+- **Nested config directories** for tools that keep their configuration one level down: omp's `~/.omp/agent/` is synced the same way as a top-level directory (its own files, plus `skills/`, `extensions/` and `models/`), while its session index, prompt history and model and skill catalogs (`agent.db`, `history.db`, `models.db`, `skill-descriptions.db`) stay on the host; the container builds its own.
 - **Seed files** where needed (e.g. Claude Code gets a minimal `hasCompletedOnboarding` flag to skip the first-run wizard). These are only written once — container modifications are preserved across restarts.
 
 ### Platform-specific authentication
@@ -131,6 +132,7 @@ Each tool's sandbox directory lives inside that tool's own config directory:
 ~/.claude/sandbox/                 # Claude Code sandbox
 ~/.codex/sandbox/                  # Codex sandbox
 ~/.gemini/sandbox/                 # Gemini sandbox
+~/.omp/sandbox/                    # omp sandbox
 ~/.local/share/opencode/sandbox/   # OpenCode sandbox
 ~/.local/state/opencode/sandbox/   # OpenCode state sandbox
 ~/.config/opencode/sandbox/        # OpenCode config sandbox
@@ -150,7 +152,7 @@ Example: `agent-deck-my-refactor-a1b2c3d4`
 
 1. **Session Creation:** When you create a sandboxed session, Agent Deck records the sandbox configuration.
 2. **Container Start:** When the session starts, Agent Deck syncs host tool configs into shared sandbox directories and creates/starts the Docker container with bind mounts.
-3. **tmux + docker exec:** The host tmux session runs `docker exec -it <container> <tool>` (claude, opencode, codex, or gemini).
+3. **tmux + docker exec:** The host tmux session runs `docker exec -it <container> <tool>` (claude, opencode, codex, gemini, or omp).
 4. **Container Shell:** Press `E` on a sandboxed session to exec a shell inside the container.
 5. **Cleanup:** When you remove the session, the container is automatically deleted. Sandbox directories persist for reuse.
 

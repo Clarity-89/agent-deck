@@ -89,6 +89,24 @@ var agentConfigMounts = []AgentConfigMount{
 		containerSuffix: ".gemini",
 		skipEntries:     []string{"sandbox"},
 	},
+	{
+		// Oh My Pi. Its top level holds logs, caches, the natives it extracts
+		// at run time and agent-deck's own per-session directories, all the
+		// container's to write; its configuration lives one level down.
+		hostRel:         ".omp",
+		containerSuffix: ".omp",
+		skipEntries:     []string{"sandbox"},
+		subdirs: []AgentConfigMount{{
+			// Keys, settings, provider definitions and the user's skills and
+			// extensions travel. The session index, prompt history and
+			// derived model and skill catalogs are a machine's own: the
+			// sessions they index stay on the host, and omp rebuilds the
+			// catalogs.
+			hostRel:     "agent",
+			skipEntries: []string{"agent.db*", "history.db*", "models.db*", "skill-descriptions.db*"},
+			copyDirs:    []string{"extensions", "models", "skills"},
+		}},
+	},
 }
 
 // Mount path blocklists — prevent accidental exposure of sensitive host and container paths.
@@ -184,11 +202,18 @@ type AgentConfigMount struct {
 	hostRel string
 	// containerSuffix is the path relative to container home (e.g. ".claude").
 	containerSuffix string
-	// skipEntries are top-level entry names to skip when copying (not recursive).
-	// Only exact matches on direct children of the host dir are excluded.
+	// skipEntries are direct children of the host dir left out of the copy:
+	// exact names, or filepath.Match patterns such as "agent.db*", which
+	// also covers a SQLite database's -wal and -shm files.
 	skipEntries []string
 	// copyDirs are directories to recursively copy into the sandbox.
 	copyDirs []string
+	// subdirs are directories synced the way the config dir itself is, into
+	// the same place under the sandbox: their own files minus skipEntries,
+	// their copyDirs in full, nothing else. Only hostRel (relative to the
+	// parent), skipEntries, copyDirs, preserveFiles and further subdirs
+	// apply to one.
+	subdirs []AgentConfigMount
 	// seedFiles are files written only if absent (write-once) to preserve container state (name → content).
 	seedFiles map[string]string
 	// homeSeedFiles are files to seed at the container home level, outside the config dir (name → content).
@@ -199,6 +224,20 @@ type AgentConfigMount struct {
 	preserveFiles []string
 	// keychainCredential is a macOS Keychain credential to extract (nil on Linux).
 	keychainCredential *keychainEntry
+}
+
+// skips reports whether a direct child of the synced directory is left out
+// of the copy.
+func (m AgentConfigMount) skips(name string) bool {
+	for _, pattern := range m.skipEntries {
+		if pattern == name {
+			return true
+		}
+		if matched, err := filepath.Match(pattern, name); err == nil && matched {
+			return true
+		}
+	}
+	return false
 }
 
 // WithAgentConfigs adds bind mounts from sandbox sync results.

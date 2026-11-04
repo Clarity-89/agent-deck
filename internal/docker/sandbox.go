@@ -1,8 +1,10 @@
 package docker
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
@@ -108,20 +110,46 @@ func SyncAgentConfig(homeDir string, mount AgentConfigMount, opts ...SyncOption)
 		}
 	}
 
-	// Copy top-level files from host dir (skip directories and skipEntries).
 	// Tolerate a missing host dir — seed files above still apply, and the
 	// caller (RefreshAgentConfigs) already pre-checks, but be defensive.
+	if _, err := os.Stat(hostDir); os.IsNotExist(err) {
+		return sandboxDir, nil
+	}
+	if err := syncDir(hostDir, sandboxDir, mount); err != nil {
+		return "", err
+	}
+
+	// The sandbox owns its own credential (#2153). Seeding it from the macOS
+	// Keychain is opt-in because the copy forks the host's OAuth refresh chain.
+	if mount.keychainCredential != nil {
+		dest := filepath.Join(sandboxDir, mount.keychainCredential.filename)
+		if o.seedFromKeychain {
+			if err := extractKeychainCredential(mount.keychainCredential.service, dest); err != nil {
+				slog.Warn("Extracting keychain credential", "service", mount.keychainCredential.service, "error", err)
+			}
+		}
+		if _, err := os.Stat(dest); os.IsNotExist(err) {
+			slog.Info("Sandbox has no credential file yet; run /login once inside the sandbox session, or pass CLAUDE_CODE_OAUTH_TOKEN via [docker] environment", "path", dest)
+		}
+	}
+
+	return sandboxDir, nil
+}
+
+// syncDir copies hostDir's top-level files into sandboxDir, skipEntries and
+// preserved files already there excepted, its copyDirs in full, and each
+// of its subdirs the same way. A subdir the host does not have is nothing
+// to copy.
+func syncDir(hostDir string, sandboxDir string, mount AgentConfigMount) error {
 	entries, err := os.ReadDir(hostDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return sandboxDir, nil
+			return nil
 		}
-		return "", fmt.Errorf("reading host dir %s: %w", hostDir, err)
+		return fmt.Errorf("reading host dir %s: %w", hostDir, err)
 	}
-
-	skipSet := make(map[string]bool, len(mount.skipEntries))
-	for _, s := range mount.skipEntries {
-		skipSet[s] = true
+	if err := os.MkdirAll(sandboxDir, 0o700); err != nil {
+		return fmt.Errorf("creating sandbox dir %s: %w", sandboxDir, err)
 	}
 
 	copyDirSet := make(map[string]bool, len(mount.copyDirs))
@@ -136,7 +164,7 @@ func SyncAgentConfig(homeDir string, mount AgentConfigMount, opts ...SyncOption)
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if skipSet[name] {
+		if mount.skips(name) {
 			continue
 		}
 
@@ -181,21 +209,20 @@ func SyncAgentConfig(homeDir string, mount AgentConfigMount, opts ...SyncOption)
 		}
 	}
 
-	// The sandbox owns its own credential (#2153). Seeding it from the macOS
-	// Keychain is opt-in because the copy forks the host's OAuth refresh chain.
-	if mount.keychainCredential != nil {
-		dest := filepath.Join(sandboxDir, mount.keychainCredential.filename)
-		if o.seedFromKeychain {
-			if err := extractKeychainCredential(mount.keychainCredential.service, dest); err != nil {
-				slog.Warn("Extracting keychain credential", "service", mount.keychainCredential.service, "error", err)
+	for _, sub := range mount.subdirs {
+		src := filepath.Join(hostDir, sub.hostRel)
+		resolved, err := resolveAndValidateSymlink(src, hostDir)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				slog.Warn("Skipping subdirectory", "path", src, "error", err)
 			}
+			continue
 		}
-		if _, err := os.Stat(dest); os.IsNotExist(err) {
-			slog.Info("Sandbox has no credential file yet; run /login once inside the sandbox session, or pass CLAUDE_CODE_OAUTH_TOKEN via [docker] environment", "path", dest)
+		if err := syncDir(resolved, filepath.Join(sandboxDir, sub.hostRel), sub); err != nil {
+			slog.Warn("Syncing subdirectory", "path", src, "error", err)
 		}
 	}
-
-	return sandboxDir, nil
+	return nil
 }
 
 // RefreshAgentConfigs syncs all tool configs into shared sandbox directories.

@@ -152,6 +152,62 @@ func TestSyncAgentConfig_CopyDirsRecursive(t *testing.T) {
 	require.True(t, os.IsNotExist(err))
 }
 
+// A subdir is synced like the config dir itself: its files minus its own
+// skipEntries, its copyDirs in full, and none of its other directories.
+func TestSyncAgentConfig_SubdirsSyncTheirOwnFiles(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	hostDir := filepath.Join(homeDir, ".omp")
+	agentDir := filepath.Join(hostDir, "agent")
+	require.NoError(t, os.MkdirAll(filepath.Join(agentDir, "skills", "review"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(agentDir, "sessions"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(hostDir, "install-id"), []byte("id"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(agentDir, "config.yml"), []byte("model: x"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(agentDir, "skills", "review", "SKILL.md"), []byte("skill"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(agentDir, "sessions", "s.jsonl"), []byte("{}"), 0o644))
+	for _, name := range []string{"agent.db", "agent.db-wal", "agent.db-shm"} {
+		require.NoError(t, os.WriteFile(filepath.Join(agentDir, name), []byte("db"), 0o644))
+	}
+
+	mount := AgentConfigMount{
+		hostRel:     ".omp",
+		skipEntries: []string{"sandbox"},
+		subdirs: []AgentConfigMount{
+			{hostRel: "agent", skipEntries: []string{"agent.db*"}, copyDirs: []string{"skills"}},
+			{hostRel: "absent"},
+		},
+	}
+	sandboxDir, err := SyncAgentConfig(homeDir, mount)
+	require.NoError(t, err)
+
+	for path, content := range map[string]string{
+		"install-id":                   "id",
+		"agent/config.yml":             "model: x",
+		"agent/skills/review/SKILL.md": "skill",
+	} {
+		data, err := os.ReadFile(filepath.Join(sandboxDir, path))
+		require.NoError(t, err, path)
+		require.Equal(t, content, string(data), path)
+	}
+	for _, path := range []string{"agent/agent.db", "agent/agent.db-wal", "agent/agent.db-shm", "agent/sessions", "absent"} {
+		_, err := os.Stat(filepath.Join(sandboxDir, path))
+		require.True(t, os.IsNotExist(err), path)
+	}
+}
+
+func TestAgentConfigMount_SkipsNamesAndPatterns(t *testing.T) {
+	t.Parallel()
+
+	mount := AgentConfigMount{skipEntries: []string{"sandbox", "history.db*"}}
+	for _, name := range []string{"sandbox", "history.db", "history.db-wal"} {
+		require.True(t, mount.skips(name), name)
+	}
+	for _, name := range []string{"sandbox2", "config.yml", "auth.db"} {
+		require.False(t, mount.skips(name), name)
+	}
+}
+
 func TestSyncAgentConfig_FollowsSymlinks(t *testing.T) {
 	t.Parallel()
 

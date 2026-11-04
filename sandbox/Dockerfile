@@ -62,6 +62,12 @@ RUN npm install -g @openai/codex@0
 # Pin major version; update periodically.
 RUN npm install -g @google/gemini-cli@0
 
+# ── omp (Oh My Pi) ───────────────────────────────────────────────────
+# The prebuilt binary for this platform, checked against the build
+# service's sha256 by the installer; bun is not in the image. Lands in
+# /root/.local/bin, which is on PATH already.
+RUN curl -fsSL https://omp.sh/install | sh -s -- --binary
+
 # Pre-create credential directories for auth volume mounts.
 RUN mkdir -p /root/.claude \
     /root/.config/opencode \
@@ -69,6 +75,7 @@ RUN mkdir -p /root/.claude \
     /root/.local/state/opencode \
     /root/.codex \
     /root/.gemini \
+    /root/.omp \
     /root/.ssh
 
 # Make /root traversable by the non-root runtime user (--user uid:gid).
