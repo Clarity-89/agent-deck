@@ -95,11 +95,34 @@ func (i *Instance) CanFork() bool {
 		return i.CanForkCodex()
 	}
 
-	// Claude sessions can fork if session ID is recent
+	// Claude sessions can fork if the session ID was detected recently, or if
+	// its transcript is on disk: a fork is `claude --resume <id>
+	// --fork-session`, which needs the transcript, not a fresh detection.
+	// #3032: a one-shot CLI never refreshes ClaudeDetectedAt for a session that
+	// already has an id, so the clock alone refused every session older than
+	// five minutes.
 	if i.ClaudeSessionID == "" {
 		return false
 	}
-	return time.Since(i.ClaudeDetectedAt) < 5*time.Minute
+	if time.Since(i.ClaudeDetectedAt) < 5*time.Minute {
+		return true
+	}
+	return i.claudeForkTranscriptOnDisk()
+}
+
+// claudeForkTranscriptOnDisk reports whether this session's Claude transcript
+// sits where the fork's `claude --resume` looks for it: the instance's own
+// config dir, under the project dir Claude derives from ProjectPath or
+// EffectiveWorkingDir. Only exact paths are stat'ed (no projects/* glob, no
+// global config-dir fallback): CanFork runs on TUI render and web snapshot
+// paths. Remote (--ssh) sessions have no local transcript, so the clock alone
+// still decides for them; non-Claude tools never get here with a Claude id
+// that matters.
+func (i *Instance) claudeForkTranscriptOnDisk() bool {
+	if !IsClaudeCompatible(i.Tool) || !i.TranscriptIsResolvableLocally() {
+		return false
+	}
+	return exactClaudeTranscriptPath(GetClaudeConfigDirForInstance(i), i.ProjectPath, i.ClaudeSessionID, i.EffectiveWorkingDir()) != ""
 }
 
 // CanForkPi returns true if this Pi session can be forked by Agent Deck.
@@ -206,7 +229,7 @@ func (i *Instance) buildClaudeForkCommandForTarget(target *Instance, opts *Claud
 
 	// Build extra flags from options (for fork, we use ToArgsForFork which excludes session mode)
 	launchName := target.ClaudeLaunchName()
-	if extraArgsSupplyName(i.ExtraArgs) || extraArgsSelectSession(i.ExtraArgs) {
+	if extraArgsSupplyName(i.ExtraArgs) || extraArgsSelectSession(i.claudeExtraArgsForCommand()) {
 		launchName = ""
 	}
 	extraFlags := i.buildClaudeExtraFlagsWithName(opts, launchName)
@@ -393,8 +416,10 @@ func (i *Instance) createForkedClaudeInstance(
 	// (buildClaudeResumeCommand reads the fork's own ExtraArgs) and a
 	// fork-of-a-fork never sees them at all. Mirrors how ClaudeOptions are
 	// persisted via SetClaudeOptions further down. Copied, not aliased.
-	if len(i.ExtraArgs) > 0 {
-		forked.ExtraArgs = append([]string(nil), i.ExtraArgs...)
+	// Never the parent's session selectors (a stale fork pair would
+	// make the fork's own restarts fork the grandparent).
+	if args := i.claudeExtraArgsForCommand(); len(args) > 0 {
+		forked.ExtraArgs = append([]string(nil), args...)
 	}
 
 	// The parent is set before the one-shot command is baked: the launch env

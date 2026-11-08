@@ -47,7 +47,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.16.36" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.16.38" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -154,6 +154,22 @@ func writeVersionOutput(w io.Writer, currentVersion string) {
 		fmt.Fprintf(w, " (update available: v%s)", info.LatestVersion)
 	}
 	fmt.Fprintln(w)
+}
+
+// coreFeatures are the capabilities `agent-deck version --json` advertises,
+// so a client (the Mac app) can pick a call shape without trial and error.
+// A core that predates this list prints the plain version line instead of
+// JSON for `version --json`; clients treat that as "no features".
+//   - recall_timeline_batch: `recall timeline --json [--tail N] --sessions a,b,...`
+var coreFeatures = []string{"recall_timeline_batch"}
+
+// writeVersionJSON prints {"version": "...", "features": [...]}.
+func writeVersionJSON(w io.Writer, currentVersion string) {
+	out, _ := json.MarshalIndent(struct {
+		Version  string   `json:"version"`
+		Features []string `json:"features"`
+	}{currentVersion, coreFeatures}, "", "  ")
+	fmt.Fprintln(w, string(out))
 }
 
 // printUpdateNotice checks for updates and prints a one-liner if available
@@ -479,6 +495,8 @@ func main() {
 	// calls use Instance.TmuxSocketName directly — this default is only
 	// the installation-wide fallback for callers without a session handle.
 	tmux.SetDefaultSocketName(session.GetTmuxSettings().GetSocketName())
+	// [tmux.binaries]: the tmux binary per socket, for every tmux call.
+	tmux.SetSocketBinaries(session.GetTmuxSettings().Binaries)
 	if cfg, err := session.LoadUserConfig(); err == nil && cfg != nil {
 		session.ConfigureTmuxDisplay(cfg.Display)
 	}
@@ -531,6 +549,10 @@ func main() {
 			handleTelemetry(args[1:])
 			return
 		case "version", "--version", "-v":
+			if len(args) > 1 && args[1] == "--json" {
+				writeVersionJSON(os.Stdout, Version)
+				return
+			}
 			writeVersionOutput(os.Stdout, Version)
 			return
 		case "help", "--help", "-h":
@@ -662,6 +684,9 @@ func main() {
 		case "open":
 			handleOpen(profile, args[1:])
 			return
+		case "switch":
+			handleSwitch(profile, args[1:])
+			return
 		case "ask":
 			handleAsk(profile, args[1:])
 			return
@@ -755,6 +780,9 @@ func main() {
 			return
 		case "feedback":
 			handleFeedback(args[1:])
+			return
+		case "whats-new":
+			handleWhatsNew(args[1:])
 			return
 		case "debug-dump":
 			if helpRequested(args[1:]) {
@@ -933,19 +961,8 @@ func main() {
 	// this guard only fires on the interactive TUI path. Headless web mode
 	// (--no-tui) skips it for the same reason: no TUI, no detach surprise.
 	if !webHeadless && isOuterTmuxWithoutOptIn() {
-		fmt.Fprintln(os.Stderr, "Error: The agent-deck TUI is designed to run OUTSIDE of tmux.")
-		fmt.Fprintln(os.Stderr, "You are inside a tmux session, so Ctrl+Q detach and nested")
-		fmt.Fprintln(os.Stderr, "tmux behavior will be surprising. agent-deck manages its own")
-		fmt.Fprintln(os.Stderr, "tmux sessions internally.")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Options:")
-		fmt.Fprintln(os.Stderr, "  • Detach from tmux (Ctrl+B d) and run agent-deck from a clean shell.")
-		fmt.Fprintln(os.Stderr, "  • Run CLI subcommands — they work fine inside tmux:")
-		fmt.Fprintln(os.Stderr, "      agent-deck list                    # List sessions")
-		fmt.Fprintln(os.Stderr, "      agent-deck add /path -t \"Title\"  # Add a new session")
-		fmt.Fprintln(os.Stderr, "      agent-deck session start <id>      # Start a session")
-		fmt.Fprintln(os.Stderr, "  • If you really want to run the TUI anyway, set:")
-		fmt.Fprintln(os.Stderr, "      AGENT_DECK_ALLOW_OUTER_TMUX=1 agent-deck")
+		// Same rows and words as the TUI quick check page (check_text.go).
+		fmt.Fprint(os.Stderr, outerTmuxRefusalText(tmuxVersionLine(), Version))
 		exitCLI(1)
 	}
 
@@ -991,7 +1008,7 @@ func main() {
 	// Web parses its own flags and preflights during subcommand dispatch so
 	// help remains tmux-free and startup probes see the repaired PATH.
 	if !webEnabled {
-		ensureTmuxInPathOrExit()
+		ensureTmuxInPathOrExitTUI()
 	}
 
 	healthRole := "tui"
@@ -1644,11 +1661,11 @@ var commandRegistry = map[string]bool{
 	"group": true, "try": true, "launch": true, "conductor": true,
 	"agents": true, "agent": true,
 	"telegram-doctor": true, "watcher": true, "openclaw": true, "oc": true,
-	"remote": true, "remote-agent": true, "provider": true, "system": true, "worktree": true, "wt": true, "costs": true, "open": true, "ask": true, "browser": true, "file": true, "events": true, "triggers": true, "trace": true, "daemon": true, "usage": true, "web": true, "config": true, "recall": true,
+	"remote": true, "remote-agent": true, "provider": true, "system": true, "worktree": true, "wt": true, "costs": true, "open": true, "switch": true, "ask": true, "browser": true, "file": true, "events": true, "triggers": true, "trace": true, "daemon": true, "usage": true, "web": true, "config": true, "recall": true,
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
 	"hermes-hooks": true, "cursor-hooks": true, "tmux-hooks": true, "pi-hooks": true, "deepseek": true, "notify-daemon": true,
-	"run-task": true, "inbox": true, "msg": true, "feedback": true, "telemetry": true,
+	"run-task": true, "inbox": true, "msg": true, "feedback": true, "whats-new": true, "telemetry": true,
 	"debug-dump": true, "version": true, "--version": true, "-v": true,
 	"help": true, "--help": true, "-h": true, "completion": true,
 	"__complete": true,
@@ -3213,24 +3230,27 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		cached = cachedStatus[0]
 	}
 	type sessionJSON struct {
-		ID                string    `json:"id"`
-		ParentSessionID   string    `json:"parent_session_id,omitempty"`
-		ParentProjectPath string    `json:"parent_project_path,omitempty"`
-		Title             string    `json:"title"`
-		Path              string    `json:"path"`
-		Group             string    `json:"group"`
-		Tool              string    `json:"tool"`
-		Account           string    `json:"account"`
-		Command           string    `json:"command,omitempty"`
-		ModelID           string    `json:"model_id,omitempty"`
-		Model             string    `json:"model,omitempty"`
-		ModelVersion      string    `json:"model_version,omitempty"`
-		Status            string    `json:"status"`
-		StatusSource      string    `json:"status_source,omitempty"`
-		Substate          string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
-		ExitCode          *int      `json:"exit_code,omitempty"`
-		SubstateDetail    string    `json:"substate_detail,omitempty"` // free text for the substate (codex usage-limit retry time; usage-limit window, model-limit model, account-blocked reason)
-		TmuxSession       string    `json:"tmux_session,omitempty"`
+		ID                string `json:"id"`
+		ParentSessionID   string `json:"parent_session_id,omitempty"`
+		ParentProjectPath string `json:"parent_project_path,omitempty"`
+		Title             string `json:"title"`
+		Path              string `json:"path"`
+		Group             string `json:"group"`
+		Tool              string `json:"tool"`
+		Account           string `json:"account"`
+		Command           string `json:"command,omitempty"`
+		ModelID           string `json:"model_id,omitempty"`
+		Model             string `json:"model,omitempty"`
+		ModelVersion      string `json:"model_version,omitempty"`
+		Status            string `json:"status"`
+		StatusSource      string `json:"status_source,omitempty"`
+		Substate          string `json:"substate,omitempty"` // Honest Status v2: additive refinement
+		ExitCode          *int   `json:"exit_code,omitempty"`
+		SubstateDetail    string `json:"substate_detail,omitempty"` // free text for the substate (codex usage-limit retry time; usage-limit window, model-limit model, account-blocked reason)
+		TmuxSession       string `json:"tmux_session,omitempty"`
+		// TmuxSocketName and TmuxBinary: see addTmuxRouteJSON.
+		TmuxSocketName    string    `json:"tmux_socket_name,omitempty"`
+		TmuxBinary        string    `json:"tmux_binary,omitempty"`
 		Profile           string    `json:"profile"`
 		CreatedAt         time.Time `json:"created_at"`
 		SSHHost           string    `json:"ssh_host,omitempty"`
@@ -3331,6 +3351,7 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		if cached[inst] {
 			sj.StatusSource = "cached"
 		}
+		sj.TmuxSocketName, sj.TmuxBinary = tmuxRouteFields(inst)
 		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 			sj.TmuxSession = tmuxSess.Name
 			if v, known := viewers[tmuxSess.Name]; known {
@@ -4492,6 +4513,7 @@ func handleUpdate(args []string) {
 	fmt.Printf("\n✓ Updated to v%s\n", info.LatestVersion)
 	fmt.Println("  Restart agent-deck to use the new version.")
 	printPathShadowing(os.Stdout, update.FindShadowingCopies(info.LatestVersion), updateCLILog)
+	printWhatsNewAfterUpdate(context.Background(), os.Stdout, info.CurrentVersion, info.LatestVersion, true)
 
 	// Offer to update remotes
 	updateRemotesAfterLocalUpdate(info.LatestVersion)
@@ -4589,6 +4611,9 @@ func handleUpdateToSpecificVersion(requested string, checkOnly bool) {
 	fmt.Printf("\n✓ Installed v%s\n", targetVersion)
 	fmt.Println("  Restart agent-deck to use this version.")
 	printPathShadowing(os.Stdout, update.FindShadowingCopies(targetVersion), updateCLILog)
+	if update.CompareVersions(Version, targetVersion) < 0 {
+		printWhatsNewAfterUpdate(context.Background(), os.Stdout, Version, targetVersion, true)
+	}
 }
 
 // brewRunner abstracts `brew <args...>` so tests can inject canned output
@@ -4740,6 +4765,7 @@ func printHelp() {
 	fmt.Println("  rename, mv       Rename a session")
 	fmt.Println("  status           Show session status summary")
 	fmt.Println("  session          Manage session lifecycle")
+	fmt.Println("  switch <query>   Show a session in the Mac app (or attach here) by id, title or part of one [--json]")
 	fmt.Println("  open <file|url>  Show a page in the Mac app Browser panel [--session <id|title>]")
 	fmt.Println("  ask <kind>       Ask the owner for a secret, choice or text in a dialog (docs/ask.md)")
 	fmt.Println("  browser <op>     Drive the session's Mac app Browser: open, tabs, close, click, type, read, shot")
@@ -4770,6 +4796,7 @@ func printHelp() {
 	fmt.Println("  telegram-doctor  Audit channel-owning sessions for telegram drops (#1138)")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
+	fmt.Println("  whats-new        What changed since the version you last saw, your fixed reports first")
 	fmt.Println("  telemetry        Opt-in anonymous usage reports: status|enable|disable|preview|show-last|reset-id (see TELEMETRY.md)")
 	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")
 	fmt.Println("  migrate-paths    Copy legacy ~/.agent-deck files into XDG paths and pin the XDG data root")
@@ -5422,6 +5449,17 @@ func isOuterTmuxWithoutOptIn() bool {
 		return false
 	}
 	return true
+}
+
+// ensureTmuxInPathOrExitTUI is ensureTmuxInPathOrExit for the TUI: the same
+// exit, printed as the quick check page (check_text.go) a new user would
+// otherwise see inside the TUI. CLI subcommands keep the short error.
+func ensureTmuxInPathOrExitTUI() {
+	if err := ensureTmuxInPath(); err != nil {
+		telemetry.ErrorOccurred(telemetry.AreaTmux, telemetry.KindTmuxMissing, "")
+		fmt.Fprint(os.Stderr, tmuxMissingCheckText(runtime.GOOS, Version, os.Getenv("PATH")))
+		exitCLI(1)
+	}
 }
 
 func ensureTmuxInPathOrExit() {

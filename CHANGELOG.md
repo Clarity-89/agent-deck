@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.38] - 2026-11-07
+
+### Highlights
+
+- After a restart, a conductor whose recovery prompt was left typed in its composer now gets Enter again, so it picks up its work and `session send` to it no longer stalls (see Fixes; thanks @tsblack).
+- Parents on the comms ledger are woken more reliably by their children, pi children included (see Fixes; thanks @fpmx3bp).
+
+### Fixes
+
+- Conductor restart: the recovery prompt was submitted with one Enter. When Claude Code did not act on it, the prompt sat in the composer as a draft until someone pressed Enter, and `session send` to the conductor was blocked meanwhile. If the composer still holds exactly the recovery prompt, agent-deck now presses Enter up to 2 more times (after 0.5 s, then 1 s). It looks at the pane again right before each Enter and never touches anything else typed there (#3062, #3074; thanks @tsblack for the report, the timings and the proposal).
+- `session send` could hang for good when `ps` or `pgrep` hung while it read a session's process tree. Both now run under a time limit, and the send treats the process tree as incomplete instead of waiting (#3072; thanks @fpmx3bp for the report).
+- pi children: when a pi run continues inside one prompt (an auto-retry, a compaction or a continue before it settles), it keeps one run id, so the parent is no longer woken an extra time for that run (#3071; thanks @fpmx3bp for the report).
+- Comms ledger: after the ledger log is restored to an earlier point, a new record no longer inherits an old record's failed wake attempts, which could silence its urgent wake (#3069). A record whose pending flag could not be written to disk, such as an urgent record that needs a wake, is no longer skipped by the delivery pass until a later write succeeds (#3070). After a restore, a parent left with an old pending flag is scanned once instead of on every idle poll (#3075) (thanks @fpmx3bp for the reports).
+
+### Under the hood
+
+- Hook files now keep a per-session turn count (`turn_seq`) that survives `/clear`, compaction and restarts, also with `[health]` off, and the restart and fresh-start tokens record it. Every hook write takes the status lock so no count is lost. Nothing reads the count yet; it is the first step toward simpler checks of whether a child has had a turn since it started (#3080; thanks @tarekrached for the plan in #3012).
+- Comms test matrix: a new scenario checks that a parent on the comms ledger sees each run of a pi child exactly once (#3073; thanks @fpmx3bp for the report).
+
+## [1.16.37] - 2026-11-07
+
+### Highlights
+
+- New users get a quick check page, a welcome screen and a first Claude session (or their first installed agent) in two Enters, with a short hint bar and a 5-key help (see New features).
+- Your bug reports now come back to you: after an update the TUI shows "What's new", with your fixed reports first and a "Is it fixed for you?" question; `agent-deck feedback mine` and `whats-new` do the same from the CLI (see New features).
+- Sandboxes are ready to use: `agent-deck provider connect azure` connects your own Azure in one step, the docker example gives a Claude session at its prompt in the project, and the TUI can destroy a sandbox and shows who owns it (see New features).
+- Much less CPU on busy machines: the usage status line, the notifier and `remote-agent` stop re-reading every profile on every refresh (see Under the hood).
+- Fixes: a multi-repo launch with `~/.claude` no longer overwrites your global `CLAUDE.md`, older Claude sessions can be forked again, an installed web app stays signed in, and copy in the TUI reaches your clipboard from tmux and over SSH (see Fixes; thanks @hohounk, @tsblack and @tiantianLl).
+
+### New features
+
+- First-run onboarding in the TUI. A fresh install opens a quick check page for tmux, agent-deck and each agent CLI, with an install line for anything missing (`r` checks again, `l` signs in). With no sessions, the main screen is the welcome: `n` new session, `i` import tmux sessions, `?` the keys. New Session defaults to the first installed agent instead of a shell (a set `default_tool` still wins), lists installed tools first, and puts worktree, Docker and multi-repo under "More options". The Claude hooks question is one ticked line in the form. After the first session a one-line hint bar teaches Enter, Ctrl+Q, `n` and `?`, once per machine. `?` now opens "5 keys to start", and Tab shows every key. An install that already had config or sessions sees no onboarding screens (#3055, #3056; thanks @sharjeelajmalsemantic786 for the plan and prototype).
+- What's new in the TUI: on the first start after an update, a short dialog lists your fixed reports ("Your report #N: fixed in vX") and the release highlights. `y` or `n` answers "Is it fixed for you?" after a preview of the exact public text; only `y` posts, and Enter never does. `Alt+N` opens it again, Esc closes it (#3052).
+- Report loop in the CLI: agent-deck keeps a list of the reports you filed with `agent-deck feedback bug|idea`. `feedback mine` lists them with the version that fixed each one, read from this changelog. `whats-new [--json] [--since] [--mark-seen]` shows your fixed reports first, then each release's highlights, and `agent-deck update` prints it after a manual install. `feedback fixed N --fixed|--not-fixed [--comment]` answers "Is it fixed for you?" on the issue, after showing you exactly what will be posted (#3050, #3051).
+- Agent reports (opt-in): `feedback bug --from-agent` lets an agent session file a bug without prompts or a browser. It is labelled as found by an agent, and a repeat of an open report adds a "Seen again" comment instead of a new issue. Nothing is posted until a person runs `agent-deck feedback agent-consent` once on that machine (`--off` turns it off again) (#3051).
+- `agent-deck provider connect azure` connects your own Azure to sandboxes in one step. It checks for `az` (and prints the install line if it is missing), logs in with a one-time code that works over ssh, lets you pick a subscription, creates one resource group and a service principal with Contributor on that group only, keeps the secret in a 0600 file, writes the provider config, and checks the result. Running it again keeps what works. `--disconnect` (or `provider disconnect azure`) asks first, removes the service principal it created and the local files, and keeps the resource group. Clear messages cover the usual Azure stumbling blocks, and `--json` prints one event per line. The secret is never printed, logged or put in argv (#3049).
+- Azure VM example provider (`examples/providers/azure-vm`): one small ready Linux VM per sandbox, using the `az` CLI. It works inside one resource group, tags everything it creates, and destroys only resources that carry its tags (#3018).
+- Ready docker sandboxes: the example docker provider now installs Claude Code, puts your project in the sandbox (a git clone, a copy of a folder, or a small demo) and skips Claude's first-run screens, so a new sandbox gives a Claude session at its prompt. An optional `claude_token_file` signs Claude in; the token is never put in argv, the image or a log (#3017).
+- TUI sandboxes: `d` on a sandbox's host row opens "Destroy Sandbox?", which says how many sessions will be stopped and follows the same rules as `remote destroy`. Create and destroy show the current step and elapsed time above the list, and a failed create says where it stopped and whether anything was left behind (#3017).
+- Sandbox owner: each new sandbox records whose it is (`[sandbox] owner`, or your login name by default), and `remote list`, the TUI and the web fleet view show it. `remote list --json` adds `owner` and the sandbox's `ssh_config` path. A start prompt typed in the New Session dialog now reaches a session on a new sandbox or a remote picked in the Where row (#3019).
+- `agent-deck switch <query> [--json] [--no-attach] [--wait 2s]` finds a session by id, id prefix, title or group words and shows it in the AgentDeck Mac app, from the Mac or from a box the app follows. If no app answers, it attaches in the terminal instead (#3048).
+- `recall timeline --json [--tail N] --sessions <id1>,<id2>,...` reads the first screens of up to 50 sessions in one call, also through `remote <name> recall timeline`. Each id gets its own result or error, in input order, and one failing id never fails the call. `agent-deck version --json` lists `recall_timeline_batch` in its `features`, so a client can tell the batch is there (#3061).
+- Newer tmux per socket (opt-in): `[tmux.binaries]` maps a tmux socket name to the tmux binary agent-deck runs on it, and `agent-deck session set <id> tmux-socket <name>` moves a stopped session to another socket. This lets you move sessions one at a time to a newer tmux (for example 3.6 for `indic_zero_width_marks`) while others stay on the distro's tmux. `list --json` and `session show --json` show `tmux_socket_name` and `tmux_binary` when they apply (#3045).
+
+### Fixes
+
+- Multi-repo launch with `-additional-path ~/.claude` (or any folder named `.claude`) replaced your global `~/.claude/CLAUDE.md`, and could replace `settings.json` the same way. Such a folder is now linked as `dot-claude/` and its files are left alone, and agent-deck only replaces a `CLAUDE.md` it wrote itself (#3041, #3042; thanks @hohounk for the report).
+- `session fork` no longer refuses a Claude session whose id was detected more than 5 minutes ago when its transcript is still on disk. `session show` and the TUI's Fork hint agree (#3032, #3034; thanks @tsblack for the report and the diagnosis).
+- Web: with `--token-file`, a web app installed to the home screen stays signed in. The token cookie now lasts 30 days and is renewed on use, gets `Secure` behind an HTTPS proxy, and is no longer set for a token it cannot hold (#3031, #3033; thanks @tiantianLl for the report).
+- A Codex session on its home screen shows `waiting` instead of `running`; a row of its braille logo was read as a spinner (#3037, #3038; thanks @Clarity-89 for the report and the fix).
+- Settings (`S`): the focused row is marked with `▶`, and on a choice row the selected option is underlined, so you can see where the cursor is (#3039, #3043; thanks @godlen4332 for the report).
+- Claude sessions no longer label ordinary inbox replies and progress updates delivered at Stop as "Child session(s) completed"; they get a neutral inbox heading. The outer "Stop hook error" label comes from Claude Code itself (#3053, #3057; thanks @c2keesey for the report and @mvanhorn for the fix).
+- Copy in the TUI (copy output, copy pane, code blocks, session info, `session output --copy`) now reaches your clipboard when the TUI runs inside tmux without `allow-passthrough`, and over SSH on a host that has its own clipboard tool (#3047).
+- `remote attach`: Ctrl+V image paste works again when Claude Code lists background agents under its composer, when tmux 3.5+ changes how Ctrl+V is encoded, and in windows opened with Shift+Enter. Cmd+V with only an image on the clipboard pastes the image too (#3046).
+- Restarting a Claude session that was started as a fork through `--extra-arg --resume <id> --fork-session` no longer forks its parent again on every restart; it resumes its own conversation. Forking such a session no longer copies the parent's selectors (#3067).
+- Sends to Devin sessions (the `devin` tool or a tool with `compatible_with = "devin"`) wait a little longer before Enter, so the message is submitted instead of left typed in the composer (#3064; thanks @ruiheng).
+- `session send` to a Codex session in the middle of a long turn no longer makes every other send to it fail after 5 s with "Codex acceptance lock timed out". They wait for the turn to end and are delivered as separate turns (#3054; thanks @c2keesey).
+- A `session send --no-wait` into an idle Claude session that got stuck in Claude's queued-messages list is now submitted. If it still cannot be, the send exits non-zero with `typed_not_submitted` instead of reporting delivered (#3044).
+- A child muted with `--no-transition-notify` (or `transition_events = false`) still has its DONE recorded, so `session children` and the agents view show it as done, and one `done_suppressed` log line says it was not delivered (#3029; thanks @tarekrached).
+- pi parents and children on the comms ledger: an urgent record that arrives while the parent is busy wakes it once it settles, each pi run is shown to the parent once instead of twice, and a second idle restart of a pi child gives the parent its "Restarted while idle" line (#3021, #3022, #3023; thanks @fpmx3bp).
+- The watcher-creator skill no longer teaches commands that do not exist (#3027).
+
+### Under the hood
+
+- Less CPU on busy machines: `usage statusline-wrap` keeps a small index instead of opening every profile store on each status line refresh, and short CLI commands skip a repeat hook cleanup sweep (#3060). The notifier skips empty profiles that have not changed and closes their stores (#3059). `remote-agent` stops full re-scans after state writes that do not change the listings, and `group list --json` checks each session's status once (#3058).
+- pi wake socket client, the first part of waking a pi parent over a private socket instead of typing into its pane. Nothing uses it yet (#3035; thanks @fpmx3bp).
+- Skill evals: watcher-creator gets its own evals, and `model-run.sh` runs both repo skills' evals against a real model (#3027).
+- CI: the Playwright jobs run on Ubuntu 24.04 because Playwright does not support 26.04 yet, and the eval smoke tests get more time (#3066).
+- Dependency updates: sentry-go 0.50.0, google.golang.org/api 0.310.0 and grpc 1.85.0 (#3028).
+
 ## [1.16.36] - 2026-11-02
 
 ### Highlights

@@ -10,6 +10,7 @@ The full contract is in [docs/PLUG-IN-ANY-MACHINE.md](../../docs/PLUG-IN-ANY-MAC
 |---------|---------------|-------|
 | [docker/](docker/) | A local Docker container with sshd, tmux and git | docker, ssh-keygen, python3 |
 | [ssh-vm/](ssh-vm/) | A VM from your own controller's HTTP API (template) | curl, python3, your API |
+| [azure-vm/](azure-vm/) | A small Azure Linux VM, ready with Claude Code, git and the project | az, ssh, ssh-keygen, python3 |
 
 ## Configure
 
@@ -25,6 +26,10 @@ agent_deck_path = ""           # agent-deck path on the sandbox, default "agent-
 
 `command` is an absolute path or a name on `PATH`. It is run directly, never
 through a shell.
+
+For Azure you can skip this: `agent-deck provider connect azure` logs in,
+makes the resource group and service principal, and writes the config for
+you. See [azure-vm/README.md](azure-vm/README.md#connect-in-one-step).
 
 ## Try
 
