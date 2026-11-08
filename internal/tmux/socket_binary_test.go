@@ -78,7 +78,7 @@ func TestStartCommandSpec_RunsTheSocketsBinary(t *testing.T) {
 				assert.Contains(t, args, bin, "systemd-run must exec the socket's binary")
 				assert.NotContains(t, args, "tmux")
 			}
-			inner := stripSystemdRunPrefix(args, bin)
+			inner := stripKillScopeArgs(t, stripSystemdRunPrefix(args, bin))
 			assert.Equal(t, []string{"-u", "-L", "deck36", "new-session", "-d", "-s", "agentdeck_bin_1234abcd",
 				"-c", "/tmp/project", "-x", "120", "-y", "40"}, inner)
 		})

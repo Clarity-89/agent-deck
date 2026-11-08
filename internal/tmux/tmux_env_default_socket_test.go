@@ -57,7 +57,7 @@ func TestStartAndAttach_DefaultSessionInsideConfiguredSocketPane(t *testing.T) {
 					t.Fatalf("launcher = %q, want the PATH tmux for the default server", launcher)
 				}
 			}
-			inner := stripSystemdRunPrefix(args, "tmux")
+			inner := stripKillScopeArgs(t, stripSystemdRunPrefix(args, "tmux"))
 			want := []string{"-u", "-L", "default", "new-session", "-d", "-s", "agentdeck_def_1234abcd",
 				"-c", "/tmp/project", "-x", "120", "-y", "40"}
 			if !slices.Equal(inner, want) {
